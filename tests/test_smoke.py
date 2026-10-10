@@ -27,8 +27,10 @@ def test_run_smoke_writes_png(tmp_path: Path) -> None:
 @pytest.mark.render
 def test_run_smoke_physics_is_plausible(tmp_path: Path) -> None:
     result = run_smoke(tmp_path / "s.png", steps=500, width=64, height=48)
-    # A damped pendulum released at 0.5 rad has moved, but cannot gain amplitude.
+    # A lightly damped pendulum released at 0.5 rad swings well away from its start
+    # (0.224 rad after 1 s) but can never gain amplitude.
     assert 0.0 < abs(result.final_angle) < result.initial_angle
+    assert abs(result.initial_angle - result.final_angle) > 0.1
     assert result.sim_time == pytest.approx(500 * result.timestep)
 
 
@@ -53,7 +55,8 @@ def test_run_smoke_reports_missing_renderer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # mujoco has no Renderer attribute when its GL context failed to load.
-    monkeypatch.delattr(mujoco, "Renderer")
+    monkeypatch.delenv("MUJOCO_GL", raising=False)
+    monkeypatch.delattr(mujoco, "Renderer", raising=False)
     with pytest.raises(RenderingUnavailableError, match="headless rendering unavailable"):
         run_smoke(tmp_path / "s.png", steps=1)
     assert not (tmp_path / "s.png").exists()
@@ -82,7 +85,8 @@ def test_main_rejects_non_positive_steps(steps: str) -> None:
 def test_main_reports_rendering_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.delattr(mujoco, "Renderer")
+    monkeypatch.delenv("MUJOCO_GL", raising=False)
+    monkeypatch.delattr(mujoco, "Renderer", raising=False)
     assert main(["--out", str(tmp_path / "s.png"), "--steps", "1"]) == 1
     assert "headless rendering unavailable" in capsys.readouterr().err
 

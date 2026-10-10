@@ -9,8 +9,8 @@ import mujoco
 from topple._gl import rendering_disabled
 
 _HINT = (
-    "install OSMesa (apt-get install libosmesa6) or set MUJOCO_GL=egl on Linux; "
-    "use MUJOCO_GL=cgl on macOS"
+    "on headless Linux set MUJOCO_GL=osmesa (apt-get install libosmesa6) or MUJOCO_GL=egl; "
+    "on macOS use MUJOCO_GL=cgl"
 )
 
 
@@ -31,6 +31,8 @@ def make_renderer(model: mujoco.MjModel, height: int, width: int) -> mujoco.Rend
         )
     try:
         renderer: mujoco.Renderer = renderer_cls(model, height=height, width=width)
-    except (OSError, ImportError, RuntimeError, mujoco.FatalError) as exc:
-        raise RenderingUnavailableError(f"headless rendering unavailable: {exc} ({_HINT})") from exc
+    except Exception as exc:  # GL stacks raise many unrelated types (PyOpenGL, glfw, OSError...)
+        raise RenderingUnavailableError(
+            f"headless rendering unavailable: {type(exc).__name__}: {exc} ({_HINT})"
+        ) from exc
     return renderer

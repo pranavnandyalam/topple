@@ -7,7 +7,11 @@ htmlcov/
 runs/
 checkpoints/
 *.mp4
-.env
+.env*
+!.env.example
+.dev.vars
+*.pem
+*.key
 .DS_Store
 .superset/config.local.json
 smoke.png

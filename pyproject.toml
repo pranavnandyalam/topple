@@ -48,9 +48,10 @@ packages = ["python/topple"]
 
 [tool.uv]
 default-groups = ["dev"]
-required-version = ">=0.10.2"
-# Prefer the system/Homebrew interpreter: on Apple Silicon a stray uv-managed x86_64 (Rosetta)
-# CPython would otherwise win discovery and fail the platform-restricted lock below.
+required-version = ">=0.12.18"  # earlier releases have published advisories
+# Prefer a system/Homebrew interpreter over uv-managed ones: on this Apple Silicon setup a stray
+# uv-managed x86_64 (Rosetta) CPython would otherwise win discovery and fail the platform-restricted
+# lock below. This does not pin the CPU architecture; see README for the recovery commands.
 python-preference = "system"
 # onnxruntime has no Intel-mac wheels; resolve only for platforms we support.
 environments = [

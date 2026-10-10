@@ -21,15 +21,27 @@ def test_disabled_rendering_raises(
         make_renderer(model, height=8, width=8)
 
 
-@pytest.mark.parametrize("error", [RuntimeError("no context"), OSError("libOSMesa missing")])
+class NullFunctionError(Exception):
+    """Stand-in for OpenGL.error.NullFunctionError (not a RuntimeError/OSError subclass)."""
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("no context"),
+        OSError("libOSMesa missing"),
+        NullFunctionError("glGenFramebuffers"),
+    ],
+)
 def test_context_failures_are_wrapped(
     model: mujoco.MjModel, monkeypatch: pytest.MonkeyPatch, error: Exception
 ) -> None:
     def broken_renderer(*_args: Any, **_kwargs: Any) -> None:
         raise error
 
-    monkeypatch.setattr(mujoco, "Renderer", broken_renderer)
-    with pytest.raises(RenderingUnavailableError, match="libosmesa6") as excinfo:
+    monkeypatch.delenv("MUJOCO_GL", raising=False)
+    monkeypatch.setattr(mujoco, "Renderer", broken_renderer, raising=False)
+    with pytest.raises(RenderingUnavailableError, match="MUJOCO_GL=osmesa") as excinfo:
         make_renderer(model, height=8, width=8)
     assert excinfo.value.__cause__ is error
 

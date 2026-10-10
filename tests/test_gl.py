@@ -82,23 +82,33 @@ def test_rendering_disabled_false(env: dict[str, str]) -> None:
     assert not rendering_disabled(env)
 
 
-def test_configure_sets_platform_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("MUJOCO_GL", raising=False)
-    monkeypatch.delenv("DISPLAY", raising=False)
-    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+def test_configure_sets_platform_default() -> None:
+    env: dict[str, str] = {}
+    assert configure(env, "linux", modules={}) == "osmesa"
+    assert env["MUJOCO_GL"] == "osmesa"
+    assert configure({}, "darwin", modules={}) == "cgl"
+
+
+def test_configure_warns_when_mujoco_already_chose_differently() -> None:
+    # headless Linux: MuJoCo defaulted to glfw before topple could choose osmesa
     with pytest.warns(RuntimeWarning, match="imported before topple"):
-        backend = configure()  # mujoco is already imported in this test process
-    assert backend == default_gl_backend(sys.platform, {})
-    assert os.environ["MUJOCO_GL"] == backend
+        configure({}, "linux", modules={"mujoco": object()})
 
 
-def test_configure_keeps_matching_env_without_warning(
-    monkeypatch: pytest.MonkeyPatch, recwarn: pytest.WarningsRecorder
+@pytest.mark.parametrize(
+    ("env", "platform"),
+    [({}, "darwin"), ({"DISPLAY": ":0"}, "linux"), ({}, "win32"), ({"MUJOCO_GL": "egl"}, "linux")],
+)
+def test_configure_no_false_alarm(
+    env: dict[str, str], platform: str, recwarn: pytest.WarningsRecorder
 ) -> None:
-    current = os.environ["MUJOCO_GL"]
-    monkeypatch.setenv("MUJOCO_GL", current)
-    assert configure() == current
+    configure(dict(env), platform, modules={"mujoco": object()})
     assert not [w for w in recwarn if issubclass(w.category, RuntimeWarning)]
+
+
+def test_configure_uses_process_env_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MUJOCO_GL", os.environ["MUJOCO_GL"])
+    assert configure() == os.environ["MUJOCO_GL"]
 
 
 def test_import_topple_sets_default_before_mujoco(headless_env: dict[str, str]) -> None:

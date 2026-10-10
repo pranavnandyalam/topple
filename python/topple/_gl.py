@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import sys
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 
 DISABLED_VALUES = frozenset({"disable", "disabled", "off", "false", "0"})
 _GENERIC_VALUES = frozenset({"enable", "enabled", "on", "true", "1", "glfw"})
@@ -54,19 +54,33 @@ def resolve_gl_backend(env: Mapping[str, str], platform: str) -> str:
     return requested
 
 
-def configure() -> str:
+def _mujoco_default(platform: str) -> str:
+    """What MuJoCo itself picks when MUJOCO_GL is unset."""
+    return "cgl" if platform == "darwin" else "glfw"
+
+
+def configure(
+    env: MutableMapping[str, str] | None = None,
+    platform: str | None = None,
+    modules: Mapping[str, object] | None = None,
+) -> str:
     """Set ``MUJOCO_GL`` for this process and return the chosen backend.
 
-    Warns when ``mujoco`` was imported first with a different setting: MuJoCo has already
-    picked its GL context, so the new value cannot take effect in this process.
+    Warns only when ``mujoco`` was imported first and has already picked a different GL backend
+    (in practice: headless Linux, where MuJoCo defaults to GLFW but topple wants OSMesa).
     """
-    backend = resolve_gl_backend(os.environ, sys.platform)
-    if "mujoco" in sys.modules and _requested(os.environ) != backend:
+    env = os.environ if env is None else env
+    platform = sys.platform if platform is None else platform
+    modules = sys.modules if modules is None else modules
+    backend = resolve_gl_backend(env, platform)
+    effective = _requested(env) or _mujoco_default(platform)
+    if "mujoco" in modules and effective != backend:
         warnings.warn(
-            f"mujoco was imported before topple; MUJOCO_GL={backend!r} cannot take effect in "
-            "this process. Import topple first or set MUJOCO_GL yourself.",
+            f"mujoco was imported before topple and is using MUJOCO_GL={effective!r}; "
+            f"topple's choice {backend!r} cannot take effect in this process. "
+            "Import topple first or set MUJOCO_GL yourself.",
             RuntimeWarning,
-            stacklevel=2,
+            stacklevel=3,
         )
-    os.environ["MUJOCO_GL"] = backend
+    env["MUJOCO_GL"] = backend
     return backend

@@ -40,7 +40,8 @@ def test_smoke_command_rejects_zero_steps() -> None:
 def test_smoke_command_reports_rendering_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delattr(mujoco, "Renderer")
+    monkeypatch.delenv("MUJOCO_GL", raising=False)
+    monkeypatch.delattr(mujoco, "Renderer", raising=False)
     result = runner.invoke(app, ["smoke", "--out", str(tmp_path / "s.png"), "--steps", "1"])
     assert result.exit_code == 1
     assert "headless rendering unavailable" in result.output

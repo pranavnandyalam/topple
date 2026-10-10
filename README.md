@@ -14,10 +14,13 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.12.
 
 ```bash
 uv sync                # add --all-extras for RL training (torch, stable-baselines3)
-uv run pytest          # tests + coverage
+uv run pytest          # tests (add --cov for the coverage report and 80% gate)
 uv run topple smoke    # check MuJoCo simulates and renders headlessly -> smoke.png
 ```
 
 Headless rendering picks a backend automatically: CGL on macOS, OSMesa on headless Linux
 (`apt-get install libosmesa6`), GLFW when a display is present. Override with `MUJOCO_GL`.
-On Apple Silicon, uv is configured to prefer the native arm64 Python.
+On Apple Silicon, uv prefers a system (Homebrew) Python over uv-managed ones. If `uv sync` reports
+an incompatible platform, a Rosetta (x86_64) interpreter was picked; fix it with
+`UV_PYTHON=cpython-3.12-macos-aarch64-none uv sync` or remove it with
+`uv python uninstall cpython-3.12-macos-x86_64-none`.
