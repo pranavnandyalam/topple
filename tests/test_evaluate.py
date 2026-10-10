@@ -192,7 +192,7 @@ def test_error_info_codes_are_closed() -> None:
 def test_saved_trajectory_verifies_and_rescores(tmp_path: Path) -> None:
     results = evaluate(protocol("standard", 2), pid, INFO, traj_dir=tmp_path)
     assert results.episodes is not None
-    for i, episode in enumerate(results.episodes):
+    for i in range(len(results.episodes)):
         traj = load_npz(tmp_path / f"traj_{i:03d}.npz")
         verification = verify_episode(traj)
         assert verification.ok, verification.reason

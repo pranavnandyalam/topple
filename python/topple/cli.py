@@ -89,10 +89,12 @@ def _episode_line(e: EpisodeResult) -> str:
         if e.error
         else ("success" if e.success else str(m.get("termination")))
     )
+    upright = float(m.get("time_upright_s", 0))
+    drift = float(m.get("drift_m", 0))
+    energy = float(m.get("energy_j", 0))
     return (
         f"  #{e.index:<3d} seed {e.seed!s:>6}  score {e.score:6.2f}  {status:<14} "
-        f"upright {float(m.get('time_upright_s', 0)):5.2f}s  drift {float(m.get('drift_m', 0)):.3f} m  "
-        f"energy {float(m.get('energy_j', 0)):6.2f} J"
+        f"upright {upright:5.2f}s  drift {drift:.3f} m  energy {energy:6.2f} J"
     )
 
 

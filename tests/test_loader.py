@@ -66,7 +66,8 @@ def test_directory_submission_with_assets(tmp_path: Path) -> None:
         "controller.py",
         GOOD.replace(
             "def make_controller(spec):",
-            "from pathlib import Path\nGAIN = float((Path(__file__).parent / 'gains.txt').read_text())\n"
+            "from pathlib import Path\n"
+            "GAIN = float((Path(__file__).parent / 'gains.txt').read_text())\n"
             "def make_controller(spec):",
         ),
     )
@@ -117,7 +118,7 @@ def test_missing_path(tmp_path: Path) -> None:
 
 def test_directory_without_entry(tmp_path: Path) -> None:
     (tmp_path / "empty").mkdir()
-    with pytest.raises(LoadError, match="controller.py"):
+    with pytest.raises(LoadError, match=r"controller\.py"):
         load_submission(tmp_path / "empty")
 
 

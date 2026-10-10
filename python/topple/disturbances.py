@@ -105,12 +105,14 @@ class Scenario:
     pushes: tuple[Push, ...]
     model: ModelOverrides
     sensors: SensorOffsets
+    init_pitch_rate_rads: float = 0.0  # nonzero only for injected states (fuzzer, RoA maps)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "seed": self.seed,
             "preset": self.preset,
             "init_pitch_rad": self.init_pitch_rad,
+            "init_pitch_rate_rads": self.init_pitch_rate_rads,
             "pushes": [vars(p) for p in self.pushes],
             "model": {**vars(self.model), "motor_gain": list(self.model.motor_gain)},
             "sensors": {**vars(self.sensors), "gyro_bias_rads": list(self.sensors.gyro_bias_rads)},
@@ -127,6 +129,7 @@ class Scenario:
             seed=validate_seed(data["seed"]),
             preset=data["preset"],
             init_pitch_rad=float(data["init_pitch_rad"]),
+            init_pitch_rate_rads=float(data.get("init_pitch_rate_rads", 0.0)),
             pushes=tuple(Push(**p) for p in data["pushes"]),
             model=ModelOverrides(
                 **{**model, "motor_gain": (model["motor_gain"][0], model["motor_gain"][1])}

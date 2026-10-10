@@ -9,7 +9,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-FORMAT = "topple.results/1"
+FORMAT: Literal["topple.results/1"] = "topple.results/1"
 MAX_DETAIL_CHARS = 300
 
 ErrorCode = Literal[

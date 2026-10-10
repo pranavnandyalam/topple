@@ -32,6 +32,7 @@ from topple.robot import (
     RobotParams,
     bind_robot,
     build_model,
+    robot_hash,
     tilt_angle,
     validate_robot,
 )
@@ -225,12 +226,13 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             if not all(isinstance(p, Push) for p in pushes):
                 raise ValueError("pushes must be a sequence of topple.disturbances.Push")
             scenario = replace(scenario, pushes=pushes)
-        init_rate = float(opts.get("init_pitch_rate", 0.0))
+        if "init_pitch_rate" in opts:
+            scenario = replace(scenario, init_pitch_rate_rads=float(opts["init_pitch_rate"]))
 
         self._scenario = scenario
         self._sensors_ideal = PRESETS[scenario.preset].sensors == "ideal"
         self._apply_model_overrides(scenario)
-        self._set_initial_state(scenario.init_pitch_rad, init_rate)
+        self._set_initial_state(scenario.init_pitch_rad, scenario.init_pitch_rate_rads)
         self._init_episode_state(scenario)
         obs = self._observe(last_action=(0.0, 0.0))
         if self.record:
@@ -357,6 +359,8 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
                 "root": self.binding.root_qposadr,
                 "wheels": list(self.binding.wheel_qposadr),
             },
+            "wheel_sign": list(self.binding.wheel_sign),
+            "robot_hash": robot_hash(self.robot_xml, self.params),
             "termination": {"step": self._step_count, "reason": self._termination or "timeout"},
             "versions": {
                 "topple": __version__,
