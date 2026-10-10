@@ -1,189 +1,300 @@
-# Robot Sim Lab: Plan
+# Topple: Plan v2
 
-Design a robot in CAD, drop it into a physics sim, train a neural-network policy to control it, and
-**push controller code to the simulated robot** the way you'd push to a real one: every push runs
-the robot in sim and reports back with metrics and a video.
+> Supersedes the v1 plan (in git history). v1's core (balancer, MuJoCo, PPO vs. PID,
+> `git push` → score + video) is kept; v2 adds what the research says people want and nobody ships.
+> Brand: **Topple** (repo `pranavnandyalam/topple`, PyPI `topple-sim`, npm `topple-arena`, CLI and
+> import name `topple`; bare `topple` is taken on PyPI and npm).
 
-Merges two ideas: *"train a robot in an environment with a neural network"* and *"model a robot in an
-environment and push code to it in a simulated environment."*
-
----
-
-## 1. Goal and scope
-
-**One-sentence pitch:** CI for robots. `git push` a controller, get back a score, a leaderboard
-position and an MP4 of your robot doing (or failing) the task.
-
-**What "done" looks like (v1):**
-1. A two-wheeled self-balancing robot, designed in Onshape, running in MuJoCo.
-2. A trained RL policy (PPO) that balances it and drives to waypoints under disturbances.
-3. A hand-written PID baseline, so you can show learned vs. classical control.
-4. A `simlab` CLI: `simlab run controller.py --task balance` gives metrics JSON and an MP4.
-5. A GitHub Action that runs `simlab eval` on every push/PR and comments results with a video link.
-6. A write-up: what worked, reward-shaping lessons, PID vs. RL comparison, sim-to-real gaps.
-
-**Explicit non-goals for v1:** multi-user hosted platform, browser IDE, custom physics engine,
-real hardware. All of these are stretch phases.
-
-### Why a self-balancing robot first
-- Simple CAD (chassis, 2 wheels, 2 motors) that you could actually build later for about $50. That's a sim-to-real story.
-- Trains in **minutes on CPU**, so iteration is fast on the M5 Pro.
-- Classical controller (PID/LQR) is well understood, so it makes a meaningful baseline for RL.
-- The same pipeline later scales to an arm or quadruped by swapping the MJCF + task.
+**Pitch:** *Can your controller survive being toppled?* The open successor to DeepRacer and robotbenchmark for the MuJoCo era. Design a robot,
+push a controller, and get back a deterministic score, a crash-test rating, an AI coach's fix and a
+replay anyone can watch and poke in the browser. Free, Mac-native, zero-install to try.
 
 ---
 
-## 2. Tech stack
+## 1. Why this, why now (research summary, Oct 2026)
 
-| Layer | Choice | Why |
+| Finding | Evidence | What we do with it |
 |---|---|---|
-| Language / env | Python 3.12 via `uv` | Fast, reproducible; 3.14 is too new for some wheels |
-| Physics | **MuJoCo** (`mujoco` pip pkg) | Fast, accurate contacts, runs great on Apple Silicon CPU |
-| CAD to sim | **Onshape** to `onshape-to-robot` to URDF/MJCF | Design in CAD, export directly; no hand-written XML |
-| RL API | **Gymnasium** custom env | Standard interface; works with every RL library |
-| RL algorithms | **Stable-Baselines3** (PPO, SAC) | Battle-tested, minimal code; swap to CleanRL if you want to own the algorithm |
-| Logging | TensorBoard (W&B optional) | Reward curves, episode stats |
-| Video | `mujoco.Renderer` + `imageio[ffmpeg]` | Headless MP4 per eval |
-| CLI | `typer` | Clean CLI with little code |
-| Tests | `pytest` + `pytest-cov` | 80%+ coverage target |
-| CI runner | GitHub Actions (ubuntu, CPU) | The "push code to robot" loop with zero infra |
+| **AWS DeepRacer is dead** (league ended 2024, console retired Dec 2025) after 560k+ builders in 6 years. The community went to self-hosted forks that run poorly on Mac. | AWS blog/FAQ; deepracer-for-cloud | Seasons, monthly challenges, divisions: the DeepRacer loop, open and free |
+| **robotbenchmark.net is dead** (domain now spam). It was the only free "Python in browser, get ranked, watch replay" robotics site. | Cyberbotics/EOSC | Browser Arena is a core feature, not a stretch goal |
+| **HF Open RL Leaderboard has stalled** (errors, last results Apr 2024). LeRobot has EnvHub but no standing leaderboard. | HF | Publish our env to LeRobot EnvHub; be the leaderboard |
+| **"CI for robots" exists only for enterprises** (Applied Intuition, Foretellix). Hobbyists hand-roll Gazebo-in-Actions. | vendor sites, ROS Discourse | Ship a reusable GitHub Action anyone can point at their own MJCF |
+| **Isaac Sim/Lab and MJWarp are NVIDIA-only.** Mac users are second-class everywhere. | NVIDIA, MuJoCo docs | Mac-first CPU training; browser for everyone else |
+| **MuJoCo now has official WASM bindings** (`@mujoco/mujoco` 3.15). mjswan already runs ONNX policies in-browser. | Measured on M5 Pro: WASM ≈ 0.57× native; ONNX MLP 6 µs; Pyodide PID 3 µs/call | Zero-install arena is feasible now with huge headroom |
+| **LLM-in-the-loop control is the 2026 frontier** (Act-Observe-Rewrite, Eureka/DrEureka). | arXiv 2603.04466, 2310.12931 | AI Coach PR bot + reward autotuner |
+| **FIRST: ~200k FRC/FTC students.** Programmers get little robot time, rookies have no hardware until kickoff, and sim tools are "complicated to set up". 67% of teams want to sim their own robot. | FIRST AR 2025, Chief Delphi, WPI study | Off-season programmer-training league, team leagues |
+| **Teachers are isolated and use Chromebooks.** They need ready lessons and autograding that fits GitHub Classroom. | CSTA 2025, SIGCSE 2025 | Classroom mode + 5-lesson curriculum |
+| **"AI learns to X" videos get massive views** (AI Warehouse: ~97M views from 21 videos). | channel trackers | Every submission auto-generates a shareable clip; Sumo and Evolve make good content |
 
-**Compute reality:** small MLP policies don't benefit from the GPU. MuJoCo plus SB3 with 16 parallel
-envs (`SubprocVecEnv`) on 18 CPU cores is the right setup. GPU-accelerated sim (MJX / MuJoCo
-Playground, Isaac Lab) needs NVIDIA, so that's only for the quadruped stretch phase, via the UMich GPU
-offering or cloud.
+Gap noted: the community pain-point sweep (Reddit/HN) was cut short; the findings above come from
+the competitor, growth, frontier-tech and feasibility sweeps.
 
 ---
 
-## 3. Architecture
+## 2. Product pillars
+
+1. **Sim Core.** Balancer robot, Gymnasium env, the `Controller` contract, PID and PPO baselines, `eval_v1`.
+2. **Robot CI.** A reusable GitHub Action: push a controller and the PR gets a score, a GIF and a leaderboard rank. It works on *your own* robot's MJCF too.
+3. **Crash-Test Rating.** NCAP-style 1–5 stars per controller, from an adversarial push fuzzer, a region-of-attraction map and formal specs.
+4. **Arena (browser).** Watch any replay, shove the robot with your mouse, edit PID gains or Python live (Pyodide), and run ONNX policies. No install, works on a Chromebook.
+5. **AI Coach.** Claude reads the metrics and key frames from a failed run and opens a PR that fixes your controller. `topple autotune` evolves reward and randomization configs overnight.
+6. **Robot Sumo.** Two balancers in a ring, trained by self-play, with Elo, nightly tournaments and bracket videos.
+7. **Seasons and leagues.** Monthly themed challenges (wind, ice, payload), divisions (HS / College / Open), and private class/team leagues.
+8. **Sim-to-real.** A ~$50 ESP32 balancer from Onshape CAD, system ID from real logs, the same `Controller` on hardware, and a real-robot leaderboard track.
+9. **Open challenges.** Anyone can author a task (MJCF + scorer + seeds) and the community votes it into the next season. Published to LeRobot EnvHub.
+
+---
+
+## 3. Tech stack
+
+| Layer | Choice | Notes |
+|---|---|---|
+| Core | Python 3.12 via `uv`, `mujoco==3.15.*` (pinned) | Determinism is guaranteed only within one version + architecture |
+| RL | Gymnasium 1.4, SB3 2.9 (PPO/SAC), TensorBoard | Training on CPU `SubprocVecEnv`, 16 envs on 18 cores |
+| Policy format | **ONNX everywhere** (SB3 export wrapper with VecNormalize + clipping baked in) | Eval/CI/browser never need torch: `onnxruntime` ~15 MB vs. torch 555 MB+ |
+| CLI | `typer` | `topple run / eval / train / export / fuzz / coach / autotune / sumo` |
+| Rendering | `mujoco.Renderer`; `MUJOCO_GL=cgl` (Mac), `osmesa` (Linux CI) | CI renders one short episode at 320×240 → GIF |
+| CI | GitHub Actions, `pull_request` → `workflow_run` split | Fork PRs get no secrets; privileged stage only reads validated artifacts |
+| Web | Vite + TypeScript + three.js, `@mujoco/mujoco` (single-thread build), `onnxruntime-web`, Pyodide in a Web Worker | Start from mjswan rather than from scratch |
+| Hosting | Cloudflare Pages (site), R2 (GIFs, `traj.npz`), D1 (leaderboard) | Est. $0–5/mo at 1k users; Claude API is the real cost, so add quotas |
+| AI | Claude: user's own `ANTHROPIC_API_KEY` or their Claude Code login (`claude-sonnet-5-5` default, `claude-opus-5-5` for hard cases) | Bring-your-own key; images, not video: sample 6–10 key frames |
+| CAD | Onshape → `onshape-to-robot` 1.8.x → MJCF | Commit generated MJCF; EDU API quota is ~2,500 calls/yr |
+| Hardware | ESP32-S3 + MPU-6050/BMI270 IMU + 2 geared DC motors w/ encoders | Policy runs as generated C (tiny MLP) or PID |
+| Tests | pytest + pytest-cov (80%+); Vitest for web | Bit-exact tests per platform only; cross-platform uses tolerances |
+
+---
+
+## 4. Architecture
 
 ```
 robot-sim-lab/
-├── assets/
-│   ├── onshape/            # onshape-to-robot config.json (document URL, settings)
-│   └── robots/balancer/    # exported MJCF + meshes (generated, committed)
-├── src/simlab/
-│   ├── envs/
-│   │   ├── base.py         # MujocoRobotEnv: load model, step, obs, render
-│   │   ├── balance.py      # BalanceTask: stay upright, rewards, termination
-│   │   └── waypoint.py     # WaypointTask: balance + drive to targets
-│   ├── disturbances.py     # random pushes, sensor noise, mass/friction randomization
-│   ├── controller_api.py   # Controller protocol: reset(), act(obs) -> action
-│   ├── controllers/
-│   │   ├── pid.py          # classical baseline
-│   │   └── policy.py       # wraps a trained SB3 checkpoint as a Controller
-│   ├── train.py            # PPO/SAC training entrypoint (config-driven)
-│   ├── evaluate.py         # N seeded episodes -> metrics dict
-│   ├── runner.py           # runs untrusted controller.py in a subprocess w/ timeout
-│   ├── video.py            # render episode -> MP4
-│   └── cli.py              # `simlab run | eval | train | export`
-├── configs/                # YAML: env params, reward weights, PPO hyperparams
-├── submissions/            # example controllers (pid_example.py, random.py)
-├── tests/
-└── .github/workflows/eval.yml
+├── python/topple/
+│   ├── envs/            base.py, balance.py, waypoint.py, sumo.py
+│   ├── robots/          MJCF assets (placeholder + CAD export)
+│   ├── controller_api.py   Controller protocol + Observation (frozen)
+│   ├── controllers/     pid.py, onnx_policy.py
+│   ├── disturbances.py  pushes, sensor noise, mass/friction/latency randomization
+│   ├── evaluate.py      eval_v1: seeded episodes → metrics + traj.npz
+│   ├── runner.py        runs untrusted controller in a subprocess (pipe IPC, timeout)
+│   ├── crashtest/       fuzzer.py (CMA-ES adversary), roa.py, stl.py, rating.py
+│   ├── coach/           Claude coach loop, autotune (Eureka-lite)
+│   ├── sumo/            self-play training, Elo, tournament scheduler
+│   ├── sysid/           fit sim params to real-robot logs
+│   ├── train.py, export.py (→ ONNX, → C), video.py, cli.py
+├── web/                 Arena: replay viewer, live sandbox, leaderboard, share cards
+├── action/              reusable GitHub Action (robot-ci)
+├── challenges/          task specs: balance-v1, waypoint-v1, sumo-v1, ... (MJCF + scorer + seeds)
+├── firmware/            ESP32 balancer firmware + host log tool
+├── curriculum/          5 lessons, slides, rubrics, GitHub Classroom template
+├── configs/             YAML: env params, rewards, PPO hyperparams
+├── submissions/         example controllers
+└── .github/workflows/   eval.yml (untrusted), publish.yml (workflow_run), nightly-sumo.yml
 ```
 
-### The controller contract (the core interface everything else hangs off)
+### Core contract (unchanged in spirit, fixed for waypoints)
 ```python
+@dataclass(frozen=True)
+class Observation:
+    pitch: float; pitch_rate: float
+    yaw: float; yaw_rate: float               # added: needed to steer to targets
+    wheel_vel: tuple[float, float]
+    target_rel: tuple[float, float] | None    # waypoint/sumo tasks, in robot frame
+
 class Controller(Protocol):
     def reset(self, seed: int) -> None: ...
     def act(self, obs: Observation) -> np.ndarray: ...   # wheel torques, clipped to limits
 ```
-- `Observation` is a frozen dataclass: pitch, pitch rate, wheel velocities, (waypoint task) relative target.
-- PID controllers, trained policies and user submissions all implement this, so they're all
-  evaluated identically. That's what makes "push code to the robot" fair and comparable.
+The contract is versioned (`obs_v1`). PID, ONNX policies, user submissions, coach output and
+hardware firmware all implement it.
 
-### Evaluation protocol (fixed, versioned)
-- `N=20` episodes, fixed seed list, fixed disturbance schedule.
-- Metrics: `success_rate`, `mean_time_upright`, `max_tilt`, `energy_used`, `waypoint_error`, `score` (weighted).
-- Protocol versioned (`eval_v1`), so leaderboard results stay comparable over time.
+### Trust model (the non-negotiables)
+- **Ranked scores come only from CI** (pinned Linux image = source of truth). Browser runs are unranked.
+- **The controller never shares a process with the scorer** (it could monkeypatch metrics). Subprocess + pipe; Docker `--network none --read-only` in CI.
+- **Hidden seeds:** public PR evals use public seeds. The top-k get re-evaluated nightly on private seeds in the privileged stage to stop overfitting.
+- **Replays play stored trajectories (`traj.npz`), never re-simulate.** Mac/Linux/WASM diverge after ~5k steps.
+- **Tournament opponents exchange ONNX weights (data), not code.**
 
 ---
 
-## 4. Phases
+## 5. Phases
 
-Each phase has a concrete **done-when** check. Don't start the next phase until it passes.
+Each phase ends in something **shippable and shareable**, with a concrete **done when**. Estimates
+assume part-time work alongside school.
 
 ### Phase 0: Setup (1 evening)
-- `uv init`, pin Python 3.12, add deps, `ruff` + `pytest` config, `.superset/config.json` setup script (`uv sync`).
-- Smoke test: load a MuJoCo Menagerie model, step 1000 times, render one frame headless (`MUJOCO_GL=cgl` on macOS; verify).
-- Fix the `onshape` MCP server (its venv at `~/onshape-mcp/venv` is missing) if you want Claude to drive Onshape.
-- **Done when:** `uv run pytest` passes and `uv run python -m simlab.smoke` writes `smoke.png`.
+- `uv init`, Python 3.12, pin `mujoco==3.15.*`, ruff + pytest + coverage config, `.superset/config.json` (`uv sync`).
+- Smoke test: load a Menagerie model, step 1000×, render `smoke.png` headless (`cgl`).
+- Monorepo skeleton (`python/`, `web/`, `action/`).
+- **Done when:** `uv run pytest` passes and `uv run python -m topple.smoke` writes `smoke.png`.
 
-### Phase 1: Robot model (about 1 week)
-- **1a. Placeholder first:** hand-write a minimal balancer MJCF (box body, 2 cylinder wheels, 2 hinge motors) so Phases 2–3 aren't blocked on CAD.
-- **1b. Real CAD:** design the balancer in Onshape (chassis, battery mass, motor mounts, wheels). Name mates the way `onshape-to-robot` expects (`dof_left_wheel`, `dof_right_wheel`).
-- Export with `onshape-to-robot` to MJCF; set realistic masses, motor torque limits, wheel friction.
-- **Done when:** the CAD robot loads, falls over realistically with zero torque, and wheels spin when torque is applied (tests assert this).
+### Phase 1: Sim Core (1–1.5 weeks)
+- Placeholder balancer MJCF (box, 2 wheels, 2 hinge motors, realistic masses and torque limits).
+- `Observation`/`Controller` contract, `BalanceTask`, disturbances, PID baseline.
+- `eval_v1`: 20 seeded episodes → `results.json` + `traj.npz`; `topple run` writes MP4.
+- **Done when:** `env_checker` passes; PID balances >90% of no-push episodes; same seed gives an identical trajectory on the same platform (test); coverage ≥80%.
 
-### Phase 2: Gym environment + PID baseline (about 1 week)
-- `BalanceTask`: observation, action space (2 wheel torques), reward = upright bonus − tilt² − control effort, terminate at |pitch| > 45°.
-- Disturbances module: random impulse pushes, sensor noise, ±10% mass/friction randomization.
-- PID controller tuned by hand. This is your first "submission" and a sanity check that the task is solvable.
-- **Done when:** `gymnasium.utils.env_checker` passes; PID balances >90% of eval episodes without pushes.
+### Phase 2: Learn (1–2 weeks)
+- PPO (16 envs, curriculum: none → small pushes → full randomization), TensorBoard, checkpoints.
+- `topple export` → ONNX (VecNormalize + clipping baked in); `onnx_policy.py` controller.
+- `WaypointTask`; SAC comparison (wall-clock, sample efficiency).
+- **Done when:** PPO beats PID on `eval_v1` *with* disturbances; ONNX actions match torch within 1e-5; side-by-side PID vs. PPO video exists.
 
-### Phase 3: Train the neural network (1–2 weeks)
-- PPO via SB3, 16 parallel envs, TensorBoard logging, checkpoint every N steps, config-driven.
-- Curriculum: no disturbances, then small pushes, then full randomization.
-- Then `WaypointTask` (balance + drive to targets): reuse the balance policy or train from scratch and compare.
-- Try SAC as a comparison; record wall-clock and sample efficiency.
-- **Done when:** the RL policy beats PID on `eval_v1` *with* disturbances, and a side-by-side video exists.
+### Phase 3: Robot CI (1–1.5 weeks): *first public release*
+- `runner.py` subprocess sandbox; rejects bad shapes, NaNs, timeouts, exceptions.
+- `eval.yml` (`pull_request`, `permissions: {}`, timeout) → artifacts: metrics, traj, GIF.
+- `publish.yml` (`workflow_run`): schema-validate artifacts, upload GIF to R2, PR comment with embedded GIF + metrics table + rank, update `leaderboard.json`.
+- Package as a reusable action: `uses: <you>/robot-ci@v1` with `robot:`, `task:`, `controller:` inputs.
+- **Done when:** a fork PR with a new controller gets a comment with GIF + score in <3 min; red-team tests (score tampering, infinite loop, network access, huge output) all fail cleanly.
 
-### Phase 4: "Push code to the robot" (about 1 week)
-- `simlab run controller.py`: load the user file, run it in a **subprocess with a timeout and resource limits**, emit `results.json` + `episode.mp4`.
-- GitHub Action `eval.yml`: on push/PR, if `submissions/**` changed, run eval, upload MP4 as artifact, post a PR comment with a metrics table.
-- `LEADERBOARD.md` auto-updated on main.
-- **Done when:** you open a PR with a new controller and the bot comments a score + video link within ~3 minutes.
+### Phase 4: Crash-Test Rating (1 week)
+- `fuzzer.py`: CMA-ES finds the smallest push sequence that topples a controller → "robustness margin".
+- `roa.py`: region-of-attraction heatmap over (initial tilt, tilt rate).
+- `stl.py`: spec checks, e.g. "|pitch| < 15° within 2 s after any push ≤ X N".
+- `rating.py`: 1–5 stars from those three; SVG badge; section in PR comment.
+- **Done when:** PID and PPO both have published ratings with heatmaps, and the fuzzer finds a failure in a deliberately fragile controller in <60 s.
 
-### Phase 5: Polish + write-up (about 1 week)
-- README with GIFs, architecture diagram, PID vs. PPO comparison chart, reward-design lessons.
-- Short demo video (60–90s).
-- **Done when:** a stranger can clone, `uv sync`, run `simlab run submissions/pid_example.py`, and see a video.
+### Phase 5: Arena (2–3 weeks): *launch moment ("Season 0")*
+- Replay viewer: `traj.npz` → three.js, scrub, slow-mo, side-by-side ghost of the #1 entry.
+- Live sandbox: `@mujoco/mujoco` + mouse shove + PID sliders + Pyodide editor for `act()` (Web Worker, kill on hang) + ONNX policies.
+- Leaderboard pages, per-submission share page with OG image ("survived 47 shoves, rank #12, ★★★★"), embeddable badge.
+- "Submit" button → opens a prefilled PR (git stays the source of truth).
+- **Done when:** on a Chromebook, a stranger goes from link to shoving the robot in <10 s and edits a PID gain and sees the change in <60 s; Lighthouse performance ≥80.
+- **Launch:** README with GIFs, 60 s video ("I trained an AI to balance a robot… then kicked it"), HN, r/robotics, r/reinforcementlearning, r/FRC, Chief Delphi, DeepRacer community.
 
-### Stretch phases (pick by interest)
-- **S1 Web viewer:** watch episodes in the browser with MuJoCo WASM (e.g. `zalo/mujoco_wasm`) plus a Monaco editor to write `act()` in-browser. This is the "app" version of the idea.
-- **S2 Bigger robot:** arm (reach/pick) or quadruped from MuJoCo Menagerie, trained with MuJoCo Playground on a GPU (UMich / cloud).
-- **S3 Sim-to-real:** build the balancer (ESP32 + IMU + 2 motors), deploy the policy, measure the gap. Very strong portfolio piece.
-- **S4 Hosted platform:** multi-user submissions in Docker sandboxes (no network, CPU/mem caps), public leaderboard.
+### Phase 6: AI Coach + Autotune (1.5–2 weeks)
+- `topple coach controller.py`: run eval → send metrics + 6–10 key frames + code to Claude → get patch → re-eval → keep only if score improves → repeat ≤N rounds.
+- Bring-your-own key: public users run `topple coach` locally with their own key or Claude Code login. A copy-paste workflow lets them add `/coach` to *their own* repo using their own secret. Fork PRs never get secrets, so the main repo runs no public coach bot.
+- On Pranav's repos, `/coach` runs through the Claude GitHub Action with his Max token → opens a follow-up PR with the fix and a before/after GIF.
+- `topple autotune`: Eureka-lite. Claude proposes reward + domain-randomization configs, PPO trains candidates in parallel on 18 cores, and stats feed back to Claude.
+- **Done when:** on a benchmark of 10 deliberately broken controllers, the coach gets ≥7 above the PID baseline within 3 rounds; autotune finds a reward that beats the hand-written one on `eval_v1`.
+
+### Phase 7: Robot Sumo + Seasons (2 weeks)
+- `SumoTask`: two balancers, ring, push the other out or make it fall.
+- Self-play PPO with an opponent pool; Elo/TrueSkill; nightly round-robin of all ONNX entries in CI.
+- Seasons: monthly theme config, divisions, season archive, auto-generated bracket video.
+- **Done when:** the nightly tournament runs unattended, ratings converge (stable top-5 over 3 nights), and a bracket video is generated from one command.
+
+### Phase 8: Sim-to-Real (3–4 weeks + parts lead time)
+- Design the balancer in Onshape (mates `dof_left_wheel`/`dof_right_wheel`), export with `onshape-to-robot`, commit MJCF.
+- Build: ESP32-S3, IMU, 2 encoder motors, battery (~$50). Firmware runs PID or a generated-C MLP at 200–500 Hz and logs over Wi-Fi.
+- `sysid/`: fit motor constants, friction and latency from logs; retrain with randomization centered on fitted values.
+- **Sim-to-real correlation study** (the credibility test for the whole leaderboard):
+  - Run ≥8 controllers (PID variants, PPO, top leaderboard entries) on both sim and real with a scripted push rig (servo or pendulum striker, so pushes are repeatable).
+  - Report Spearman rank correlation of sim score vs. real score, plus pitch-trajectory overlays for identical pushes.
+  - Test the hypothesis that the **crash-test rating predicts real-world success better than raw score** (robustness > fidelity).
+  - Publish the sim-to-real fidelity number on the leaderboard and re-run it whenever the robot model changes.
+- Fabrication: UMich makerspaces for printing/cutting; parts ordered early (see timeline).
+- **Done when:** the same controller file balances the real robot >30 s and survives a scripted push; sim/real rank correlation ρ ≥ 0.7 across ≥8 controllers (or a documented explanation of why not, with the sim fix); overlay video exists; the real-robot leaderboard track has entries.
+
+### Phase 9: Classrooms, FRC and Open Challenges (2 weeks)
+- League mode: private leaderboards, join code, teacher dashboard (submissions, scores, no student PII beyond GitHub handle).
+- GitHub Classroom template + `curriculum/`: 5 lessons (P → PID → tuning by data → RL → robustness) with slides and rubrics.
+- FRC-flavored challenge: differential-drive auto path following, with a RobotPy-style API.
+- Challenge spec format (`challenge.yaml` + MJCF + scorer + seeds) + contributor guide; publish `balance-v1` to LeRobot EnvHub.
+- **Done when:** a teacher can create a class league and a student can submit in <10 min from a fresh account; one community-authored challenge passes review and runs in CI.
+
+### Phases 10–15: Extensions (all in scope, built after Phase 9)
+- **Phase 10: Evolve (S1).** LLM-guided body + brain co-design (wheel radius, mass placement, extra links), parallel on 18 cores, with a generation time-lapse.
+  - **Done when:** an evolved morphology beats the hand-designed balancer on `eval_v1` with an equal training budget; a time-lapse video comes from one command.
+- **Phase 11: Human vs. Machine (S2).** Phone-tilt / WebXR teleop in the Arena records demos as LeRobot datasets → train ACT → "human", "imitation" and "RL" leaderboard categories.
+  - **Done when:** a phone player can drive a full episode; ACT trained on ≥50 demos completes `eval_v1`; all three categories are live.
+- **Phase 12: Text-to-robot (S3).** "A balancer with a tail" → Claude writes MJCF from primitives → compile → render → critique loop → playable in the Arena.
+  - **Done when:** ≥8 of 10 benchmark prompts produce MJCF that compiles, stands still under zero torque where expected, and matches the prompt per a rubric.
+- **Phase 13: Bigger robots (S4).** SO-101 arm (Menagerie model; real arm ~$150) reach/pick task, and a quadruped trained with MuJoCo Playground on UMich Great Lakes GPUs; both as new challenges.
+  - **Done when:** both robots exist as challenges with baselines on the leaderboard; ONNX policies replay in the Arena.
+- **Phase 14: Hosted submissions (S5).** Non-git uploads from the Arena run on Modal/e2b (`--network none`) behind a queue with rate limits.
+  - **Done when:** a browser upload is scored identically to the CI path for the same controller; red-team suite passes against the hosted runner; spend alert configured.
+- **Phase 15: Dream vs. Real (S6).** DreamerV3 world model on the balancer; "dreamed rollout vs. real rollout" video; a model-based entry on the leaderboard.
+  - **Done when:** the world model predicts 1 s of balancer state within a stated error bound; the comparison video exists.
+
+### Review gate (every phase and feature)
+When a phase's "done when" passes locally, independent agents review it before it counts as done:
+1. **Code review** (python-reviewer / code-reviewer; TypeScript reviewer for `web/`).
+2. **Security review** (security-reviewer). Mandatory for Phases 3, 5, 6, 9 and 14.
+3. **Done-when verifier:** a fresh agent re-runs the tests and the phase's "done when" checks from a clean checkout and reports pass/fail with evidence.
+
+If there are no CRITICAL/HIGH findings, the phase's PR is merged and the next phase starts automatically.
+Work pauses for Pranav only on: creating accounts, spending money, hardware, launches/posts, and
+making the repo public (planned right after Phase 3's security review passes).
 
 ---
 
-## 5. Testing strategy (TDD, 80%+ coverage)
-- **Unit:** reward function terms, termination logic, observation construction, action clipping, PID math, config parsing.
-- **Determinism:** same seed gives identical trajectory (critical for fair eval).
-- **Contract:** every controller in `submissions/` satisfies the `Controller` protocol; malformed controllers fail cleanly.
-- **Runner safety:** infinite loop is killed by the timeout; exceptions are reported, not crashed; wrong action shape is rejected.
-- **Integration:** `simlab eval` on PID produces valid `results.json` with all metrics.
-- **Regression:** a tiny "golden" PID score range; CI fails if a sim change shifts it unexpectedly.
-- Training itself is not unit-tested; a 2k-step smoke train in CI ensures the pipeline runs.
+## 6. Timeline (part-time, approximate)
+
+| Month | Phases | Public milestone |
+|---|---|---|
+| 1 | 0, 1, 2 | PID vs. PPO video |
+| 2 | 3, 4 | Robot CI action v1 (soft launch) |
+| 3 | 5 | **Season 0 launch** (Arena + leaderboard) |
+| 4 | 6, 7 | AI Coach + Sumo tournament video |
+| 5–6 | 8, 9 | Real robot + sim-to-real study + classroom/FRC off-season league |
+| 7–9 | 10–15 | Evolve video, human vs. machine, text-to-robot, arm/quadruped, hosted uploads, dream vs. real |
+
+Order rule: don't start a phase until the previous one passes its review gate, **except** Phase 8
+parts ordering, which should happen in month 2 to absorb shipping time.
 
 ---
 
-## 6. Risks and mitigations
-
-| Risk | Mitigation |
-|---|---|
-| Onshape export pain (mates, mesh scale, inertia) | Phase 1a placeholder MJCF unblocks everything; CAD is swapped in later |
-| Reward hacking (policy vibrates, rolls away "upright") | Penalize control effort + drift; watch videos, not just reward curves |
-| RL doesn't converge | Verify with PID that the task is solvable; start without disturbances; tune with known-good PPO defaults |
-| Headless rendering on Mac/CI | Verify `cgl` (Mac) / `egl` or `osmesa` (Linux CI) in Phase 0 |
-| Running untrusted controller code | Subprocess + timeout for v1 (your own code); Docker sandbox before accepting anyone else's |
-| Scope creep into a "platform" | Stretch phases stay stretch until Phase 5 ships |
-
----
-
-## 7. Open decisions
-1. **Robot:** self-balancer (recommended) vs. 4-DOF arm vs. quadruped from Menagerie.
-2. **CI host:** GitHub Actions (recommended, free) vs. a local runner on the Mac.
-3. **Repo visibility:** public from day one (good for portfolio) or after Phase 3.
-4. **Stretch priority:** S1 web viewer (more "product") vs. S3 real hardware (more "engineering").
+## 7. Testing strategy (TDD, 80%+)
+- **Unit:** reward terms, termination, observation construction, clipping, PID math, Elo math, rating formula, config/challenge schema parsing.
+- **Determinism:** same seed → bit-identical trajectory per platform; cross-platform within tolerance over 1k steps.
+- **Contract:** every controller in `submissions/` and every coach output satisfies `Controller`.
+- **Security/red-team:** scorer tampering, `os.system`, network calls, infinite loops, memory bombs, oversized output, malicious artifacts in `workflow_run`.
+- **ONNX parity:** torch vs. ONNX within 1e-5 on 1k random observations.
+- **Integration:** `topple eval` → valid `results.json`; action end-to-end on a test repo.
+- **Golden regression:** PID score range; CI fails if a sim change moves it.
+- **Web:** Vitest for replay decoding and the sandbox worker; Playwright smoke for "load → shove → edit gain".
+- **Coach:** recorded-response tests (no live API in CI); live benchmark run manually.
+- Training is not unit-tested; 2k-step smoke train in CI.
 
 ---
 
-## 8. Resources
-- MuJoCo docs: https://mujoco.readthedocs.io
-- MuJoCo Menagerie (ready-made robot models): https://github.com/google-deepmind/mujoco_menagerie
-- onshape-to-robot: https://github.com/Rhoban/onshape-to-robot
-- Gymnasium custom env guide: https://gymnasium.farama.org
-- Stable-Baselines3: https://stable-baselines3.readthedocs.io
-- MuJoCo Playground (GPU stretch): https://github.com/google-deepmind/mujoco_playground
+## 8. Risks and mitigations
+
+| Risk | Sev | Mitigation |
+|---|---|---|
+| **Scope blowup** (9 pillars, one person) | High | Every phase ships on its own and is publicly useful before the next starts |
+| Leaderboard cheating (tampering, forged browser scores, seed overfitting) | High | Subprocess isolation, CI-only ranked scores, private-seed re-eval of top-k |
+| Pwn-request / CI abuse | High | `pull_request` + `workflow_run` split, `permissions: {}`, timeouts, first-time-contributor approval, never execute artifacts |
+| Cross-platform divergence | Med | Pin MuJoCo, CI image authoritative, replays from stored trajectories |
+| MuJoCo WASM is "WIP" | Med | Pin npm version; Arena falls back to pre-rendered GIF/MP4 |
+| Reward hacking / RL not converging | Med | PID proves solvability; curriculum; watch videos; autotune |
+| Claude cost/abuse in coach | Low | Bring-your-own key for public users; Pranav's Max plan covers only his own use (Claude Code) |
+| Onshape API quota / export pain | Med | Placeholder MJCF unblocks everything; export once, commit output |
+| Hardware sim-to-real gap | Med | System ID + domain randomization; PID fallback; treat the gap as a write-up finding |
+| Nobody shows up | Med | Ship content (videos) with every phase; seed via FRC mentors, teachers, DeepRacer alumni before launch |
+
+---
+
+## 9. Success metrics (Season 0 + 3 months)
+- 1,000 GitHub stars; 100 external submissions; 3 classroom or FRC team leagues.
+- 1 video >100k views.
+- 1 external repo using the `robot-ci` action on its own robot.
+- Real robot balancing on the same controller code as sim.
+
+---
+
+## 10. Decisions (2026-10-10)
+1. **Scope:** everything, Phases 0–15.
+2. **Name:** Topple.
+3. **Public:** when safe, i.e. after Phase 3's security review passes.
+4. **AI Coach:** bring-your-own key for public users. Pranav's Max plan covers his own runs via Claude Code / the Claude GitHub Action on his repos.
+5. **Workflow:** review-agent gate per phase, then auto-continue (see Review gate).
+6. **Hardware:** decide by month 2. UMich makerspaces for fabrication; Great Lakes HPC for GPU work.
+7. **Accounts** (Cloudflare, Onshape EDU, domain, optional Anthropic API key): created when a phase needs them, with Pranav doing the signup.
+
+---
+
+## 11. Resources
+- MuJoCo + WASM: https://mujoco.readthedocs.io, https://github.com/google-deepmind/mujoco/tree/main/wasm
+- mjswan (browser MuJoCo + ONNX): https://mjswan.readthedocs.io
+- Menagerie: https://github.com/google-deepmind/mujoco_menagerie
+- onshape-to-robot (MuJoCo export): https://onshape-to-robot.readthedocs.io/en/latest/exporter_mujoco.html
+- SB3 ONNX export: https://stable-baselines3.readthedocs.io/en/master/guide/export.html
+- uv + PyTorch CPU index: https://docs.astral.sh/uv/guides/integration/pytorch/
+- Secure Actions (pwn requests): https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+- Act-Observe-Rewrite: https://arxiv.org/abs/2603.04466 · Eureka: https://arxiv.org/abs/2310.12931 · DrEureka: https://arxiv.org/abs/2406.01967
+- Adversarial attacks on legged controllers (RSS 2024): https://roboticsconference.org/2024/program/papers/57/
+- Competitive self-play (sumo): https://openai.com/index/competitive-self-play
+- LeRobot: https://github.com/huggingface/lerobot
+- DeepRacer retirement: https://aws.amazon.com/deepracer/faqs/
