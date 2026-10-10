@@ -9,10 +9,12 @@ scene: scene.xml
 control_dt: 0.01
 episode_seconds: 10.0
 presets: [ideal, clean, standard]
-# Calibrated 2026-10-10 on 200 held-out seeds (0..199), standard preset, pushes U(0.25, 0.45) N.s:
-#   LQR reference 90.0% survival (median 5.40 J); shipped PID 66.5% (median 6.34 J).
+# Calibrated 2026-10-10 on 200 held-out seeds (0..199), pushes U(0.25, 0.45) N.s, after tire
+# contact priority made friction randomization effective in both directions:
+#   clean:    LQR 100.0%, PID 100.0% survival
+#   standard: LQR  87.0% (median 3.31 J), shipped PID 66.0% (median 6.65 J)
 score:
-  e_ref_j: 12.7         # 2x the shipped PID's median battery energy on standard
+  e_ref_j: 13.3         # 2x the shipped PID's median battery energy on standard
   tilt_ref_rad: 0.2
   drift_ref_m: 1.0
   success_max_drift_m: 1.0

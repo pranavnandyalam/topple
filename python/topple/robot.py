@@ -132,6 +132,9 @@ def build_model(
         joint.armature = m.armature
         for geom in scene.body(joint.parent.name).geoms:
             geom.friction[0] = params.contact.wheel_friction
+            # MuJoCo combines equal-priority contacts with max(); priority makes the tire's own
+            # friction (and its per-episode randomization) govern tire-floor contacts.
+            geom.priority = 1
 
         act = scene.add_actuator(name=motor_name)
         act.trntype = mujoco.mjtTrn.mjTRN_JOINT

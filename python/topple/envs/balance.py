@@ -175,6 +175,8 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self._epilogue: list[npt.NDArray[np.float64]] = []
         self._rec: dict[str, list[Any]] = {}
         self._last_obs_for_record: npt.NDArray[np.float32] = np.zeros(len(FEATURES), np.float32)
+        self._stable_qpos = np.zeros(self.model.nq)  # state before the current substep
+        self._stable_qvel = np.zeros(self.model.nv)
 
     # ------------------------------------------------------------------ public helpers
 
@@ -228,6 +230,10 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             scenario = replace(scenario, pushes=pushes)
         if "init_pitch_rate" in opts:
             scenario = replace(scenario, init_pitch_rate_rads=float(opts["init_pitch_rate"]))
+        if not (
+            math.isfinite(scenario.init_pitch_rad) and math.isfinite(scenario.init_pitch_rate_rads)
+        ):
+            raise ValueError("initial pitch and pitch rate must be finite")
 
         self._scenario = scenario
         self._sensors_ideal = PRESETS[scenario.preset].sensors == "ideal"
@@ -268,8 +274,11 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
                     d.qfrc_applied,
                 )
                 self._push_remaining -= 1
+            np.copyto(self._stable_qpos, d.qpos)
+            np.copyto(self._stable_qvel, d.qvel)
             mujoco.mj_step(m, d)
             if self._unstable():
+                self._roll_back()
                 self._end("sim_unstable")
                 break
             if not self._sensors_ideal:
@@ -484,6 +493,15 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         if any(d.warning[w].number > 0 for w in _UNSTABLE_WARNINGS):
             return True
         return not (np.isfinite(d.qpos).all() and np.isfinite(d.qvel).all())
+
+    def _roll_back(self) -> None:
+        """Undo the substep that blew up, so observations, rewards and records stay finite."""
+        d = self.data
+        d.qpos[:] = self._stable_qpos
+        d.qvel[:] = self._stable_qvel
+        d.qacc_warmstart[:] = 0.0  # the failed solve can leave NaN here
+        d.qfrc_applied[:] = 0.0
+        mujoco.mj_forward(self.model, d)
 
     def _fall_reason(self) -> str | None:
         b, d = self.binding, self.data

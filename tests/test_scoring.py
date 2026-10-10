@@ -150,4 +150,4 @@ def test_aggregate_score() -> None:
 
 def test_score_config_is_frozen_constant() -> None:
     assert ScoreConfig.model_fields.keys() >= {"e_ref_j", "tilt_ref_rad", "drift_ref_m"}
-    assert CFG.e_ref_j == pytest.approx(12.7)
+    assert CFG.e_ref_j == pytest.approx(13.3)
