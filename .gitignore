@@ -7,6 +7,16 @@ htmlcov/
 runs/
 checkpoints/
 *.mp4
-.env
+.env*
+!.env.example
+.dev.vars
+*.pem
+*.key
 .DS_Store
 .superset/config.local.json
+smoke.png
+/out/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+.claude/settings.local.json
