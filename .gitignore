@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+runs/
+checkpoints/
+*.mp4
+.env
+.DS_Store
+.superset/config.local.json
