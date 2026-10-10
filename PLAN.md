@@ -123,8 +123,9 @@ assume part-time work alongside school.
 
 ### Phase 0: Setup (1 evening)
 - `uv init`, Python 3.12, pin `mujoco==3.15.*`, ruff + pytest + coverage config, `.superset/config.json` (`uv sync`).
-- Smoke test: load a Menagerie model, step 1000×, render `smoke.png` headless (`cgl`).
-- Monorepo skeleton (`python/`, `web/`, `action/`).
+- Smoke test: step an inline MJCF model 1000× and render `smoke.png` headless (`cgl` / `osmesa`).
+  (Inline instead of a Menagerie download so tests need no network; Menagerie models arrive in Phase 13.)
+- Python package skeleton (`python/topple`). `web/` and `action/` are created by Phases 5 and 3.
 - **Done when:** `uv run pytest` passes and `uv run python -m topple.smoke` writes `smoke.png`.
 
 ### Phase 1: Sim Core (1–1.5 weeks)

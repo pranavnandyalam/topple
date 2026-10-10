@@ -24,7 +24,12 @@ def smoke(
     steps: Annotated[int, typer.Option(min=1, help="Physics steps before rendering.")] = 1000,
 ) -> None:
     """Check that MuJoCo simulates and renders headlessly on this machine."""
+    from topple.rendering import RenderingUnavailableError
     from topple.smoke import run_smoke
 
-    result = run_smoke(out, steps=steps)
+    try:
+        result = run_smoke(out, steps=steps)
+    except RenderingUnavailableError as exc:
+        typer.echo(f"smoke failed: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(f"smoke ok: {result.steps} steps -> {result.image_path}")

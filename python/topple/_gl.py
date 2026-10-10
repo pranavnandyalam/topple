@@ -1,47 +1,72 @@
 """Choose a headless OpenGL backend for MuJoCo.
 
 MuJoCo reads ``MUJOCO_GL`` once, when ``mujoco`` is first imported, so ``configure()`` runs from
-``topple/__init__.py`` before any module imports ``mujoco``.
+``topple/__init__.py`` before any module imports ``mujoco``. Accepted values mirror MuJoCo 3.15's
+own check (``mujoco/rendering/classic/gl_context.py``); only an unset/blank value is replaced by a
+headless-friendly default.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import warnings
 from collections.abc import Mapping
 
-_DISABLED = frozenset({"disable", "disabled", "off"})
-_PLATFORM_BACKENDS: Mapping[str, frozenset[str]] = {
-    "darwin": frozenset({"cgl", "glfw"}),
-    "linux": frozenset({"egl", "osmesa", "glfw"}),
-    "win32": frozenset({"wgl", "glfw"}),
+DISABLED_VALUES = frozenset({"disable", "disabled", "off", "false", "0"})
+_GENERIC_VALUES = frozenset({"enable", "enabled", "on", "true", "1", "glfw"})
+_PLATFORM_VALUES: Mapping[str, frozenset[str]] = {
+    "darwin": frozenset({"cgl"}),
+    "linux": frozenset({"glx", "egl", "osmesa"}),
+    "win32": frozenset({"wgl"}),
 }
-_DEFAULTS: Mapping[str, str] = {"darwin": "cgl", "linux": "osmesa"}
 
 
-def default_gl_backend(platform: str) -> str:
-    """Headless-friendly default: CGL on macOS, OSMesa on Linux (works on CPU-only CI)."""
-    return _DEFAULTS.get(platform, "glfw")
+def _requested(env: Mapping[str, str]) -> str:
+    return env.get("MUJOCO_GL", "").strip().lower()
+
+
+def rendering_disabled(env: Mapping[str, str]) -> bool:
+    """True when ``MUJOCO_GL`` explicitly turns rendering off."""
+    return _requested(env) in DISABLED_VALUES
+
+
+def default_gl_backend(platform: str, env: Mapping[str, str]) -> str:
+    """CGL on macOS; on Linux GLFW with a display, OSMesa when headless (CPU-only CI)."""
+    if platform == "darwin":
+        return "cgl"
+    if platform == "linux":
+        has_display = bool(env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"))
+        return "glfw" if has_display else "osmesa"
+    return "glfw"
 
 
 def resolve_gl_backend(env: Mapping[str, str], platform: str) -> str:
-    """Return the backend to use, honoring a valid ``MUJOCO_GL`` already in ``env``."""
-    requested = env.get("MUJOCO_GL", "").strip().lower()
+    """Return the backend to use, honoring any ``MUJOCO_GL`` value MuJoCo itself accepts."""
+    requested = _requested(env)
     if not requested:
-        return default_gl_backend(platform)
-    if requested in _DISABLED:
-        return requested
-    allowed = _PLATFORM_BACKENDS.get(platform, frozenset({"glfw"}))
+        return default_gl_backend(platform, env)
+    allowed = DISABLED_VALUES | _GENERIC_VALUES | _PLATFORM_VALUES.get(platform, frozenset())
     if requested not in allowed:
         raise ValueError(
-            f"MUJOCO_GL={requested!r} is not available on {platform}; "
-            f"use one of {sorted(allowed | _DISABLED)}"
+            f"MUJOCO_GL={requested!r} is not available on {platform}; use one of {sorted(allowed)}"
         )
     return requested
 
 
 def configure() -> str:
-    """Set ``MUJOCO_GL`` for this process and return the chosen backend."""
+    """Set ``MUJOCO_GL`` for this process and return the chosen backend.
+
+    Warns when ``mujoco`` was imported first with a different setting: MuJoCo has already
+    picked its GL context, so the new value cannot take effect in this process.
+    """
     backend = resolve_gl_backend(os.environ, sys.platform)
+    if "mujoco" in sys.modules and _requested(os.environ) != backend:
+        warnings.warn(
+            f"mujoco was imported before topple; MUJOCO_GL={backend!r} cannot take effect in "
+            "this process. Import topple first or set MUJOCO_GL yourself.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     os.environ["MUJOCO_GL"] = backend
     return backend

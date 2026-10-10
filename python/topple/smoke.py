@@ -6,11 +6,14 @@ Usage: ``python -m topple.smoke [--out smoke.png] [--steps 1000]``
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import imageio.v3 as iio
 import mujoco
+
+from topple.rendering import RenderingUnavailableError, make_renderer
 
 SMOKE_XML = """
 <mujoco model="smoke-pendulum">
@@ -56,7 +59,7 @@ def run_smoke(
     for _ in range(steps):
         mujoco.mj_step(model, data)
 
-    renderer = mujoco.Renderer(model, height=height, width=width)
+    renderer = make_renderer(model, height=height, width=width)
     try:
         renderer.update_scene(data)
         pixels = renderer.render()
@@ -75,12 +78,26 @@ def run_smoke(
     )
 
 
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {text!r}") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=Path("smoke.png"))
-    parser.add_argument("--steps", type=int, default=1000)
+    parser.add_argument("--steps", type=_positive_int, default=1000)
     args = parser.parse_args(argv)
-    result = run_smoke(args.out, steps=args.steps)
+    try:
+        result = run_smoke(args.out, steps=args.steps)
+    except RenderingUnavailableError as exc:
+        print(f"smoke failed: {exc}", file=sys.stderr)
+        return 1
     print(f"smoke ok: {result.steps} steps, t={result.sim_time:.3f}s -> {result.image_path}")
     return 0
 
