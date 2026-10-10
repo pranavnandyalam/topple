@@ -67,45 +67,57 @@ the competitor, growth, frontier-tech and feasibility sweeps.
 ## 4. Architecture
 
 ```
-robot-sim-lab/
+topple/
 ├── python/topple/
-│   ├── envs/            base.py, balance.py, waypoint.py, sumo.py
-│   ├── robots/          MJCF assets (placeholder + CAD export)
-│   ├── controller_api.py   Controller protocol + Observation (frozen)
-│   ├── controllers/     pid.py, onnx_policy.py
-│   ├── disturbances.py  pushes, sensor noise, mass/friction/latency randomization
-│   ├── evaluate.py      eval_v1: seeded episodes → metrics + traj.npz
-│   ├── runner.py        runs untrusted controller in a subprocess (pipe IPC, timeout)
-│   ├── crashtest/       fuzzer.py (CMA-ES adversary), roa.py, stl.py, rating.py
-│   ├── coach/           Claude coach loop, autotune (Eureka-lite)
-│   ├── sumo/            self-play training, Elo, tournament scheduler
-│   ├── sysid/           fit sim params to real-robot logs
-│   ├── train.py, export.py (→ ONNX, → C), video.py, cli.py
-├── web/                 Arena: replay viewer, live sandbox, leaderboard, share cards
-├── action/              reusable GitHub Action (robot-ci)
-├── challenges/          task specs: balance-v1, waypoint-v1, sumo-v1, ... (MJCF + scorer + seeds)
-├── firmware/            ESP32 balancer firmware + host log tool
-├── curriculum/          5 lessons, slides, rubrics, GitHub Classroom template
-├── configs/             YAML: env params, rewards, PPO hyperparams
+│   ├── contract.py      Controller protocol, BalancerObs (obs_v1), TaskSpec, action validation (stdlib only)
+│   ├── ids.py, rng.py   identifier grammar; named append-only RNG streams
+│   ├── robot.py         balancer.robot.v1: params, MjSpec builder (motors, IMU, friction), validation
+│   ├── challenge.py     challenge bundles (challenge.yaml: presets, score constants, public seeds)
+│   ├── challenges/      balance-v1/{challenge.yaml, scene.xml, robot/}, later waypoint-v1, sumo-v1, ...
+│   ├── disturbances.py  presets (ideal/clean/standard), JSON scenarios, pushes
+│   ├── estimation.py    IMU model, complementary filter, encoders, odometry (portable float math)
+│   ├── envs/            balance.py (topple/Balance-v1), later waypoint.py, sumo.py
+│   ├── controllers/     pid.py, lqr.py, onnx_policy.py (P2)
+│   ├── design/          LQR design from the linearized model
+│   ├── traj.py, scoring.py, verify.py   topple.traj/1, metrics + score, open-loop re-simulation check
+│   ├── evaluate.py, results.py, loader.py   protocols, topple.results/1, submission loading
+│   ├── runner.py        (P3) runs untrusted controllers in a subprocess/container
+│   ├── crashtest/       (P4) fuzzer, RoA, STL, rating
+│   ├── coach/, sumo/, sysid/   (P6, P7, P8)
+│   └── train.py, export.py, video.py, cli.py
+├── web/                 (P5) Arena: replay viewer, live sandbox, leaderboard, share cards
+├── action/              (P3) reusable GitHub Action (robot-ci)
+├── firmware/            (P8) ESP32 balancer firmware + host log tool
+├── curriculum/          (P9) lessons, slides, rubrics, GitHub Classroom template
 ├── submissions/         example controllers
-└── .github/workflows/   eval.yml (untrusted), publish.yml (workflow_run), nightly-sumo.yml
+├── docs/contract.md     the normative contract
+└── .github/workflows/   ci.yml; (P3) eval.yml (untrusted), publish.yml (workflow_run), nightly
 ```
 
-### Core contract (unchanged in spirit, fixed for waypoints)
+### Core contract
+
+The normative definition is `docs/contract.md`; this is the summary.
+
 ```python
-@dataclass(frozen=True)
-class Observation:
-    pitch: float; pitch_rate: float
-    yaw: float; yaw_rate: float               # added: needed to steer to targets
-    wheel_vel: tuple[float, float]
-    target_rel: tuple[float, float] | None    # waypoint/sumo tasks, in robot frame
+@dataclass(frozen=True, slots=True)
+class BalancerObs:                     # balancer.obs.v1, alias topple.contract.Observation
+    t: float                           # s since reset (metadata, not a feature)
+    pitch: float; pitch_rate: float    # from the IMU + complementary filter, not ground truth
+    yaw: float; yaw_rate: float        # yaw from wheel odometry, yaw_rate from the gyro
+    wheel_pos: tuple[float, float]     # quantized encoders, rad since reset
+    wheel_vel: tuple[float, float]     # encoder finite difference per control step
+    last_action: tuple[float, float]   # command applied during the previous step
 
 class Controller(Protocol):
-    def reset(self, seed: int) -> None: ...
-    def act(self, obs: Observation) -> np.ndarray: ...   # wheel torques, clipped to limits
+    def reset(self, rng_seed: int) -> None: ...      # private seed, never the episode seed
+    def act(self, obs: BalancerObs) -> Sequence[float]: ...   # normalized voltage per wheel, [-1, 1]
+
+def make_controller(spec: TaskSpec) -> Controller: ...        # in every submission
 ```
-The contract is versioned (`obs_v1`). PID, ONNX policies, user submissions, coach output and
-hardware firmware all implement it.
+`act()` runs at exactly 100 Hz everywhere, firmware included; sensing and estimation run at
+500 Hz. PID, LQR, ONNX policies, user submissions, coach output and firmware all implement it.
+Later tasks append fields under new schema ids (e.g. `balancer-target.obs.v1`) instead of
+changing `obs_v1`.
 
 ### Trust model (the non-negotiables)
 - **Ranked scores come only from CI** (pinned Linux image = source of truth). Browser runs are unranked.
@@ -177,7 +189,7 @@ assume part-time work alongside school.
 
 ### Phase 8: Sim-to-Real (3–4 weeks + parts lead time)
 - Design the balancer in Onshape (mates `dof_left_wheel`/`dof_right_wheel`), export with `onshape-to-robot`, commit MJCF.
-- Build: ESP32-S3, IMU, 2 encoder motors, battery (~$50). Firmware runs PID or a generated-C MLP at 200–500 Hz and logs over Wi-Fi.
+- Build: ESP32-S3, IMU, 2 encoder motors, battery (~$50). Firmware runs the IMU + estimator at 500 Hz and calls the controller (PID or a generated-C MLP) at exactly 100 Hz, logging `topple.traj/1`-compatible records over Wi-Fi.
 - `sysid/`: fit motor constants, friction and latency from logs; retrain with randomization centered on fitted values.
 - **Sim-to-real correlation study** (the credibility test for the whole leaderboard):
   - Run ≥8 controllers (PID variants, PPO, top leaderboard entries) on both sim and real with a scripted push rig (servo or pendulum striker, so pushes are repeatable).

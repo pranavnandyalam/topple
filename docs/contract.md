@@ -230,15 +230,16 @@ pickles, no strings). Row `k` of state arrays is the state at `t = k·control_dt
 | `qpos` | T+1 × nq | f8 | state; row T is the final/terminal state |
 | `qvel` | T+1 × nv | f8 | |
 | `obs` | T × 10 | f4 | exactly what the controller received |
-| `action` | T × 2 | f8 | raw controller output (NaN row on error) |
+| `action` | T × 2 | f8 | raw controller output, before clipping |
 | `ctrl` | T × 2 | f8 | clipped command issued at step k (before native delay) |
 | `enc_counts` | T × 2 | i4 | encoder counts after the step |
 | `gyro`, `accel` | T × 3 | f4 | last-substep IMU readings (after bias/noise) |
 | `push_force` | T × 3 | f8 | world-frame push force active during step k (0 if none) |
 | `epilogue_qpos` | E × nq | f8 | 1 s after termination, replay only |
-| `meta_json` | n | u1 | UTF-8 JSON: format, challenge, protocol, episode_index, scenario, versions, model sha256, termination {step, reason}, control_dt, timestep, field names |
+| `meta_json` | n | u1 | UTF-8 JSON: format, challenge, preset, episode_index, scenario, versions, robot_hash, wheel_sign, joint addresses, termination {step, reason}, error (if any), control_dt, timestep, frame_skip, max_steps, obs features |
 
-The env is a pure function of (protocol, scenario, ctrl sequence): `verify_episode` re-simulates
+If the controller errors at step `k`, the episode stops there (T = k) and the error is stored in
+`meta.error`. The env is a pure function of (protocol, scenario, ctrl sequence): `verify_episode` re-simulates
 open loop from `scenario` + `ctrl` and must reproduce `qpos` exactly on the same platform.
 Loading uses `allow_pickle=False`, an allow-list of keys, dtype checks, `T ≤ max_steps`, and a
 per-member size cap.
