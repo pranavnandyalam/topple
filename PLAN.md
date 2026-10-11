@@ -50,8 +50,8 @@ the competitor, growth, frontier-tech and feasibility sweeps.
 | Layer | Choice | Notes |
 |---|---|---|
 | Core | Python 3.12 via `uv`, `mujoco==3.15.*` (pinned) | Determinism is guaranteed only within one version + architecture |
-| RL | Gymnasium 1.4, SB3 2.9 (PPO/SAC), TensorBoard | Training on CPU `SubprocVecEnv`, 16 envs on 18 cores |
-| Policy format | **ONNX everywhere** (SB3 export wrapper with VecNormalize + clipping baked in) | Eval/CI/browser never need torch: `onnxruntime` ~15 MB vs. torch 555 MB+ |
+| RL | Gymnasium 1.4, SB3 2.9 (PPO/SAC), TensorBoard | Training runs on CPU with `SubprocVecEnv`: 8 envs, at most 1 run at a time, and eval pools of at most 4 workers. This is because the laptop is shared (Phase 2 spec §1). |
+| Policy format | **ONNX everywhere** (pickle-free `onnx.helper` build, IR 8 / opset 17, VecNormalize and clip baked in, canonical bytes) | Eval/CI/browser never need torch: `onnxruntime` ~15 MB vs. torch 555 MB+ |
 | CLI | `typer` | `topple run / eval / train / export / fuzz / coach / autotune / sumo` |
 | Rendering | `mujoco.Renderer`; `MUJOCO_GL=cgl` (Mac), `osmesa` (Linux CI) | CI renders one short episode at 320×240 → GIF |
 | CI | GitHub Actions, `pull_request` → `workflow_run` split | Fork PRs get no secrets; privileged stage only reads validated artifacts |
@@ -77,14 +77,16 @@ topple/
 │   ├── disturbances.py  presets (ideal/clean/standard), JSON scenarios, pushes
 │   ├── estimation.py    IMU model, complementary filter, encoders, odometry (portable float math)
 │   ├── envs/            balance.py (topple/Balance-v1), later waypoint.py, sumo.py
-│   ├── controllers/     pid.py, lqr.py, onnx_policy.py (P2)
+│   ├── controllers/     pid.py, lqr.py, onnx_policy.py (P2), waypoint_pid.py (P2b)
+│   ├── policy/          (P2) topple.policy/1: manifest, ONNX build, acceptance validator, hardened ORT session
+│   ├── train/           (P2) config + wrappers + selection (torch-free); learn/snapshot/callbacks (train extra)
 │   ├── design/          LQR design from the linearized model
 │   ├── traj.py, scoring.py, verify.py   topple.traj/1, metrics + score, trusted replay + re-scoring
 │   ├── evaluate.py, results.py, loader.py   protocols, topple.results/1, submission loading
 │   ├── runner.py        (P3) runs untrusted controllers in a subprocess/container
 │   ├── crashtest/       (P4) fuzzer, RoA, STL, rating
 │   ├── coach/, sumo/, sysid/   (P6, P7, P8)
-│   └── train.py, export.py, video.py, cli.py
+│   └── export.py, stats.py, compare.py, bench.py, course.py (P2b), video.py, cli.py
 ├── web/                 (P5) Arena: replay viewer, live sandbox, leaderboard, share cards
 ├── action/              (P3) reusable GitHub Action (robot-ci)
 ├── firmware/            (P8) ESP32 balancer firmware + host log tool
@@ -128,6 +130,10 @@ changing `obs_v1`.
   re-simulates an uploaded trajectory's commands on its own build from the protocol's own seed and
   scores only that replay; any bit that differs fails verification (contract §16).
 - **Tournament opponents exchange ONNX weights (data), not code.**
+  - An ONNX submission is a directory containing only `policy.onnx` and `policy.json`, with no
+    `.py` and no pickles.
+  - Models are validated on their bytes against an allow-list before ORT parses them.
+  - Pickled training checkpoints never cross a trust boundary.
 
 ---
 
@@ -149,11 +155,50 @@ assume part-time work alongside school.
 - `eval_v1`: 20 seeded episodes → `results.json` + `traj.npz`; `topple run` writes MP4.
 - **Done when:** `env_checker` passes; PID balances >90% of no-push episodes; same seed gives an identical trajectory on the same platform (test); coverage ≥80%.
 
-### Phase 2: Learn (1–2 weeks)
-- PPO (16 envs, curriculum: none → small pushes → full randomization), TensorBoard, checkpoints.
-- `topple export` → ONNX (VecNormalize + clipping baked in); `onnx_policy.py` controller.
-- `WaypointTask`; SAC comparison (wall-clock, sample efficiency).
-- **Done when:** PPO beats PID on `eval_v1` *with* disturbances; ONNX actions match torch within 1e-5; side-by-side PID vs. PPO video exists.
+### Phase 2: Learn (1–2 weeks). Spec: `docs/design/phase-2.md`
+- **2a, balance.**
+  - Training: PPO with 8 SubprocVecEnv workers on `balance-v1/standard` from step 0. There is no
+    curriculum (measured worse). Each seed trains for 5M steps, and 3 seeds are run.
+  - Training-only action-excess penalty.
+  - Checkpoints are selected on 200 selection seeds through the real harness. Logging uses
+    TensorBoard.
+  - Checkpoints are eligible only if success ≥ PID's, median energy ≤ E_ref and saturation ≤ 0.08.
+  - SAC is the comparison: 1.0M env steps (about PPO's training time), same harness and seeds.
+    It is learner-throughput-limited at this budget and is not expected to reach PID level.
+  - Each run is capped by a process-tree RSS limit and a CPU-seconds budget. Wall-clock is only a
+    runaway guard; an aborted run is re-run, never reported.
+- **Export.** `topple export` builds a pickle-free, torch-free ONNX: VecNormalize and clipping are
+  baked in, with IR 8 and opset 17. It writes a **data-only** submission (`policy.onnx` +
+  `policy.json`, `topple.policy/1`, no code). This needs an ONNX acceptance policy and the
+  hardened `ONNXPolicy` runtime.
+- **Results.** The package covers the CI scoreboard, the shove test, learning curves and the hero
+  video.
+- **Done when (2a):** the shipped ONNX directory, run without torch, must pass all of:
+  - its eval_v1 score > PID's;
+  - on calibration seeds 0..199, the paired-bootstrap 95% CI of (PPO − PID) is above 0;
+  - its success rate ≥ PID's on both seed sets;
+  - it beats LQR (paired CI lower bound of PPO − LQR > 0, success ≥ LQR's − 0.03);
+  - median energy ≤ E_ref and saturation ≤ 0.10;
+  - ONNX matches SB3's own predict within 1e-5, open-loop at batch 1, re-checked torch-free in CI;
+  - at least 2 of the 3 PPO training seeds independently pass the PID gates (the recipe, not one
+    lucky seed);
+  - a side-by-side PID vs PPO video exists.
+- **2b, waypoint-v1** (after 2a).
+  - The course: fixed-leg courses (5 × 0.70 m), the `balancer-target.obs.v1` observation,
+    and a frozen scorer (55 course / 25 speed / 15 alive / 5 energy).
+  - Baselines and training: a reference driver, and PPO trained from scratch vs fine-tuned from
+    the balance policy.
+- **Done when (2b):**
+  - the challenge is frozen (push strength calibrated first, by a fixed sweep), its two-sided
+    calibration band holds, and its degenerate-strategy anchors pass;
+  - it is learnable, judged relative to the reference driver at the frozen push level: the best
+    learned policy docks on ≥ 60% of calibration seeds, is not clearly worse than the driver
+    (paired CI lower bound of PPO − driver > −5), beats the creeper anchor, and falls at most
+    20 points more often than the driver;
+  - balance-v1 is unchanged;
+  - verify and rescore work;
+  - both arms are reported (3 seeds each);
+  - a course video exists.
 
 ### Phase 3: Robot CI (1–1.5 weeks): *first public release*
 - `runner.py` subprocess sandbox; rejects bad shapes, NaNs, timeouts, exceptions.
@@ -256,12 +301,20 @@ parts ordering, which should happen in month 2 to absorb shipping time.
 - **Determinism:** same seed → bit-identical trajectory per platform; cross-platform within tolerance over 1k steps.
 - **Contract:** every controller in `submissions/` and every coach output satisfies `Controller`.
 - **Security/red-team:** scorer tampering, `os.system`, network calls, infinite loops, memory bombs, oversized output, malicious artifacts in `workflow_run`.
-- **ONNX parity:** torch vs. ONNX within 1e-5 on 1k random observations.
+- **ONNX parity:** ONNX matches SB3's own predict pipeline within 1e-5. The check runs at batch 1
+  on fixed observation sets, fed open-loop:
+  - on-policy observations;
+  - random observations in normalized space;
+  - edge cases;
+  - with at least 300 unsaturated rows.
+
+  CI re-checks the result without torch.
 - **Integration:** `topple eval` → valid `results.json`; action end-to-end on a test repo.
 - **Golden regression:** PID score range; CI fails if a sim change moves it.
 - **Web:** Vitest for replay decoding and the sandbox worker; Playwright smoke for "load → shove → edit gain".
 - **Coach:** recorded-response tests (no live API in CI); live benchmark run manually.
-- Training is not unit-tested; 2k-step smoke train in CI.
+- Training is not unit-tested. A 2k-step smoke train runs in CI, in the separate `python-train` job
+  that has the train extra. The default job never installs torch.
 
 ---
 
@@ -274,7 +327,7 @@ parts ordering, which should happen in month 2 to absorb shipping time.
 | Pwn-request / CI abuse | High | `pull_request` + `workflow_run` split, `permissions: {}`, timeouts, first-time-contributor approval, never execute artifacts |
 | Cross-platform divergence | Med | Pin MuJoCo, CI image authoritative, replays from stored trajectories |
 | MuJoCo WASM is "WIP" | Med | Pin npm version; Arena falls back to pre-rendered GIF/MP4 |
-| Reward hacking / RL not converging | Med | PID proves solvability; curriculum; watch videos; autotune |
+| Reward hacking / RL not converging | Med | PID proves solvability; 5M budget, 3 seeds, 200-seed selection, action-excess penalty; watch videos; autotune |
 | Claude cost/abuse in coach | Low | Bring-your-own key for public users; Pranav's Max plan covers only his own use (Claude Code) |
 | Onshape API quota / export pain | Med | Placeholder MJCF unblocks everything; export once, commit output |
 | Hardware sim-to-real gap | Med | System ID + domain randomization; PID fallback; treat the gap as a write-up finding |
