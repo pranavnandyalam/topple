@@ -292,10 +292,11 @@ def test_results_round_trip_and_atomic_write(tmp_path: Path) -> None:
 
 
 def test_results_reject_nan_and_extra_fields() -> None:
+    """A NaN where no bound would refuse it (a metric value): only the no-NaN/Inf rule can."""
     results = evaluate(protocol("ideal", 1), pid, INFO)
     data = results.model_dump()
-    data["aggregate"]["score"] = math.nan
-    with pytest.raises(ValidationError):
+    data["episodes"][0]["metrics"]["energy_j"] = math.nan
+    with pytest.raises(ValidationError, match="finite"):
         EvalResults.model_validate(data)
     data = results.model_dump()
     data["surprise"] = 1

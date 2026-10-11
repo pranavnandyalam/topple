@@ -22,6 +22,7 @@ from topple.results import (
     MAX_EPISODES,
     MAX_METRIC_CHARS,
     MAX_METRICS,
+    MAX_STEP,
     MAX_TIME_UPRIGHT_S,
     ControllerInfo,
     EpisodeResult,
@@ -49,6 +50,7 @@ def episode(index: int, *, seed: int | None = 0, error: str | None = None) -> di
 
 def results_dict(**overrides: Any) -> dict[str, Any]:
     data: dict[str, Any] = {
+        "format": "topple.results/1",
         "challenge": "balance-v1",
         "protocol": "balance-v1/standard",
         "protocol_hash": HEX,
@@ -562,6 +564,167 @@ def test_read_results_refuses_a_file_that_grew_past_the_cap(
     )
     with pytest.raises(ValueError, match=r"^results\.json has more than 100 bytes$"):
         read_results(path)
+
+
+# ------------------------------------------------------------------ reading: exact types, domains
+
+
+def read_json(tmp_path: Path, data: dict[str, Any], *, token: str | None = None) -> EvalResults:
+    """``read_results`` of ``data`` written as JSON; ``token`` (such as ``NaN``) replaces the
+    string value ``"__TOKEN__"`` verbatim, for what ``json.dumps`` would not write."""
+    text = json.dumps(data)
+    if token is not None:
+        assert text.count('"__TOKEN__"') == 1
+        text = text.replace('"__TOKEN__"', token)
+    path = tmp_path / "results.json"
+    path.write_text(text)
+    return read_results(path)
+
+
+def edited(edit: Callable[[dict[str, Any]], None], **overrides: Any) -> dict[str, Any]:
+    data = results_dict(**overrides)
+    edit(data)
+    return data
+
+
+def _set(*path: Any, value: Any) -> Callable[[dict[str, Any]], None]:
+    def edit(data: dict[str, Any]) -> None:
+        target = data
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+
+    return edit
+
+
+def test_read_json_reads_an_honest_file(tmp_path: Path) -> None:
+    assert read_json(tmp_path, results_dict()) == EvalResults.model_validate(results_dict())
+
+
+LOOSE = {
+    "success as a string": _set("episodes", 0, "success", value="yes"),
+    "complete as a string": _set("complete", value="on"),
+    "index as a string": _set("episodes", 0, "index", value="0"),
+    "seed as a string": _set("episodes", 0, "seed", value="0"),
+    "seed as a float": _set("episodes", 0, "seed", value=0.0),
+    "score as a string": _set("episodes", 0, "score", value="90.0"),
+    "success rate as a boolean": _set("aggregate", "success_rate", value=True),
+    "errors as a string": _set("aggregate", "errors", value="0"),
+}
+
+
+@pytest.mark.parametrize("edit", LOOSE.values(), ids=LOOSE.keys())
+def test_reading_refuses_values_of_the_wrong_json_type(
+    tmp_path: Path, edit: Callable[[dict[str, Any]], None]
+) -> None:
+    """The writer emits exact JSON types, and a reader of the raw file (jq, JavaScript) sees the
+    raw ones: ``"yes"`` is not ``true`` and ``"0"`` is not ``0``. Validation coerces nothing."""
+    with pytest.raises(ValidationError):
+        read_json(tmp_path, edited(edit))
+
+
+def test_reading_requires_the_format(tmp_path: Path) -> None:
+    """A file that never says it is ``topple.results/1`` is not one."""
+    data = results_dict()
+    del data["format"]
+    with pytest.raises(
+        ValueError, match=r"^results\.json: no format: not a topple\.results/1 file$"
+    ):
+        read_json(tmp_path, data)
+    with pytest.raises(ValidationError):
+        read_json(tmp_path, results_dict(format="topple.results/2"))
+
+
+def _private(**aggregate: Any) -> dict[str, Any]:
+    data = results_dict(seed_set="private", episodes=None)
+    data["aggregate"].update(aggregate)
+    return data
+
+
+OUT_OF_DOMAIN = {
+    "negative seed": edited(_set("episodes", 0, "seed", value=-5)),
+    "seed 2**53": edited(_set("episodes", 0, "seed", value=2**53)),
+    "seed 2**64": edited(_set("episodes", 0, "seed", value=2**64)),
+    "seed 10**300": edited(_set("episodes", 0, "seed", value=10**300)),
+    "index beyond the episode cap": edited(
+        _set("episodes", 1, "index", value=MAX_EPISODES), complete=False
+    ),
+    "error step 10**30": edited(
+        _set(
+            "episodes",
+            1,
+            value={
+                **episode(1, seed=5, error="exception"),
+                "error": {"code": "exception", "step": 10**30, "detail": ""},
+            },
+        ),
+        complete=False,
+        aggregate={
+            "score": 45.0,
+            "success_rate": 0.5,
+            "mean_time_upright_s": 10.0,
+            "episodes": 2,
+            "errors": 1,
+        },
+    ),
+    "private episode count 10**30": _private(episodes=10**30),
+    "private error count 10**30": _private(episodes=5, errors=10**30),
+    "more private errors than episodes": _private(episodes=5, errors=6),
+}
+
+
+@pytest.mark.parametrize("data", OUT_OF_DOMAIN.values(), ids=OUT_OF_DOMAIN.keys())
+def test_reading_refuses_numbers_outside_their_domain(tmp_path: Path, data: dict[str, Any]) -> None:
+    """Seeds are integers in [0, 2**53) (§9), indices below the episode cap, error steps and
+    episode counts within their bounds (§15): exact in every JSON reader, JavaScript included."""
+    with pytest.raises(ValidationError):
+        read_json(tmp_path, data)
+
+
+def test_the_bounds_accept_their_limits() -> None:
+    data = results_dict(complete=False)
+    data["episodes"][1].update(index=MAX_EPISODES - 1, seed=2**53 - 1)
+    assert EvalResults.model_validate(data).episodes[1].seed == 2**53 - 1  # type: ignore[index]
+    assert ErrorInfo(code="exception", step=MAX_STEP).step == MAX_STEP
+    private = EvalResults.model_validate(_private(episodes=MAX_EPISODES, errors=MAX_EPISODES))
+    assert private.aggregate.errors == MAX_EPISODES
+
+
+@pytest.mark.parametrize("seed_set", ["public", "private"])
+def test_a_protocol_belongs_to_the_results_challenge(tmp_path: Path, seed_set: str) -> None:
+    data = results_dict(protocol="sumo-v1/standard")
+    if seed_set == "private":
+        data = {**_private(), "protocol": "sumo-v1/standard"}
+    with pytest.raises(
+        ValidationError, match=r"protocol 'sumo-v1/standard' is not one of 'balance-v1'"
+    ):
+        read_json(tmp_path, data)
+
+
+NON_FINITE = ["NaN", "Infinity", "-Infinity", "1e400"]
+
+
+@pytest.mark.parametrize("token", NON_FINITE)
+@pytest.mark.parametrize(
+    "where",
+    ["metric value", "mean upright of an incomplete run", "mean upright of a private run"],
+)
+def test_reading_refuses_non_finite_numbers_where_no_bound_would(
+    tmp_path: Path, where: str, token: str
+) -> None:
+    """Metric values have no bounds and a mean time upright only a lower one: only the no-NaN/Inf
+    rule (§15) refuses these. Python's JSON parser accepts the tokens, and writing them back
+    would turn them into null."""
+    if where == "metric value":
+        data = results_dict(complete=False)
+        data["episodes"][0]["metrics"]["energy_j"] = "__TOKEN__"
+    elif where == "mean upright of an incomplete run":
+        data = results_dict(complete=False)
+        data["aggregate"]["mean_time_upright_s"] = "__TOKEN__"
+    else:
+        data = _private(mean_time_upright_s="__TOKEN__")
+    with pytest.raises(ValidationError, match="finite"):
+        read_json(tmp_path, data, token=token)
 
 
 UNSAFE_TEXT = "\x1b]0;pwn\x07\u202e\n::error::x"  # a terminal escape, a bidi override, a CI command

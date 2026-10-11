@@ -24,6 +24,7 @@ from pydantic import (
 
 from topple._inputs import open_regular
 from topple.ids import parse_protocol, validate_challenge_id
+from topple.rng import MAX_SEED
 
 FORMAT: Literal["topple.results/1"] = "topple.results/1"
 MAX_DETAIL_CHARS = 300
@@ -39,6 +40,8 @@ MAX_METRIC_CHARS = 64
 MAX_TIME_UPRIGHT_S = 1e9
 """Largest ``time_upright_s`` a complete run may report: far beyond any episode, and small
 enough that the sum over ``MAX_EPISODES`` episodes stays far from overflowing."""
+MAX_STEP = 10**7
+"""Largest step an error may name: far beyond any episode (balance-v1 has 1000 steps)."""
 MAX_RESULTS_BYTES = 16 * 1024 * 1024
 """Most bytes ``read_results`` reads."""
 RESULTS_FILE_MODE = 0o644
@@ -123,7 +126,7 @@ class _Strict(BaseModel):
 
 class ErrorInfo(_Strict):
     code: ErrorCode
-    step: int = Field(ge=0)
+    step: int = Field(ge=0, le=MAX_STEP)
     detail: str = ""  # untrusted: produced by submitted code; escape before rendering
 
     @field_validator("detail")
@@ -133,8 +136,8 @@ class ErrorInfo(_Strict):
 
 
 class EpisodeResult(_Strict):
-    index: int = Field(ge=0)
-    seed: int | None  # None for private seed sets
+    index: int = Field(ge=0, lt=MAX_EPISODES)
+    seed: Annotated[int, Field(ge=0, lt=MAX_SEED)] | None  # None for private seed sets (§9)
     success: bool
     score: float = Field(ge=0.0, le=100.0)
     metrics: Metrics | None
@@ -151,8 +154,16 @@ class Aggregate(_Strict):
     score: float = Field(ge=0.0, le=100.0)
     success_rate: float = Field(ge=0.0, le=1.0)
     mean_time_upright_s: float = Field(ge=0.0)
-    episodes: int = Field(ge=0)
-    errors: int = Field(ge=0)
+    episodes: int = Field(ge=0, le=MAX_EPISODES)
+    errors: int = Field(ge=0, le=MAX_EPISODES)
+
+    @model_validator(mode="after")
+    def _errors_among_episodes(self) -> Aggregate:
+        if self.errors > self.episodes:
+            raise ValueError(
+                f"aggregate.errors is {self.errors}, more than its {self.episodes} episodes"
+            )
+        return self
 
 
 class Versions(_Strict):
@@ -194,6 +205,8 @@ class EvalResults(_Strict):
 
     @model_validator(mode="after")
     def _consistent(self) -> EvalResults:
+        if parse_protocol(self.protocol)[0] != self.challenge:
+            raise ValueError(f"protocol {self.protocol!r} is not one of {self.challenge!r}")
         if self.seed_set == "private":
             if self.episodes is not None:
                 raise ValueError("private results are redacted: episodes must be null")
@@ -330,4 +343,9 @@ def read_results(path: Path) -> EvalResults:
         data = fh.read(MAX_RESULTS_BYTES + 1)  # it may have grown since it was examined
     if len(data) > MAX_RESULTS_BYTES:
         raise ValueError(f"{path.name} has more than {MAX_RESULTS_BYTES} bytes")
-    return EvalResults.model_validate_json(data)
+    # Strict: the writer emits exact JSON types, and a raw reader (jq, JavaScript) sees those, so
+    # nothing is coerced ("yes" is not true, "0" is not 0, true is not 1.0).
+    results = EvalResults.model_validate_json(data, strict=True)
+    if "format" not in results.model_fields_set:
+        raise ValueError(f"{path.name}: no format: not a {FORMAT} file")
+    return results
