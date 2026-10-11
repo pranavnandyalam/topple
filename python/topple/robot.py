@@ -534,9 +534,10 @@ def _axle_problems(model: mujoco.MjModel, chassis: int, tires: tuple[int, int]) 
 def _spawn_problems(model: mujoco.MjModel, chassis: int, tires: tuple[int, int]) -> list[str]:
     """The chassis origin (the axle) must start one tire radius above the floor, the plane z = 0.
 
-    A reset keeps the root's position from the MJCF and sets only its orientation and velocities
-    (contract §9), so this height is what spawns the tires touching the floor (§5). Checked only
-    while ``root`` is the chassis's free joint (``_root_problems`` reports anything else).
+    A reset keeps the root's position from the MJCF and sets only its orientation (the initial
+    pitch) and the velocities (contract §3, §9), so this height is what spawns the tires touching
+    the floor (§5). Checked only while ``root`` is the chassis's free joint (``_root_problems``
+    reports anything else).
     """
     root = _lookup(model, mujoco.mjtObj.mjOBJ_JOINT, ROOT_JOINT)
     free = root >= 0 and model.jnt_type[root] == mujoco.mjtJoint.mjJNT_FREE

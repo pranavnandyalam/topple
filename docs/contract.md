@@ -133,9 +133,9 @@ or its contacts with the floor, and the geometry the env relies on:
   floor (§5) and start rolling without slip.
 - the chassis starts with its origin, the axle, one tire radius above the floor (the plane
   z = 0): the root's initial position is the chassis body's `pos`, whose z must equal `size[0]`
-  within 1e-6 m. A reset keeps that position and sets only the root's orientation and
-  velocities, so this height is what spawns the tires touching the floor (§5); where on the
-  floor the MJCF puts the robot, and how it turns it, do not matter. At z = 0 the robot would
+  within 1e-6 m. A reset keeps that position and sets only the root's orientation (the initial
+  pitch) and the velocities (§9), so this height is what spawns the tires touching the floor
+  (§5); where on the floor the MJCF puts the robot, and how it turns it, do not matter. At z = 0 the robot would
   start half inside the floor and every episode would end at step 1 with `floor_contact`.
 - the `imu` site is not rotated relative to the chassis: each of its axes lies along the same
   chassis axis, within 1e-6 in 1 − cos of the angle between them. MuJoCo's gyro and
