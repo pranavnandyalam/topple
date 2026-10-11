@@ -1,9 +1,10 @@
-# Phase 2 design: Learn (v5.1, normative)
+# Phase 2 design: Learn (v5.2, normative)
 
 v5 resolves re-critique round 3. Every issue from the six critiques (`wf_3f0c2a9a-a51`,
 `wf_2fb93652-cd0`, `wf_bc1d1edf-2dc`) and the three re-critiques is decided in
 `docs/design/phase-2-decisions.md`. v5.1 syncs the spec with the merged Phase 1 (main `f997394`,
-PR #3); its changes are rows S1–S21 of the log's "Sync with merged Phase 1".
+PR #3); its changes are rows S1–S22 of the log's "Sync with merged Phase 1". v5.2 fixes the 18
+findings of the sync's adversarial verification (rows V1–V18 of the log's "Sync verification").
 
 The design builds on the merged Phase 1 code and `docs/contract.md` ("contract §n", also for a
 list such as "contract §9, §14"; a bare §n is this spec): `controller_obs(obs_arr, t)`,
@@ -393,7 +394,8 @@ exported artifacts (§4–§5).
 A policy submission is **data only**: a real directory (lstat: not a symlink) whose entries are
 exactly `policy.onnx`, `policy.json` and optionally `README.md` (≤ 64 KiB, untrusted, never printed
 by the CLI), all regular files with `st_nlink == 1`.
-- Anything else is `LoadError("unexpected entry: <safe(name)>")`, including subdirectories, hidden
+- Anything else is `LoadError(f"unexpected entry: {safe(name)!r}")` (contract §8 quotes every
+  name a load error shows with `repr`; `safe`, §3.4, runs first), including subdirectories, hidden
   files (`.DS_Store`), FIFOs, sockets and `.py/.pyc/.so/.pkl/.pickle/.zip/.pt/.pth/.joblib/.ckpt/
   .onnx.data`. `policy.json` plus any `.py` is `LoadError("ambiguous submission kind")`.
 - As contract §8 rules for `controller.py`: names match exactly as `os.scandir` returns them
@@ -401,7 +403,9 @@ by the CLI), all regular files with `st_nlink == 1`.
   4th entry (a bounded walk), and a path that cannot be examined is a `LoadError`, never `OSError`.
 - **Read once.** Each file is read once (`read_regular_file`); `submission_sha256` (contract §8's
   recipe) is computed from those bytes, and those `policy.onnx` bytes are validated and run.
-- The loader checks for `policy.json` before `controller.py`. Python submissions are unchanged.
+- The loader checks for `policy.json` before `controller.py`. Python submissions are unchanged but
+  for one case: a Python directory with a top-level `policy.json` asset, which contract §8 allows
+  today, becomes ambiguous and is refused; the §8 update (§3.6) states this.
 
 `policy.json` is the normative manifest (onnxruntime-web cannot read `metadata_props`).
 **Parsing:** `read_regular_file(cap=16 KiB)`; reject a BOM; a rejection-only pre-pass
@@ -503,7 +507,9 @@ def reference_actions(w: MlpWeights, norm: ObsNorm, action_rule: str, obs: NDArr
    `actor.npz`, `parity_ref.npz` (npz ≤ 8 MiB), each with `read_regular_file`. npz bytes go through
    the Phase 1 trajectory reader's parts (contract §14), moved from `topple/traj.py` into
    `topple/_npz.py` with no change to `load_npz`: `topple._zip.Archive` (numpy's canonical layout
-   only, exactly the expected member names, directory ≤ 16 KiB, members ≤ 8 MiB in total) and the
+   only, exactly the expected member names, directory ≤ 16 KiB, each member ≤ 8 MiB through
+   `max_member_bytes`; `Archive` has no total cap, so `_npz.py` also requires
+   `sum(m.size for m in archive.members.values()) ≤ 8 MiB` before any member is read) and the
    hand-parsed npy header (never evaluated; header ≤ 4096 bytes; the exact expected dtype, C order;
    the shape checked against the expected one and needing exactly the member's bytes before any
    data is read, so a header declaring 2^42 elements allocates nothing). dtypes `<f4`, `<f8`,
@@ -585,9 +591,12 @@ Every Python-side pattern check uses `re.fullmatch` with an unanchored pattern (
 **`read_regular_file`** (in `topple/_inputs.py`, beside Phase 1's `open_regular`, which follows
 symlinks and serves `results.json` and trajectories, contract §14–§15; this stricter sibling is for
 files inside submission and run directories): `st = lstat(path)` (not a symlink, `S_ISREG`,
-`st_nlink == 1`, size ≤ cap); `fd = os.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY |
-O_CLOEXEC | getattr(os, "O_BINARY", 0))` (`O_NONBLOCK`: a FIFO swapped in after the lstat cannot
-block the open); `fstat(fd)` MUST be `S_ISREG` with (st_dev, st_ino) equal to the lstat; read at
+`st_nlink == 1`, size ≤ cap); `fd = os.open(path, os.O_RDONLY | flag("O_NOFOLLOW") |
+flag("O_NONBLOCK") | flag("O_NOCTTY") | flag("O_CLOEXEC") | flag("O_BINARY"))` with `flag(n) =
+getattr(os, n, 0)`, as the merged `open_regular` and `loader._read_capped` do (win32, one of the
+lock's environments, has only `O_BINARY` of these; round 1 deploy #8). `O_NONBLOCK`: a FIFO swapped
+in after the lstat cannot block the open. `fstat(fd)` MUST be `S_ISREG` with (st_dev, st_ino)
+equal to the lstat, which carries the no-symlink guarantee where `O_NOFOLLOW` is missing; read at
 most cap+1 bytes. `OSError` becomes `LoadError` naming the file (contract §8).
 
 **Checks, in order, short-circuiting:** the first check that produces any message returns. No onnx
@@ -750,7 +759,8 @@ def eval_pool(workers: int) -> ProcessPoolExecutor
   `/proc/cpuinfo` on Linux; `arm64-sme` / `arm64-neon` from `sysctl hw.optional` on macOS), each
   `VersionStr | None = None`; `ControllerInfo` gains `policy_sha256: Sha256 | None = None` (JSON
   `null` for a Python submission; `read_results` reads both).
-- **Contract.** §8 (submission kinds), new §17 (`topple.policy/1` = §3.1–§3.5), §15.
+- **Contract.** §8 (submission kinds, with §3.1's ambiguity rule), new §17 (`topple.policy/1` =
+  §3.1–§3.5), §15.
 
 ## 4. Done-when for 2a (every gate MUST pass)
 
@@ -785,9 +795,10 @@ uv run python scripts/phase2_gate.py out/cmp_cal.json out/cmp_eval_v1.json out/p
 - **Ubuntu evidence.** In CI's `python-slow` job (where `slow` tests run, §7), after
   `test_shipped_policy`, `topple compare
   submissions/pid_example.py submissions/lqr_example.py submissions/ppo_balance -p
-  balance-v1/standard --seeds 0..199 --workers 4 --json out/cmp_cal_ci.json` (about 1 min on a
-  4-vCPU runner; 15 s locally) runs, and both it and `test_shipped_policy`'s `results.json` are
-  uploaded as artifacts. Because a commit's own CI run exists only after push, the binding is to
+  balance-v1/standard --seeds 0..199 --workers 4 --json out/cmp_cal_ci.json` (about 1–2 min on
+  the private repo's 2-vCPU runner, where the pool clamps `--workers 4` to 2, §1; 15 s locally)
+  runs, and both it and `test_shipped_policy`'s `results.json` are uploaded as artifacts.
+  Because a commit's own CI run exists only after push, the binding is to
   the **policy**, not the commit: `phase2_results.py --fetch-ci` downloads (`gh run download`)
   the newest successful `ci.yml` run whose `results.json` has `controller.policy_sha256 ==`
   the shipped `onnx.sha256` and whose compare `protocol_hash` equals the current one, and copies
@@ -858,11 +869,12 @@ run {ci_run}, policy {policy_sha256[:12]})."
 **GIF ladders** (each rung in order; the rung used goes into `phase2.json`; the build fails only
 if the last rung exceeds the cap; `video.py` renders only sizes that are multiples of 16 px
 (`MACRO_BLOCK`) and fit the scene's offscreen buffer, so a rung below the rendered size resamples
-the composed frame):
-- hero: pane 480×240 at 20 → 15 → 12 fps, then pane × 0.9 three times at 12 fps (432, 389, 350 px
+the composed frame; every fps divides the 100 Hz control rate, which `video._stride` requires of
+every render, so each fps rung is rendered at its own stride):
+- hero: pane 480×240 at 20 → 10 → 5 fps, then pane × 0.9 three times at 5 fps (432, 389, 350 px
   wide);
-- failure galleries: 320 px at 10 → 8 → 6 fps, then × 0.9 three times at 6 fps;
-- waypoint: 480 px at 10 → 8 → 6 fps, then × 0.9 three times at 6 fps.
+- failure galleries: 320 px at 10 → 5 → 4 fps, then × 0.9 three times at 4 fps;
+- waypoint: 480 px at 10 → 5 → 4 fps, then × 0.9 three times at 4 fps.
 
 1. **Hero.** PID vs shipped PPO via `topple video --side-by-side`: MP4 960×480 at 50 fps (≤ 8 MB;
    measured 0.24 MB) and GIF 480×240 (≤ 6 MB; measured 4.96 MB at 20 fps; hero ladder). Seed rule: among eval_v1 seeds where PID fell and PPO survived, the
@@ -971,10 +983,10 @@ train"`; torch-free):
 | `test_shipped_policy` (slow; parametrized over `ppo_balance` and, once it exists, `ppo_waypoint`) | The submission loads; fixture sha equals `onnx.sha256`; parity ≤ 1e-5 with ≥ 300 unsaturated and ≥ 32 saturated rows; balance: eval_v1 PPO > PID; writes `results.json` as a CI artifact. |
 | `test_c_reference` | Generates a C header from `submissions/ppo_balance/policy.onnx` initializers by §3.2 position (`float.hex` literals; `tests/c/genc.py`), compiles `tests/c/mlp.c` (about 40 lines) with the system `cc -O2`, with and without `-ffp-contract=off`, and checks every `.bin` row within 1e-5 (measured ≤ 6.6e-7). Skips locally without `cc`; CI sets `TOPPLE_REQUIRE_CC=1`. |
 | `test_harness_finite_obs` | A fake env emitting NaN makes `evaluate` raise `RuntimeError` before `act()` is called, also under `python -O`. |
-| `test_driver_golden` (2b) | `submissions/waypoint_pid_example.py` scores on `waypoint-v1/clean` seeds 0..4 pinned to 1e-9; docked/fell on `standard` 0..19 pinned. `WaypointScore` dump pinned. |
+| `test_driver_golden` (2b) | Per platform tag, as `tests/test_golden.py` pins balance-v1's baselines (contract §13; physics reproduces only per platform, e.g. LQR seed 1001 scores 84.08 on darwin-arm64 and 85.40 on linux-x86_64): `EPISODES[platform_tag()]` holds `submissions/waypoint_pid_example.py`'s scores on `waypoint-v1/clean` seeds 0..4 (to 1e-9) and docked/fell on `standard` 0..19, for `darwin-arm64` and `linux-x86_64`; a platform without pins skips locally and fails in CI, and CI must run on `linux-x86_64` (the same `pins_for` / `check_ci_platform` rule); a re-pin updates both platforms in one change. The platform-independent `WaypointScore` dump is pinned once. |
 | `test_traj_v2` (2b) | The §8.1a cases. |
 | `test_import_hygiene` | Importing `topple.cli`, `topple.export`, `topple.policy.*`, `topple.pool`, `topple.controllers.onnx_policy` leaves no `torch`, `stable_baselines3`, `tensorboard`, `psutil` in `sys.modules`. |
-| `test_no_unsafe_loads` | AST scan of `python/topple`, `scripts/`, `tests/`. Outside `topple/train/`: no `pickle, cloudpickle, dill, joblib, shelve, marshal, torch, stable_baselines3` imports (tests: only `train`-marked tests in `test_snapshot_reference`). Torch-free tree: onnx entry point only `onnx.ModelProto.FromString`; banned `onnx.load(`, `load_external_data_for_model`, `onnx.external_data_helper`, `numpy_helper.to_array`, `register_custom_ops_library`; `InferenceSession(` and `add_session_config_entry` (the three §3.5 literal keys) only in `runtime.make_session`. `PPO.load`, `SAC.load`, `VecNormalize.load`, `load_from_zip_file` only in `learn.resume_from`. Everywhere: no `yaml.load/full_load/unsafe_load`, `allow_pickle=True`, `torch.load` without `weights_only=True`. Name-based; `getattr` evasion out of scope. |
+| `test_no_unsafe_loads` | AST scan of `python/topple`, `scripts/`, `tests/`. Outside `topple/train/`: no `pickle, cloudpickle, dill, joblib, shelve, marshal, torch, stable_baselines3` imports, except a fixed (file → modules) allow-list in the test: the `train`-marked test files (`test_train_smoke`, `test_snapshot_reference`, `test_pack_torch_legacy`, `test_resources`, `test_surgery`) → `torch`, `stable_baselines3`; the merged `tests/test_contract.py` → `pickle` (its `TaskSpec` pickle round trip, contract §8); `scripts/make_thirdparty_fixtures.py` → `torch` (§3.3, run once with the train extra). Torch-free tree: onnx entry point only `onnx.ModelProto.FromString`; banned `onnx.load(`, `load_external_data_for_model`, `onnx.external_data_helper`, `numpy_helper.to_array`, `register_custom_ops_library`; `InferenceSession(` and `add_session_config_entry` (the three §3.5 literal keys) only in `runtime.make_session`. `PPO.load`, `SAC.load`, `VecNormalize.load`, `load_from_zip_file` only in `learn.resume_from` (`test_snapshot_reference` reloads through it). Everywhere: no `yaml.load/full_load/unsafe_load`, `allow_pickle=True`, `torch.load` without `weights_only=True`. Name-based; `getattr` evasion out of scope. |
 | `test_repo_hygiene` | No pickle-family, `.onnx.data` or hidden files under `submissions/`; `.gitignore` covers `runs/`, `*.pkl`, `.venv-eval/`, `.DS_Store`; `git check-ignore docs/results/phase2/hero.mp4` and `.../waypoint.mp4` return non-zero. |
 | `test_stats`, `test_compare`, `test_bench` | `paired_bootstrap` known answer pinning (mean, lo, hi) for a committed 200-element vector; n = 1; all-equal; compare round-trip, all ordered pairs on 2 `ideal` seeds; shove both directions and interpolation. |
 | `test_video_sbs` | Timeline (hold-last-frame, labels, trims), GIF ladder, frame rule; one `render`-marked 64 px smoke. |
@@ -1000,7 +1012,12 @@ train"`; torch-free):
   `psutil>=6`; no onnxscript. `dev` gains `matplotlib`. New marker `train` (beside `render`,
   `slow`).
 - **mypy.** The merged `ignore_missing_imports` list (`onnxruntime.*`, `stable_baselines3.*`, …)
-  gains `torch.*`, `tensorboard.*`, `psutil.*`. Strict stays on everywhere except one override:
+  gains `torch.*`, `tensorboard.*`, `psutil.*` and `google.protobuf.*`: §3.4's `validate.py`
+  imports `google.protobuf.message` and `google.protobuf.unknown_fields`, protobuf 7.36 ships no
+  `py.typed` and `types-protobuf` is not in the lock, so strict mypy would stop at
+  `import-untyped` (measured). onnx's messages then derive from `Any`: bind
+  `onnx.ModelProto.FromString(data)` to a variable annotated `onnx.ModelProto` before returning
+  it (`warn_return_any`). Strict stays on everywhere except one override:
   `[[tool.mypy.overrides]] module = ["topple.train.learn", "topple.train.callbacks",
   "topple.train.snapshot", "topple.train.surgery", "topple.train.resources"]`,
   `disallow_subclassing_any = false` (the default job has no SB3, so `class
@@ -1047,12 +1064,17 @@ metric keys may be added (`fall_cause`, §8.5). Golden tests pin the existing ke
   challenge=None)` (Phase 1 checks the name against `PRESETS`). `topple.disturbances.MAX_PUSHES`
   (public since Phase 1) stays 3: the PUSHES stream always draws 3 candidates, whatever a preset's
   `count`.
-- **ENV_ALGO_VERSION** becomes per kind; balance stays 1. Waypoint: **before the 2b freeze**, every
-  course-generator, event or observation code change bumps it (nothing is published, and stale
-  2b runs become detectable, §8.9 item 11); **at the freeze** its value is recorded in
-  `phase2.json`; **after the freeze** any change to a fixed controller's score on a fixed seed
-  is `waypoint-v2` (contract §13), and the version only guards against accidental drift. Stream
-  `TARGETS = 6` and `balancer-target.obs.v1` freeze at the same point.
+- **ENV_ALGO_VERSION** becomes per kind. `KindSpec.env_algo_version` is a zero-argument getter
+  read at call time, never an int copied at import: balance's returns the module attribute
+  `topple.challenge.ENV_ALGO_VERSION` (name and value 1 unchanged), because Phase 1's
+  `test_protocol_hash_covers_the_env_algorithm_version` monkeypatches that attribute and requires
+  `protocol_hash` to change (a stored copy fails it; measured); waypoint's returns its own module
+  constant. Waypoint: **before the 2b freeze**, every course-generator, event or observation code
+  change bumps it (nothing is published, and stale 2b runs become detectable, §8.9 item 11); **at
+  the freeze** its value is recorded in `phase2.json`; **after the freeze** any change to a fixed
+  controller's score on a fixed seed is `waypoint-v2` (contract §13), and the version only guards
+  against accidental drift. Stream `TARGETS = 6` and `balancer-target.obs.v1` freeze at the same
+  point.
 - **Dispatch** through the registry (Phase 1 hard-codes balance in each): `iter_episodes` and
   `verify._replay_env` (both construct `BalanceEnv`), `verify_episode`, `verify_with_seed`,
   `rescore`, `verify_run`, `Challenge.task_spec` (raises for any other schema), `build_results`
@@ -1077,25 +1099,44 @@ dtypes, other widths, canonical zip layout, every contract §14 cap, `T, E ≤ m
 finite-only `meta_json`) except: `meta.format = "topple.traj/2"`, and `obs` is T × D float32 with
 D = `len(TaskSpec.obs_features)` of its challenge, 1 ≤ D ≤ `MAX_OBS_WIDTH = 64`,
 `meta.obs_features` naming exactly D features (waypoint: D = 15).
-- **Reader.** `TrajLayout(format, obs_width)` in `topple/traj.py`, `TRAJ_V1 =
-  TrajLayout("topple.traj/1", 10)`; `load_npz(path, *, max_steps, layout=TRAJ_V1)`. The `obs`
-  header's width must equal `layout.obs_width` before its data is read (like the T limit),
-  `meta.format` must equal `layout.format`, and `len(meta.obs_features)` must equal D. Trusted
-  callers pass `verify.protocol_traj_layout(protocol)`, derived from the protocol's challenge kind
-  and never from the file, as they pass `protocol_max_steps`; the default fails closed on a
-  waypoint file. `read_meta` accepts both formats (it only names the challenge and preset; the
-  load that follows enforces the protocol's layout). `Trajectory` checks `obs` against
-  `len(meta["obs_features"])` (10 without it); `save_npz` writes `/2` iff `meta.obs_schema` is
-  not `balancer.obs.v1`.
+- **Reader.** `TrajLayout(format, obs_width)` in `topple/traj.py` (frozen; 1 ≤ `obs_width` ≤
+  `MAX_OBS_WIDTH`), `TRAJ_V1 = TrajLayout("topple.traj/1", 10)`; `load_npz(path, *, max_steps,
+  layout=TRAJ_V1)`. The `obs` header's width must equal `layout.obs_width` before its data is read
+  (like the T limit), and `meta.format` must equal `layout.format`. Under `TRAJ_V1` that is all:
+  the `/1` path is the merged reader unchanged (a Phase 1 test file's meta may hold neither
+  `obs_schema` nor `obs_features`). Only a `/2` layout also requires `meta.obs_features` to be a
+  list of exactly `obs_width` strings, checked inside the reader's guard (a bad value is a
+  `ValueError` naming the file). Trusted callers pass `verify.protocol_traj_layout(protocol)`,
+  derived from the protocol's challenge kind and never from the file, as they pass
+  `protocol_max_steps`; the default fails closed on a waypoint file. `read_meta` accepts both
+  formats (it only names the challenge and preset; the load that follows enforces the protocol's
+  layout).
+- **Format rule.** A trajectory is `/2` iff its `meta` has an `obs_schema` that is not exactly the
+  string `balancer.obs.v1`; a meta without one (Phase 1's `test_traj.py` writes such files) is
+  `/1`, and `save_npz` writes the rule's format. `Trajectory._check_shapes` requires `obs` of
+  shape (T, 10) for `/1` and (T, D) with 1 ≤ D ≤ `MAX_OBS_WIDTH` for `/2`. It touches `meta` only
+  with `in`, `isinstance` and `==`, never `len()` or another call on an untrusted value, so a
+  forged-meta copy (`dataclasses.replace`, as `tests/verify_support.with_meta` makes) still
+  constructs and then fails verification as `not_reproducible`. A 15-wide `obs` whose meta claims
+  `balancer.obs.v1` cannot be constructed, so such a file fails to load (closed).
 - **Verify / rescore** (contract §16) are unchanged: the replay records its challenge's layout and
   step 5 compares `obs` (shape, then bytes) and `obs_schema` / `obs_features` with it, so a forged
   width or feature list fails even past the reader. Every upload loader (`cli._load_upload`,
   `_UploadFiles`, `_render`, `topple video`, Phase 3 `publish`) passes the protocol's layout.
-- **Tests** (`test_traj_v2`): waypoint round trip; balance-v1 records byte-identical (Phase 1's
-  trajectory and done-when tests pass unchanged); refused before any data is read: 10-wide `obs`
-  under the waypoint layout, 15-wide under `TRAJ_V1`, D = 65; refused: `/2` offered to balance-v1,
-  `/1` to waypoint, `len(obs_features) ≠ D`; contract §14's zip/npy red-team cases over both
-  formats.
+- **Tests** (`test_traj_v2`): waypoint round trip, written as `/2`; balance-v1 records identical
+  to the merged writer's member by member (array bytes, dtypes, shapes and `meta_json`; numpy
+  stamps zip entries with the save time, so whole files are not compared); refused before any
+  data is read: 10-wide `obs` under the waypoint layout, 15-wide under `TRAJ_V1`, a 65-wide
+  header; refused: D = 65 in `TrajLayout` and `Trajectory`, `/2` offered to balance-v1, `/1` to
+  waypoint, `obs_features` not a list of exactly D names, a 15-wide `obs` claiming
+  `balancer.obs.v1`; contract §14's zip/npy red-team cases over both formats. Phase 1's suite
+  passes unchanged, in particular `test_traj.py::test_round_trip`,
+  `::test_a_symlink_to_a_regular_file_loads`, `::test_meta_is_utf8_json_bytes`,
+  `::test_fixed_trailing_shapes` and
+  `test_verify.py::test_every_env_meta_field_must_equal_the_replay[obs_features-retyped]`,
+  `::test_arbitrary_meta_values_never_crash_verification` (measured on a prototype of these rules:
+  all 1,806 Phase 1 tests that run on macOS pass; v5.1's literal rules failed five of the six
+  named).
 
 ### 8.2 Bundle `challenges/waypoint-v1/`
 
@@ -1134,19 +1175,32 @@ and Linux x86_64:
 1. Each attempt draws, in order, `h0` = U(−π, π) (one double), `mags` = U(rad(30), rad(150)) (four
    doubles), `signs = rng.integers(0, 2, size=4)` (raw bits).
 2. `θ_0 = h0`, `θ_k = θ_{k−1} ± mags[k−1]` (`+` iff `signs[k−1]`).
-3. `p_k = p_{k−1} + 0.70·(math.cos θ_k, math.sin θ_k)` from `p_{−1} = (0, 0)`.
+3. `p_k = p_{k−1} + 0.70·(pcos θ_k, psin θ_k)` from `p_{−1} = (0, 0)` (portable trigonometry,
+   below).
 4. Accept iff every `p_x² + p_y² ≤ 1.5²` (about 44% accepted); after 1000 failures, `RuntimeError`.
+
+**Portable trigonometry.** Acceptance decides how many attempts the TARGETS stream consumes, so it
+must come out the same on every platform (contract §9: scenarios materialize identically
+everywhere). libm's `math.cos`/`math.sin` may differ in the last bit between platforms (numpy's
+even within one, cf. contract §12's arccos rule), which could accept a course near the 1.5 m
+radius on one platform and refuse it on another. `course.py` therefore computes `pcos`/`psin`
+with Python float `+`, `−` and `×` only (IEEE-754, correctly rounded on every supported platform;
+CPython never fuses them): `k = round(θ / (2π))`, `r = (θ − k·6.28125) − k·(2π − 6.28125)` with
+2π = `2.0 * math.pi`, then the Taylor polynomials of cos and sin on [−π, π] through r^30 and
+r^31 (16 terms each) by Horner in a fixed order, with coefficients `(−1)^n / (2n)!` and
+`(−1)^n / (2n + 1)!` from exact integer division. Measured: within 1.3e-15 of libm on |θ| ≤ 14,
+the same accepted course as libm on 20,000 seeds, 44.0% of attempts accepted, mean accepted turn
+98.1°. A known-answer test pins `pcos`/`psin` at fixed inputs and runs on every platform.
 
 Path length 3.5 m, mean turn 98°. Points are in the start frame (origin = axle midpoint at reset,
 x = initial heading). `Scenario.course` stores only the accepted draws `{h0, turns}` (signed
 radians), so the scenario stays portable bit for bit (contract §9); `Scenario.from_dict` checks
 `|h0| ≤ π`, 4 turns, each `|turn|` in [rad(30), rad(150)]. `course_points(course)` derives the 5
-points wherever they are used (env, scorer, video) with the C library's scalar `math.cos` /
-`math.sin`, never numpy's (it can pick SVML on AVX-512, cf. contract §12's arccos rule), so they are
-exact per platform, like physics. Only a radius within a few ulps of 1.5 m could be accepted on one
-platform and refused on another; the waypoint golden scenarios (seeds 0, 3000, 2**53−1 per
-preset) must pass unchanged on every platform, like Phase 1's. `course` is serialized only when
-non-empty (balance-v1's scenarios keep their key set). Waypoints 0–3 are gates, 4 is the dock.
+points wherever they are used (env, scorer, video) with the same `pcos`/`psin`, never libm's or
+numpy's, so the points too are the same doubles on every platform. The waypoint golden scenarios
+(seeds 0, 3000, 2**53−1 per preset) must pass unchanged on every platform, like Phase 1's.
+`course` is serialized only when non-empty (balance-v1's scenarios keep their key set). Waypoints
+0–3 are gates, 4 is the dock.
 
 ### 8.4 Observation `balancer-target.obs.v1` (contract §6)
 
@@ -1397,19 +1451,25 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
 2. **No regression.** balance-v1's Phase 1 goldens (`tests/test_golden.py`: bundle and
    per-preset `protocol_hash`, scenarios, scores) and the pinned standard payload with its
    `ScoreConfig` dump (`tests/test_challenge.py`) unchanged (pytest above).
-3. **Verification** (pytest above). `verify_episode` reproduces 5 waypoint trajectories and
-   `verify_run` on them reports `failed == 0` (`topple verify DIR` exits 0); an edited
-   `meta.scenario.course` gives `not_reproducible`; a 10-wide obs in a waypoint upload and a
-   15-wide obs in a balance upload are rejected by `load_npz` (§8.1a); trusted and env scenarios
-   are equal on 5 seeds; `waypoint-v1/standard` pushes lie in [2.0, 18.0] s.
+3. **Verification** (pytest above). `verify_episode` reproduces 5 waypoint trajectories recorded
+   on `p5 = dataclasses.replace(EvalProtocol.from_id("wp_eval_v1"), seeds=(3000, …, 3004))`, and
+   `verify_run(p5, …).failed == 0` (`verify_run` expects all `len(protocol.seeds)` episodes and
+   counts each absent one as `missing`). `topple verify` exits 0 on each of the 5 files and, in a
+   slow test, on the directory of a full 50-episode `topple eval -p wp_eval_v1` run: the CLI checks
+   a directory against the protocol's whole public seed list and has no `--seeds`, so a 5-file
+   directory would count 45 `missing` and exit 1. An edited `meta.scenario.course` gives
+   `not_reproducible`; a 10-wide obs in a waypoint upload and a 15-wide obs in a balance upload
+   are rejected by `load_npz` (§8.1a); trusted and env scenarios are equal on 5 seeds;
+   `waypoint-v1/standard` pushes lie in [2.0, 18.0] s.
 4. **Contract** updated: §1 (gym id, `wp_eval_v1`, `topple.traj/2`), §4 (`max_steps` per
    challenge), §6 (`balancer-target.obs.v1`, replacing the "target_x, target_y" example), §9
-   (`TARGETS = 6`), §10 (per-bundle presets), §11/metrics vocabulary (`fall_cause`), §12a
-   (waypoint score and score parts), §13 (per-kind `ENV_ALGO_VERSION`, the §8.1 versioning rule;
-   mujoco and onnxruntime upgrades mean a re-score, not a challenge bump), §14a (`topple.traj/2`,
-   §8.1a), §16 (trusted scenario includes `course`; uploads load with the protocol's layout), §17
-   (non-finite observations outside the policy domain). Schema id, feature order, gym id and alias
-   frozen. Checked by a grep of `docs/contract.md` for each named term.
+   (`TARGETS = 6`; course draws and their portable acceptance, §8.3), §10 (per-bundle presets),
+   §12 (metrics vocabulary: `fall_cause`), §12a (waypoint score and score parts), §13 (per-kind
+   `ENV_ALGO_VERSION` with its call-time getter, the §8.1 versioning rule; mujoco and onnxruntime
+   upgrades mean a re-score, not a challenge bump), §14a (`topple.traj/2`, §8.1a), §16 (trusted
+   scenario includes `course`; uploads load with the protocol's layout), §17 (non-finite
+   observations outside the policy domain). Schema id, feature order, gym id and alias frozen.
+   Checked by a grep of `docs/contract.md` for each named term.
 5. **Results.** Both arms × 3 seeds in `phase2.md` vs the driver on 0..399 (paired bootstrap) and
    on `wp_eval_v1`, with gates, docked, falls, `t_finish` per selection eval, the headline
    comparison (§8.8) and an anchors-plus-PPO table of score parts, docked, fell and median
@@ -1521,7 +1581,8 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
 - **Phases 3 and 5 (display).** `claims`, README, metadata and errors are untrusted: escaped or not
   rendered; `claims` labelled self-reported.
 - **Residual Phase 1 risks** (robot validation gaps, darwin-only calibration, sensor-noise
-  portability): `docs/design/deferred-risks.md`, one owning phase each.
+  portability): `docs/design/deferred-risks.md`, each with its owning phases (Phase 3 first for
+  the robot validation gaps, since robot-ci scores users' own robots).
 - **Phase 5 (Arena).** Pin `onnxruntime-web@1.30.0` exactly (lockfile; measured: PPO 7.7e-7, SAC
   4.9e-7 vs SB3 for IR 8–11; 1.20.1 also passes IR 8–10). Canonical bytes from R2 by sha256 in a
   Web Worker with `executionProviders: ['wasm']`, `graphOptimizationLevel: 'disabled'`,

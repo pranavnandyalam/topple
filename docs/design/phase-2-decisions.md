@@ -3,9 +3,11 @@
 Source: `docs/design/phase-2-critiques.json`. It holds 6 critiques with 68 issues in total. Every
 issue appears below exactly once. The re-critique of v2 (round 1, 54 issues) is decided in
 "Re-critique round 1", and the re-critique of v3 (round 2, 54 issues) in "Re-critique round 2", and
-the re-critique of v4 (round 3, 52 issues) in "Re-critique round 3" at the end. Later rounds supersede earlier rows where they conflict; each superseded row is named in
-the later round's preamble. The round-1 and round-2 critique texts were supplied inline to the
-designer and are not yet committed as JSON (see round 2, consistency #15, and round 3, consistency #16).
+the re-critique of v4 (round 3, 52 issues) in "Re-critique round 3". The sync with the merged
+Phase 1 (v5.1) and its adversarial verification (v5.2, 18 findings) follow at the end. Later rounds
+supersede earlier rows where they conflict; each superseded row is named in the later round's
+preamble. The round-1 and round-2 critique texts were supplied inline to the designer and are not
+yet committed as JSON (see round 2, consistency #15, and round 3, consistency #16).
 
 Decision values:
 - **accepted:** adopted as recommended.
@@ -522,6 +524,7 @@ Superseded earlier decisions:
 | S19 | `phase2b_done.sh` syncs `.venv-eval` with the dev group (pytest lives there; `--no-dev` dropped it), still without extras, so still torch-free. | `pyproject.toml` (`[dependency-groups] dev`, `default-groups`) | §8.9 |
 | S20 | Dims and action bounds come from the challenge's `TaskSpec` (`Challenge.task_spec(wheel_radius_m, track_width_m)` also wants robot geometry, which does not change them); the driver's gains are named (`controllers.lqr.DEFAULT_GAINS`). | `challenge.py`, `contract.ActionSpec`, `controllers/lqr.py` | §3.2, §3.3, §3.5, §8.7 |
 | S21 | Phase 1 is merged: the "train after the fix merges" gate, the `phase-1-sim-core/…` path and "fix I/J" references are replaced by the merged code, contract and tests; residual Phase 1 risks go to `docs/design/deferred-risks.md`, linked from §10. | main `f997394` | preamble, §3.1, §9, §10 |
+| S22 | Trusted hooks and runner codes named: the shove test's pushes are injected with the trusted `reset(options={"pushes": …})` hook (a test hook that skips the scenario bounds but not the push-schedule check), and a Phase 3 run that exhausts its CPU budget ends its remaining episodes through the proxy's `RunnerError` (`timeout`). Added in the sync without a row (verification finding V18). | contract §9, §15; `envs/balance.py` (`_RESET_OPTIONS`, `check_push_schedule`), `evaluate.RunnerError` | §5.2, §10 |
 
 ### F41 decision: `topple.traj/2`
 
@@ -560,3 +563,45 @@ because it changes the member set, which every zip-layout check pins. Specified 
   item 6 on calibration seeds 0..399 are unchanged. The sync defines `fell` as the fall reasons
   only (`fell`, `floor_contact`), which the fall term depends on, and success through `survived`;
   an errored episode still scores 0 and cannot pass the docked or score gates.
+
+## Sync verification (spec v5.1 → v5.2)
+
+An adversarial verifier checked v5.1 (commit `aa0767f`) against the merged code (main `f997394`)
+and reported 18 findings: 1 HIGH, 7 MEDIUM, 10 LOW. Each finding was re-checked against the code
+before it was decided, with prototypes and probes on scratch copies of main (darwin-arm64,
+nothing written to the repository). All 18 are confirmed; none is rejected. V10 is modified: its
+claim that `--workers 4` oversubscribes the runner does not hold, because the pool clamps workers
+to `os.cpu_count()` (§1). Only `phase-2.md`, this log and `deferred-risks.md` were edited.
+
+Superseded earlier decisions:
+- S16 and the "F41 decision" (a feature-count check on every read, `Trajectory` width from
+  `len(meta["obs_features"])`, `/2` iff `obs_schema` is not `balancer.obs.v1`) → V1. The format
+  choice itself (a new `topple.traj/2`, `/1` frozen) stands.
+- S4 (course points from libm `math.cos`/`math.sin`, exact per platform, with a radius within a
+  few ulps of 1.5 m allowed to differ across platforms) → V17.
+- Round 2 product #9 and round 3 product #8 (the ladders' 15, 12, 8 and 6 fps rungs) → V3.
+- Round 3 product #2 (`test_driver_golden` pins with no platform named) → V6.
+- Round 1 consistency #9 (per-kind `ENV_ALGO_VERSION`, form unstated) → V7.
+- Round 1 security #6 and round 2 security #8 (`test_no_unsafe_loads` import bans with only
+  `test_snapshot_reference` exempt) → V5.
+
+| # | Issue | Impact | Decision | Reason |
+|---|---|---|---|---|
+| V1 | §8.1a's `/2` rules break merged Phase 1 tests: a meta without `obs_schema` would be written as `/2`, which the default reader refuses, and `Trajectory` calls `len()` on untrusted `meta.obs_features` | HIGH | accepted | Confirmed: a prototype of the literal rules fails 5 Phase 1 tests (`test_traj.py` round trip, symlink load and meta bytes; `test_verify.py` `obs_features-retyped` and the arbitrary-meta property). Fix (§8.1a): `/2` iff `meta` has an `obs_schema` other than exactly `balancer.obs.v1`; `Trajectory` requires width 10 (`/1`) or 1..64 (`/2`) and touches meta only with `in`, `isinstance`, `==`; only a `/2` layout checks the feature count; the `/1` path is the merged reader. "Width 1..64 always" was rejected: `test_fixed_trailing_shapes` requires 9 and 11 columns to fail. A prototype of the fixed rules passes all 1,806 Phase 1 tests that run on macOS and every §8.1a case; the six named tests are listed. Balance records are compared member by member, since numpy stamps zip entries with the save time. |
+| V2 | 2b item 3: `verify_run` on 5 trajectories, and `topple verify DIR` on them, cannot pass against the 50-seed public protocol | MEDIUM | accepted | `verify_run` counts every absent index as `missing`, and the CLI builds a directory's protocol with `from_id` and has no `--seeds`. Item 3 verifies on `dataclasses.replace(wp_eval_v1, seeds=3000..3004)` and runs `topple verify` on each file and, in a slow test, on a full 50-episode `wp_eval_v1` run directory (§8.9). |
+| V3 | GIF ladder rungs at 15, 12, 8 and 6 fps cannot render | MEDIUM | accepted | `video._stride` refuses any fps that does not divide the 100 Hz control rate, on every render path. Rungs are divisors of 100: hero 20 → 10 → 5, galleries and waypoint 10 → 5 → 4 (§5.2). |
+| V4 | Strict mypy fails on `validate.py`'s `google.protobuf` imports | MEDIUM | accepted | protobuf 7.36.2 ships no `py.typed`, and `types-protobuf` is not in the lock. `google.protobuf.*` joins `ignore_missing_imports` instead of a new stub dependency. Measured: the import errors go away; `FromString` then returns `Any`, so §7 says to bind it to an annotated variable, which passes strict mode (§7). |
+| V5 | `test_no_unsafe_loads` fails on the merged `tests/test_contract.py` (`import pickle`) and on the spec's own torch and SB3 tests | MEDIUM | accepted | A fixed (file → modules) allow-list: `train`-marked test files → `torch`, `stable_baselines3`; `tests/test_contract.py` → `pickle` (contract §8's `TaskSpec` round trip); `scripts/make_thirdparty_fixtures.py` → `torch` (it needs it too, though the finding missed it). `test_snapshot_reference` reloads SB3 through `learn.resume_from`, the only allowed load site. Banning load calls instead of imports was not adopted: `test_contract.py` calls `pickle.loads` too (§6). |
+| V6 | `test_driver_golden` pins one value for every platform | MEDIUM | accepted | Physics reproduces only per platform (LQR seed 1001: 84.08 on darwin-arm64, 85.40 on linux-x86_64), and the test runs in the ubuntu job. Pins are per platform tag under `tests/test_golden.py`'s `pins_for` / `check_ci_platform` rule; the `WaypointScore` dump stays one pin (§6). |
+| V7 | A per-kind `ENV_ALGO_VERSION` stored in the registry breaks `test_protocol_hash_covers_the_env_algorithm_version` | MEDIUM | accepted | That test monkeypatches `topple.challenge.ENV_ALGO_VERSION`. `KindSpec.env_algo_version` is a call-time getter; balance's reads that module attribute. Prototype: `test_challenge.py` and the hash goldens pass (§8.1). |
+| V8 | `deferred-risks.md` (a) and (b) omit Phase 3, whose robot-ci scores users' own robots | MEDIUM | accepted | Contract §3 names robot-ci first among `validate_robot`'s users, and PLAN.md's Phase 3 ships the `robot:` input. Phase 3 is the first owning phase: the rule lands before that input is accepted, or robot-ci refuses robots it did not ship until it does (`deferred-risks.md`, §10). |
+| V9 | Item 4 cites "§11/metrics vocabulary" | LOW | accepted | Contract §11 is termination; metrics are §12 (bounds §15). Item 4 says §12 (§8.9). |
+| V10 | The ubuntu compare is timed on a "4-vCPU runner" | LOW | modified | The merged `ci.yml` runs on the private repo's 2-vCPU runner. The time is re-estimated at 1–2 min. The pool clamps `--workers 4` to 2 there, so nothing is oversubscribed (§4). |
+| V11 | `read_regular_file` passes POSIX-only `os` flags directly | LOW | accepted | win32 is one of the lock's environments. Every optional flag goes through `getattr(os, name, 0)`, as merged `open_regular` and `loader._read_capped` do, restoring round 1 deploy #8. The lstat/fstat identity check carries the guarantee where `O_NOFOLLOW` is missing (§3.4). |
+| V12 | `Archive` has no total size cap | LOW | accepted | Each member is capped by `max_member_bytes`, and `topple/_npz.py` adds an explicit `sum(member sizes) ≤ 8 MiB` check before any member is read (§3.3). |
+| V13 | Policy-directory errors are not repr-quoted | LOW | accepted | `f"unexpected entry: {safe(name)!r}"`, as contract §8 requires of every name a load error shows (§3.1). |
+| V14 | "Python submissions are unchanged" is false for a Python directory with a `policy.json` asset | LOW | accepted | The ambiguity rule stays (fail closed). The spec states the one changed case, and the 2a contract §8 update records it (§3.1, §3.6). |
+| V15 | "one owning phase each" contradicts `deferred-risks.md` | LOW | accepted | §10 and the document's intro now speak of owning phases (§10, `deferred-risks.md`). |
+| V16 | `deferred-risks.md` (b)'s suggested rule would refuse the shipped robot | LOW | accepted | Probe on `build_model(balance-v1)`: `chassis_box` and both tires have contype = conaffinity = 1, so they pair by bits, and only `filterparent` (on) keeps them apart. The rule now exempts pairs MuJoCo already filters: one weld body, parent-child, or an exclude (`deferred-risks.md`). |
+| V17 | Course acceptance with libm `cos`/`sin` is not portable bit for bit, though contract §9 promises portable scenarios | LOW | accepted | Portable arithmetic was chosen over a contract §9 exception. `pcos`/`psin` use Python float `+`, `−`, `×` only (Cody–Waite reduction, 16-term Taylor polynomials by Horner), for both acceptance and `course_points`. Measured: within 1.3e-15 of libm, the same courses as libm on 20,000 seeds, 44.0% of attempts accepted, mean accepted turn 98.1° (§8.3, §8.9 item 4). |
+| V18 | Two sync edits had no S-row | LOW | accepted | Row S22 added: the shove pushes use the trusted reset hook (§5.2), and an exhausted budget raises `RunnerError` (§10). |

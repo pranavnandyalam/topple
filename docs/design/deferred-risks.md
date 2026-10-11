@@ -2,8 +2,9 @@
 
 Residual risks that the merged Phase 1 (main `f997394`, PR #3) leaves open and that no Phase 2
 deliverable closes. They were found while syncing `docs/design/phase-2.md` with the merged code
-(decision log, "Sync with merged Phase 1"). Each entry names the phase that must close it before
-its done-when passes, and a suggested rule; that phase's design decides the final rule and logs it.
+(decision log, "Sync with merged Phase 1"). Each entry names the phases that must close it, each
+before its own done-when passes, and a suggested rule; the first owning phase's design decides the
+final rule and logs it.
 "Contract §n" points into `docs/contract.md`.
 
 ## (a) A mass below the floor turns any robot into a passive pendulum
@@ -18,10 +19,13 @@ its done-when passes, and a suggested rule; that phase's design decides the fina
   chassis passes `validate_robot` with no problem. A controller that always returns `(0, 0)` then
   survives the full 10 s and scores 96.93 and 95.25 on `balance-v1/standard` seeds 1000 and 1001.
   The stock robot with the same controller falls at 0.50 s and 0.55 s and scores 3.99 and 4.39.
-- **Owning phases.** Every phase that scores a robot it did not ship, before that robot is scored:
-  Phase 8 (CAD export and real robots go through `validate_robot`), Phase 10 (evolved bodies),
-  Phase 12 (generated robots). balance-v1 and waypoint-v1 are not exposed: their robot is fixed,
-  and verification binds `robot_hash` (contract §16).
+- **Owning phases.** Every phase that scores a robot it did not ship, before that robot is scored.
+  First Phase 3, the first public release: robot-ci's `robot:` input scores a user's own MJCF
+  (PLAN.md pillar 2 and Phase 3; contract §3 names robot-ci first among `validate_robot`'s users),
+  so the rule lands before that input is accepted, or robot-ci refuses every robot but a shipped
+  one until it does. Then Phase 8 (CAD export and real robots go through `validate_robot`),
+  Phase 10 (evolved bodies), Phase 12 (generated robots). Ranked balance-v1 and waypoint-v1 scores
+  are not exposed: their robot is fixed, and verification binds `robot_hash` (contract §16).
 - **Suggested rule.** End the episode as a fall (a new termination reason such as `below_floor`,
   counted like `fell`) when any robot body's centre of mass (`data.xipos[b, 2]`) goes below the
   floor plane, checked after every substep like the tilt. At validation, also refuse a body that
@@ -43,12 +47,17 @@ its done-when passes, and a suggested rule; that phase's design decides the fina
   The Phase 1 re-gate measured the analogous tendon case: a damped tendon on the wheels made the
   shipped PID fall at steps 72–212 on clean seeds 1000–1002, where the stock robot survives at
   about 96 (commit `20e0ed4`, which then refused tendons on wheels).
-- **Owning phases.** Phases 8, 10 and 12, as in (a).
+- **Owning phases.** Phases 3, 8, 10 and 12, as in (a) (Phase 3 first).
 - **Suggested rule.** A tire may touch only the floor. At validation, refuse any robot collision
-  geom outside the wheel bodies whose collision bits can pair with a tire's, unless an exclude
-  between its body and the wheel body removes the pair. At run time, end the episode with an error
-  on any contact between a wheel-body geom and a geom other than the floor. Add a red-team robot
-  with a jointed brake arm to `tests/test_robot.py`.
+  geom outside the wheel bodies whose collision bits can pair with a tire's, unless MuJoCo already
+  filters the pair: geoms of one weld body, the parent-child filter (`filterparent`, on by default
+  and in every shipped scene, which owns the physics options, contract §3; it compares weld bodies,
+  so it covers the chassis, the wheel bodies' parent, and every body welded to it) or an exclude
+  between the two bodies. Without that exemption the rule refuses the shipped robot: its
+  `chassis_box` (contype = conaffinity = 1, on `chassis`) pairs with both tires by bits, and only
+  the parent-child filter keeps them apart (probe on `build_model` of balance-v1). At run time,
+  end the episode with an error on any contact between a wheel-body geom and a geom other than the
+  floor. Add a red-team robot with a jointed brake arm to `tests/test_robot.py`.
 
 ## (c) Calibration and E_ref were measured on darwin-arm64 only
 
