@@ -1,6 +1,7 @@
 """``topple.results/1``: schema bounds, cross-field checks, error details, atomic writes (§15)."""
 
 import errno
+import json
 import math
 import os
 import stat
@@ -19,6 +20,7 @@ from topple.results import (
     MAX_EPISODES,
     MAX_METRIC_CHARS,
     MAX_METRICS,
+    MAX_TIME_UPRIGHT_S,
     ControllerInfo,
     EpisodeResult,
     ErrorInfo,
@@ -452,6 +454,41 @@ def test_a_complete_aggregate_needs_every_time_upright(metrics: dict[str, Any]) 
     data["episodes"][1]["metrics"] = metrics
     with pytest.raises(ValidationError, match="time_upright_s"):
         EvalResults.model_validate(data)
+
+
+@pytest.mark.parametrize(
+    ("times", "mean"),
+    [
+        ((1e308, 1e308), 1e308),
+        ((10**308, 10**308), 1e308),
+        ((-5.0, 25.0), 10.0),
+        ((2e9, 0.0), 1e9),
+    ],
+    ids=["huge floats", "huge ints", "negative", "above the bound"],
+)
+def test_a_complete_run_bounds_every_time_upright(
+    tmp_path: Path, times: tuple[float, float], mean: float
+) -> None:
+    """Every ``time_upright_s`` of a complete run is a number of seconds in [0, 1e9]. Two near
+    the float limit made §12's sum overflow, an ``OverflowError`` that pydantic passes through
+    instead of a ``ValidationError``; a negative time could balance a forged one in the mean."""
+    data = results_dict()
+    for e, t in zip(data["episodes"], times, strict=True):
+        e["metrics"]["time_upright_s"] = t
+    data["aggregate"]["mean_time_upright_s"] = mean
+    path = tmp_path / "results.json"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValidationError, match=r"time_upright_s must be a number of seconds"):
+        read_results(path)
+
+
+@pytest.mark.parametrize("time", [0, 0.0, MAX_TIME_UPRIGHT_S, int(MAX_TIME_UPRIGHT_S)])
+def test_a_complete_run_accepts_times_up_to_the_bound(time: float) -> None:
+    data = results_dict()
+    for e in data["episodes"]:
+        e["metrics"]["time_upright_s"] = time
+    data["aggregate"]["mean_time_upright_s"] = time
+    assert EvalResults.model_validate(data).aggregate.mean_time_upright_s == time
 
 
 def test_metrics_are_bounded() -> None:

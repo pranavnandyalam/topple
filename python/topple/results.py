@@ -32,6 +32,9 @@ MAX_METRICS = 32
 """Most metrics per episode (balance-v1 reports 11)."""
 MAX_METRIC_CHARS = 64
 """Longest metric name and string value."""
+MAX_TIME_UPRIGHT_S = 1e9
+"""Largest ``time_upright_s`` a complete run may report: far beyond any episode, and small
+enough that the sum over ``MAX_EPISODES`` episodes stays far from overflowing."""
 MAX_RESULTS_BYTES = 16 * 1024 * 1024
 """Most bytes ``read_results`` reads."""
 RESULTS_FILE_MODE = 0o644
@@ -200,19 +203,22 @@ def _check_complete(episodes: list[EpisodeResult], aggregate: Aggregate) -> None
     if any(e.error is not None and e.error.code == "missing" for e in episodes):
         raise ValueError("a complete run has no missing episode")
     for e in episodes:
-        if e.metrics is not None and not _is_real(e.metrics.get("time_upright_s")):
-            raise ValueError(f"episode {e.index}: metrics.time_upright_s must be a finite number")
+        if e.metrics is not None and not _is_time(e.metrics.get("time_upright_s")):
+            raise ValueError(
+                f"episode {e.index}: metrics.time_upright_s must be a number of seconds in "
+                f"[0, {MAX_TIME_UPRIGHT_S:g}]"
+            )
     if summarize(episodes, len(episodes)) != aggregate:
         raise ValueError("aggregate does not match the episodes (contract §12)")
 
 
-def _is_real(value: object) -> bool:
+def _is_time(value: object) -> bool:
+    """A number (not a bool) in ``[0, MAX_TIME_UPRIGHT_S]``, so ``summarize`` can sum any
+    ``MAX_EPISODES`` of them: no NaN, no infinity, and no integer too large for a float (the
+    comparisons are exact)."""
     if isinstance(value, bool) or not isinstance(value, int | float):
         return False
-    try:
-        return math.isfinite(value)
-    except OverflowError:  # an int too large for a float
-        return False
+    return 0 <= value <= MAX_TIME_UPRIGHT_S
 
 
 def summarize(episodes: Sequence[EpisodeResult], expected: int) -> Aggregate:

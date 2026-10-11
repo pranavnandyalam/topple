@@ -553,8 +553,9 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
   `aggregate.episodes == len(episodes)` and `aggregate.errors` equal to the number of episodes
   with an error. A `complete` result has no `missing` episode, and its aggregate is exactly §12's
   aggregate of the listed episodes (N = their number; every episode with metrics reports a
-  finite `time_upright_s`). Private-seed results are redacted: `episodes` is null, aggregate
-  only.
+  `time_upright_s` that is a number of seconds from 0 to 10⁹, far beyond any episode, so the
+  sum over at most 10,000 episodes can never overflow). Private-seed results are redacted:
+  `episodes` is null, aggregate only.
 - **Reading** (`read_results`) reads at most 16 MiB and validates all of the above. Validation
   proves a file well formed, never its numbers true: whoever publishes a score (Phase 3's
   publish step, the leaderboard) takes every number from trusted verification (§16), never from
