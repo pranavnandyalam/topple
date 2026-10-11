@@ -29,6 +29,7 @@ from topple.evaluate import (
     wants_epilogue,
 )
 from topple.results import (
+    MAX_EPISODES,
     RUN_ERROR_CODES,
     VERIFY_ERROR_CODES,
     ControllerInfo,
@@ -168,10 +169,12 @@ def verify_with_seed(
     For local and debug runs whose seed is not in the protocol's list (``topple run --seed``).
     The scenario is still re-derived from ``seed``; ``index`` only labels the verdict and the
     upload's ``meta.episode_index`` is not checked. The verdict is not bound to the protocol.
+    ``ValueError`` (a caller bug) for a seed outside ``[0, 2**53)`` or an index a results file
+    cannot hold (outside ``[0, MAX_EPISODES)``, contract §15).
     """
     validate_seed(seed)
-    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
-        raise ValueError(f"episode index must be a non-negative int, got {index!r}")
+    if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < MAX_EPISODES:
+        raise ValueError(f"episode index must be an int in [0, {MAX_EPISODES}), got {index!r}")
     with _replay_env(protocol) as env:
         return _verify(env, upload, _target(protocol, index, seed, bind=False))
 

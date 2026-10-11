@@ -35,6 +35,7 @@ from topple.contract import (
 from topple.envs.balance import BalanceEnv
 from topple.ids import parse_protocol, resolve_protocol
 from topple.results import (
+    MAX_EPISODES,
     ControllerInfo,
     EpisodeResult,
     ErrorInfo,
@@ -94,7 +95,8 @@ class EvalProtocol:
     """A protocol: challenge, preset, seeds and salt (contract §8, §9, §13).
 
     A public protocol's salt is 0; a private one's is a secret in
-    ``[MIN_PRIVATE_SALT, MAX_PRIVATE_SALT]``. Anything else raises ``ValueError``.
+    ``[MIN_PRIVATE_SALT, MAX_PRIVATE_SALT]``. It has at most ``MAX_EPISODES`` seeds, the most
+    episodes a results file lists (§15). Anything else raises ``ValueError``.
     """
 
     challenge: Challenge
@@ -104,6 +106,11 @@ class EvalProtocol:
     salt: int = 0
 
     def __post_init__(self) -> None:
+        if len(self.seeds) > MAX_EPISODES:
+            raise ValueError(
+                f"a protocol has at most {MAX_EPISODES} seeds, got {len(self.seeds)}: a results "
+                "file lists at most that many episodes"
+            )
         if self.seed_set not in ("public", "private"):
             raise ValueError(f"seed_set must be 'public' or 'private', got {self.seed_set!r}")
         if type(self.salt) is not int:

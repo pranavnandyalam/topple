@@ -690,6 +690,35 @@ def test_verify_a_local_seed_is_unbound(tmp_path: Path) -> None:
     assert "scenario" in bound.output
 
 
+@pytest.mark.parametrize("episode_index", [10_000, 123_456, 2**53 - 1])
+def test_a_file_index_no_results_file_holds_verifies_unbound(
+    tmp_path: Path, episode_index: int
+) -> None:
+    """§16: an upload chooses its own meta.episode_index. One no results file can hold (an index
+    is below 10,000, §15) once made the default binding, --seed and score print "verification
+    crashed: ValidationError" and exit 2, the message reserved for verifier bugs. Like any index
+    outside the protocol it is verified unbound on its scenario's seed, labelled 0."""
+    out = _run(tmp_path, "-p", "balance-v1/clean")
+    seed = load_npz(out / "traj_000.npz", max_steps=1000).meta["scenario"]["seed"]
+    path = _edited_file(out, "far.npz", episode_index=episode_index)
+    trusted = tmp_path / "trusted.json"
+    for args in ([], ["--seed", str(seed)]):
+        result = runner.invoke(app, ["verify", str(path), *args, "--out", str(trusted)])
+        assert result.exit_code == 0, result.output
+        line = f"OK (UNBOUND): balance-v1/clean seed {seed}: reproduced bit-exactly"
+        assert result.output.startswith(line), result.output
+        assert json.loads(trusted.read_text())["episodes"][0]["index"] == 0
+    scored = runner.invoke(app, ["score", str(path)])
+    assert scored.exit_code == 0, scored.output
+    payload = json.loads(scored.stdout)
+    assert (payload["ok"], payload["bound"], payload["index"], payload["seed"]) == (
+        True,
+        False,
+        0,
+        seed,
+    )
+
+
 def test_verify_writes_single_episode_results(tmp_path: Path) -> None:
     out = _run(tmp_path, "-p", "balance-v1/clean")
     trusted = tmp_path / "trusted.json"

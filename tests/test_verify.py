@@ -16,7 +16,7 @@ from hypothesis import strategies as st
 
 from topple.envs.balance import BalanceEnv
 from topple.evaluate import EPILOGUE_S, EvalProtocol, evaluate, run_episode
-from topple.results import EpisodeResult
+from topple.results import MAX_EPISODES, EpisodeResult
 from topple.traj import Trajectory
 from topple.verify import (
     ENV_META_FIELDS,
@@ -772,10 +772,25 @@ def test_run_episode_is_what_verification_replays(honest_runs: dict[str, Honest]
     assert results.episodes == run.results.episodes
 
 
-def test_verify_with_seed_rejects_bad_label_indices(honest_runs: dict[str, Honest]) -> None:
+@pytest.mark.parametrize("index", [-1, MAX_EPISODES, 2**53 - 1, True])
+def test_verify_with_seed_rejects_bad_label_indices(
+    honest_runs: dict[str, Honest], index: Any
+) -> None:
+    """§16: the label must be an index a results file can hold (below 10,000, §15). Index 10,000
+    once got past this check and crashed building the verdict with a ValidationError."""
     run = honest_runs["pid"]
-    with pytest.raises(ValueError, match="index"):
-        verify_with_seed(run.uploads[0], run.protocol, run.protocol.seeds[0], index=-1)
+    with pytest.raises(ValueError, match=r"episode index must be an int in \[0, 10000\)"):
+        verify_with_seed(run.uploads[0], run.protocol, run.protocol.seeds[0], index=index)
+
+
+def test_verify_with_seed_takes_the_largest_label_a_results_file_holds(
+    honest_runs: dict[str, Honest],
+) -> None:
+    run = honest_runs["pid"]
+    upload = run.uploads[0]
+    verdict = verify_with_seed(upload, run.protocol, run.protocol.seeds[0], index=MAX_EPISODES - 1)
+    assert verdict.ok, verdict.reason
+    assert verdict.index == verdict.result.index == MAX_EPISODES - 1
 
 
 class Unprintable:

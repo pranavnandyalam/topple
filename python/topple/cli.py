@@ -309,6 +309,14 @@ def _meta_int(value: object) -> int | None:
     return value if type(value) is int and 0 <= value < MAX_SEED else None
 
 
+def _unbound_label(file_index: int | None) -> int:
+    """The index an unbound verdict is labelled with: the file's own, if a results file can hold
+    it (contract §15), else 0. The upload chooses it, and it labels nothing but the verdict."""
+    from topple.results import MAX_EPISODES
+
+    return file_index if file_index is not None and file_index < MAX_EPISODES else 0
+
+
 def _bind(
     meta: dict[str, Any], protocol: EvalProtocol, index: int | None, seed: int | None
 ) -> _Binding:
@@ -318,7 +326,8 @@ def _bind(
     if index is not None and seed is not None:
         _fail("pass either --index or --seed, not both")
     if seed is not None:
-        return _Binding(protocol, file_index or 0, seed, False, "UNBOUND (seed from --seed)")
+        label = _unbound_label(file_index)
+        return _Binding(protocol, label, seed, False, "UNBOUND (seed from --seed)")
     if index is not None:
         if index >= n:
             _fail(f"--index {index} is outside {protocol.id}'s {n} episodes")
@@ -333,7 +342,8 @@ def _bind(
         return _Binding(protocol, file_index, protocol.seeds[file_index], True, "")
     if file_seed is None:
         _fail("cannot tell which episode this is; pass --index or --seed")
-    return _Binding(protocol, file_index or 0, file_seed, False, "UNBOUND (seed taken from file)")
+    label = _unbound_label(file_index)
+    return _Binding(protocol, label, file_seed, False, "UNBOUND (seed taken from file)")
 
 
 def _verify_file(

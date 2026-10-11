@@ -294,9 +294,10 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   itself never crosses the controller boundary. With a private protocol's secret salt it carries
   no usable information about the episode. `EvalProtocol` enforces the salts: a public
   protocol's salt is 0 and a private protocol's is an `int` in `[2**64, 2**128)`; anything else
-  (a forgotten salt of 0, a hand-typed `99`, a bool) raises `ValueError`. Its `repr` (so also
-  `str` and f-strings) never shows a private protocol's seeds or salt, so a log line or an
-  exception message cannot leak them.
+  (a forgotten salt of 0, a hand-typed `99`, a bool) raises `ValueError`, and so do more than
+  10,000 seeds, the most episodes a results file lists (§15). Its `repr` (so also `str` and
+  f-strings) never shows a private protocol's seeds or salt, so a log line or an exception
+  message cannot leak them.
 - **Public seeds are identifiable.** Public protocols use salt 0, so `rng_seed` (and equally the
   initial observation) identifies which public episode is running: a controller can recognize a
   public seed and replay a memorized answer. Scores on public seeds are therefore provisional.
@@ -748,8 +749,8 @@ def protocol_max_steps(protocol) -> int
 ```
 
 Verification never raises for anything in the upload. `verify_episode` raises `ValueError` only
-for an index outside the protocol, `verify_with_seed` for a seed outside `[0, 2**53)` or a
-negative index (caller bugs).
+for an index outside the protocol, `verify_with_seed` for a seed outside `[0, 2**53)` or an
+index outside `[0, 10000)`, the indices a results file holds (§15): caller bugs.
 `replay` is the trusted env's own record of the replay, with one exception: `action`, the raw
 controller output (§14), cannot be re-derived open loop, so `replay.action` is the upload's,
 checked in step 3 (finite, and `clip(action, −1, 1) == ctrl`). Nothing is scored from it.
@@ -841,7 +842,10 @@ terminal nor start a GitHub Actions workflow command.
     index from `meta.episode_index`. If that index is outside the protocol or its seed differs
     from `meta.scenario.seed`, the file is verified with `verify_with_seed` on the scenario's
     seed and the output says `UNBOUND (seed taken from file)`; the scenario is still re-derived
-    from that seed. `--index I` binds explicitly; `--seed S` verifies unbound on S.
+    from that seed. `--index I` binds explicitly; `--seed S` verifies unbound on S. An unbound
+    verdict is labelled with the file's own index (the `index` that `topple score` prints and
+    `--out` records) when a results file can hold it, below 10,000 (§15), and 0 otherwise: the
+    upload chooses that index, so it never decides anything else.
   - The first output line names the protocol and the episode, then gives the verdict's reason:
     `OK: <protocol> episode <i> (seed <s>): …` for a pass bound to the protocol (a private
     protocol's seed is left out), `OK (UNBOUND): <protocol> seed <s>: …` for an unbound one, and

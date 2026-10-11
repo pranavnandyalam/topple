@@ -27,6 +27,7 @@ from topple.evaluate import (
     wants_epilogue,
 )
 from topple.results import (
+    MAX_EPISODES,
     ControllerInfo,
     EpisodeResult,
     ErrorInfo,
@@ -161,6 +162,16 @@ def test_salts_in_range_are_accepted() -> None:
 def test_the_seed_set_is_public_or_private() -> None:
     with pytest.raises(ValueError, match="seed_set"):
         replace(protocol("ideal", 1), seed_set="secret")  # type: ignore[arg-type]
+
+
+def test_a_protocol_has_at_most_as_many_seeds_as_a_results_file_has_episodes() -> None:
+    """§15: a results file lists at most 10,000 episodes, each index below 10,000. A protocol
+    with more seeds could never be written: evaluation and verification would fail at episode
+    10,000 with a ValidationError, after running all the episodes before it."""
+    p = protocol("ideal", 1)
+    assert len(replace(p, seeds=tuple(range(MAX_EPISODES))).seeds) == MAX_EPISODES
+    with pytest.raises(ValueError, match=r"at most 10000 seeds, got 10001"):
+        replace(p, seeds=tuple(range(MAX_EPISODES + 1)))
 
 
 def test_pid_on_clean_scores_high(tmp_path: Path) -> None:
