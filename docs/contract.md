@@ -275,14 +275,16 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   is a file or directory that cannot be read or even examined, the submission's own path
   included (a name too long for the file system, a directory without search permission on the
   way): a `LoadError` naming it, never an `OSError`, so the CLI exits 2 with one line.
-  Untrusted names in load errors are quoted with `repr`, so they cannot
-  carry terminal escapes or line breaks. Loading a submission turns bytecode writing off for the
-  rest of the process (`sys.dont_write_bytecode`), so neither its import nor a later import of a
-  sibling module (in `make_controller`, `reset` or `act`) writes bytecode next to it. The
-  submission sha256 is sha256 of the tag `topple.submission/1\n`, then, for every file in
-  POSIX-path string order, `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths; `path`
-  is the UTF-8 POSIX path relative to the submission directory, or the file's name for a
-  single-file submission; `bytes` exactly as on disk, never normalized).
+  Every file name and path a load error shows is quoted with `repr`, so a name cannot carry a
+  terminal escape or a line break into it. A load error also quotes what the submission raised
+  (`Type: message`, and a `SyntaxError`'s message names its file raw), so its text as a whole
+  is untrusted: escape it before rendering, as the CLI does (§16). Loading a submission turns
+  bytecode writing off for the rest of the process (`sys.dont_write_bytecode`), so neither its
+  import nor a later import of a sibling module (in `make_controller`, `reset` or `act`) writes
+  bytecode next to it. The submission sha256 is sha256 of the tag `topple.submission/1\n`, then,
+  for every file in POSIX-path string order, `len(path)‖path‖len(bytes)‖bytes` (8-byte
+  big-endian lengths; `path` is the UTF-8 POSIX path relative to the submission directory, or
+  the file's name for a single-file submission; `bytes` exactly as on disk, never normalized).
 - **The sha256 covers the code that runs.** The entry file (the `.py` file, or `controller.py`)
   is read once: those bytes are hashed, and those bytes are compiled (as Python compiles a
   module, inheriting no `__future__` flags from the loader) and run as the submission's module.

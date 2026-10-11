@@ -97,7 +97,7 @@ def test_sha_changes_with_any_file(tmp_path: Path) -> None:
     ("name", "text", "message"),
     [
         ("nofactory.py", "x = 1\n", "must define make_controller"),
-        ("syntax.py", "def make_controller(:\n", "importing syntax.py failed"),
+        ("syntax.py", "def make_controller(:\n", "importing 'syntax.py' failed"),
         ("raises.py", "raise RuntimeError('at import')\n", "RuntimeError: at import"),
         (
             "twoargs.py",
@@ -196,7 +196,7 @@ def test_a_hostile_import_failure_is_a_clean_load_error(
     traceback."""
     sys.modules.pop("topple_test_liar_ran", None)
     path = write(tmp_path, "hostile.py", HOSTILE_IMPORT_PRELUDE + body)
-    assert load_error_message(path) == f"importing hostile.py failed: {detail}"
+    assert load_error_message(path) == f"importing 'hostile.py' failed: {detail}"
     assert "topple_test_liar_ran" not in sys.modules
 
 
@@ -212,7 +212,7 @@ HOSTILE_FACTORIES = {
         "    def __getattribute__(self, name):\n"
         "        raise RuntimeError('no attributes for you')\n"
         "sys.modules[__name__].__class__ = M\n",
-        "reading make_controller from hostile.py failed: RuntimeError: no attributes for you",
+        "reading make_controller from 'hostile.py' failed: RuntimeError: no attributes for you",
     ),
     "factory whose signature raises": (
         "class Factory:\n"
@@ -222,7 +222,7 @@ HOSTILE_FACTORIES = {
         "    def __call__(self, spec):\n"
         "        return None\n"
         "make_controller = Factory()\n",
-        "make_controller in hostile.py has no usable signature: "
+        "make_controller in 'hostile.py' has no usable signature: "
         "ZeroDivisionError: no signature for you",
     ),
     "factory whose signature exits": (
@@ -234,7 +234,7 @@ HOSTILE_FACTORIES = {
         "    def __call__(self, spec):\n"
         "        return None\n"
         "make_controller = Factory()\n",
-        "make_controller in hostile.py has no usable signature: SystemExit: 3",
+        "make_controller in 'hostile.py' has no usable signature: SystemExit: 3",
     ),
 }
 
@@ -255,7 +255,7 @@ def test_a_hostile_factory_lookup_is_a_clean_load_error(
 def test_a_submission_without_a_factory_leaves_no_module_behind(tmp_path: Path) -> None:
     before = set(sys.modules)
     message = load_error_message(write(tmp_path, "nofactory.py", "x = 'only here'\n"))
-    assert message == "nofactory.py must define make_controller(spec)"
+    assert message == "'nofactory.py' must define make_controller(spec)"
     assert [name for name in sys.modules if name not in before] == []
 
 
@@ -817,7 +817,7 @@ def test_the_loader_does_not_lend_its_future_imports(tmp_path: Path) -> None:
 def test_a_source_that_does_not_compile_is_a_load_error(tmp_path: Path) -> None:
     entry = tmp_path / "nul.py"
     entry.write_bytes(b"x = 1\x00\n")
-    assert load_error_message(entry).startswith("importing nul.py failed: SyntaxError: ")
+    assert load_error_message(entry).startswith("importing 'nul.py' failed: SyntaxError: ")
 
 
 # ------------------------------------------------------------------ unreadable trees (§8)
@@ -966,6 +966,51 @@ def test_the_walk_stops_at_the_directory_cap(
     with pytest.raises(LoadError, match="directories"):
         submission_sha256(root)
     assert len(listed) == 1  # refused while listing the top directory
+
+
+HOSTILE_NAME = "z\x1b]0;pwned\x07\n::error::w"  # a terminal escape, then a CI workflow command
+
+NAMED_LOAD_ERRORS = {
+    "no factory": ("x = 1\n", "{name!r} must define make_controller(spec)"),
+    "import fails": (
+        "raise RuntimeError('at import')\n",
+        "importing {name!r} failed: RuntimeError: at import",
+    ),
+    "signature raises": (
+        HOSTILE_FACTORIES["factory whose signature raises"][0],
+        "make_controller in {name!r} has no usable signature: "
+        "ZeroDivisionError: no signature for you",
+    ),
+    "lookup raises": (
+        HOSTILE_FACTORIES["module whose attribute lookup raises"][0],
+        "reading make_controller from {name!r} failed: RuntimeError: no attributes for you",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("text", "message"), NAMED_LOAD_ERRORS.values(), ids=list(NAMED_LOAD_ERRORS.keys())
+)
+def test_every_load_error_quotes_the_file_name(tmp_path: Path, text: str, message: str) -> None:
+    """Contract §8: a file name in a load error is quoted with ``repr``, so the Phase 3 runner can
+    record the message without a raw escape or line break coming from the name."""
+    name = f"{HOSTILE_NAME}.py"
+    assert load_error_message(write(tmp_path, name, text)) == message.format(name=name)
+
+
+def test_every_load_error_quotes_the_path(tmp_path: Path) -> None:
+    missing = (tmp_path / f"{HOSTILE_NAME}.py").resolve()
+    assert load_error_message(missing) == f"{str(missing)!r} does not exist"
+    link = tmp_path / f"{HOSTILE_NAME}-link.py"
+    link.symlink_to(write(tmp_path, "real.py", GOOD))
+    assert load_error_message(link) == (
+        f"{str(link)!r} is a symlink; submit the file or directory itself"
+    )
+    loop = tmp_path / HOSTILE_NAME
+    loop.symlink_to(loop)
+    assert load_error_message(loop / "bot.py").startswith(
+        f"cannot resolve {str(loop / 'bot.py')!r}"
+    )
 
 
 def test_untrusted_names_are_quoted_in_load_errors(tmp_path: Path) -> None:

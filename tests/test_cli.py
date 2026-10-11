@@ -317,7 +317,7 @@ def test_a_hostile_import_exits_2_without_a_traceback(
 ) -> None:
     result = runner.invoke(app, ["run", str(_submission(tmp_path, text)), "--no-video"])
     assert result.exit_code == 2
-    assert f"importing bot.py failed: {detail}" in result.output
+    assert f"importing 'bot.py' failed: {detail}" in result.output
     assert "Traceback" not in result.output
 
 

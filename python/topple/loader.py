@@ -190,7 +190,7 @@ def _import(entry: Path, sha: str, source: bytes) -> ModuleType:
     name = _module_name(sha)
     spec = importlib.util.spec_from_file_location(name, entry)
     if spec is None:
-        raise LoadError(f"cannot import {entry}")
+        raise LoadError(f"cannot import {str(entry)!r}")
     module = importlib.util.module_from_spec(spec)  # __file__, __spec__, ... as for an import
     sys.modules[name] = module
     stop_writing_bytecode()
@@ -201,7 +201,7 @@ def _import(entry: Path, sha: str, source: bytes) -> ModuleType:
         raise
     except BaseException as exc:  # SystemExit, GeneratorExit, ...: all the submission's fault
         sys.modules.pop(name, None)
-        raise LoadError(f"importing {entry.name} failed: {describe_exception(exc)}") from exc
+        raise LoadError(f"importing {entry.name!r} failed: {describe_exception(exc)}") from exc
     return module
 
 
@@ -236,7 +236,7 @@ def _wrap_factory(raw: Callable[..., Any], entry: Path) -> Callable[[TaskSpec], 
         raise
     except BaseException as exc:
         raise LoadError(
-            f"{FACTORY} in {entry.name} has no usable signature: {describe_exception(exc)}"
+            f"{FACTORY} in {entry.name!r} has no usable signature: {describe_exception(exc)}"
         ) from exc
     if required > 1:
         raise LoadError(f"{FACTORY} must take (spec) or no arguments, got {required} required")
@@ -269,7 +269,7 @@ def _factory_of(module: ModuleType, entry: Path) -> object:
         raise
     except BaseException as exc:
         raise LoadError(
-            f"reading {FACTORY} from {entry.name} failed: {describe_exception(exc)}"
+            f"reading {FACTORY} from {entry.name!r} failed: {describe_exception(exc)}"
         ) from exc
 
 
@@ -309,13 +309,13 @@ def _locate(path: Path) -> tuple[Path, Path]:
     """
     try:
         if path.is_symlink():
-            raise LoadError(f"{path} is a symlink; submit the file or directory itself")
+            raise LoadError(f"{str(path)!r} is a symlink; submit the file or directory itself")
         try:
             path = path.resolve()
         except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop on the way
-            raise LoadError(f"cannot resolve {path}: {exc}") from exc
+            raise LoadError(f"cannot resolve {str(path)!r}: {exc}") from exc
         if not path.exists():
-            raise LoadError(f"{path} does not exist")
+            raise LoadError(f"{str(path)!r} does not exist")
         entry = path / ENTRY_FILE if path.is_dir() else path
         if entry.suffix != ".py" or not entry.is_file():
             raise LoadError(_NO_ENTRY)
@@ -328,5 +328,5 @@ def _factory(module: ModuleType, entry: Path) -> Callable[[TaskSpec], Controller
     """The submission's checked ``make_controller``, wrapped; ``LoadError`` if it has none."""
     raw = _factory_of(module, entry)
     if not callable(raw):
-        raise LoadError(f"{entry.name} must define {FACTORY}(spec)")
+        raise LoadError(f"{entry.name!r} must define {FACTORY}(spec)")
     return _wrap_factory(raw, entry)
