@@ -471,3 +471,92 @@ Superseded earlier decisions:
   rl #5, product #3).
 - §4 stack table, CI row: untrusted bytes parsed only in a token-less, secret-less `rescore`
   job; `publish` reads only its validated output (security #1).
+
+## Sync with merged Phase 1 (spec v5 → v5.1)
+
+Phase 1 merged as PR #3 (main `f997394`) after v5 was written; its fix rounds changed names,
+numbers, hashes, APIs and contract sections that v5 cites. This round syncs `phase-2.md` with the
+merged code and `docs/contract.md`; it is not a critique round, so each row is a change, its source
+in the merged code or contract, and the spec section it lands in. Baselines were re-measured for
+this sync on darwin-arm64 with the merged code (`evaluate`, PID and LQR on `balance-v1/standard`
+seeds 0..199, 2000..2199 and 1000..1019). Only `phase-2.md`, this log and the new
+`docs/design/deferred-risks.md` were edited.
+
+Superseded earlier decisions:
+- round 0 rl #11 (§0 numbers PID 0.66 / 68.88 / 6.65 J, LQR 0.87 / 80.25 / 3.31 J, E_ref 13.3) →
+  S1, S2.
+- round 0 wf_3f0c2a9a-a51 product #4 ("`_MAX_PUSHES` is untouched") → S3: the constant is the
+  public `MAX_PUSHES`, still 3.
+- round 1 product #8 (`load_npz` obs width from the registry) and round 2 consistency #14
+  (`load_npz(path, *, max_steps, obs_dim)`) → S16: `topple.traj/2` with a trusted `layout`.
+- round 3 security #4 (npz headers parsed and size-checked before `np.load` in export and in
+  Phase 1's `load_npz`) → S6: Phase 1 already reads every member by hand; export reuses that reader.
+- round 3 deploy #6 ("the harness asserts finite observations") → S9: a `RuntimeError`, not an
+  `assert`.
+- round 3 deploy #4 (ubuntu compare in the `python` job) and consistency #13 (G9 "both jobs") →
+  S17: `python-slow` runs it; G9 covers three jobs.
+- round 3 consistency #8 (`phase2b_done.sh` syncs `.venv-eval` with `--no-dev`, then runs pytest)
+  → S19.
+- round 3 consistency #17 (`EvalProtocol.is_named`) → S12.
+
+| id | What changed | Source (code or contract) | Spec section |
+|---|---|---|---|
+| S1 | E_ref is 13.0 J (2 × PID's median 6.49 J), not 13.3; the energy bars of eligibility and G4 read it from `ScoreConfig`, so they move with it. | `challenges/balance-v1/challenge.yaml` (`e_ref_j: 13.0`); contract §12; `tests/test_challenge.py` (`STANDARD_PAYLOAD`) | preamble, §0, §9 |
+| S2 | §0 baselines re-measured on the merged env: PID 68.70 / 0.645 / 6.49 J (0..199), 70.63 / 0.655 (2000..2199), 73.05 / 0.75 (eval_v1); LQR 80.06 / 0.865 / 3.26 J, 82.51 / 0.90, 85.42 / 0.95; survival equals success; mean saturation PID 0.074, LQR 0.046. PPO/SAC numbers relabelled as fix-branch pilots (E_ref 13.3). Every gate bar is relative to PID, LQR or E_ref measured in the same run, so no bar is re-derived by hand; only E_ref's value changes (S1). | measured for this sync; `challenge.yaml` comment (LQR 86.5%, PID 64.5% survival) | §0, §2.2 |
+| S3 | `_MAX_PUSHES` is the public `topple.disturbances.MAX_PUSHES` (3, fixed consumption of the PUSHES stream); the waypoint `standard` preset is a `PushConfig` using existing fields only, so `Preset` dumps and balance-v1 hashes keep their keys. | `disturbances.py` (`MAX_PUSHES`, `PushConfig`, `_draw_pushes`) | §8.1, §8.2 |
+| S4 | Course draws follow the portable rule (one `Generator.random()` double, affine map in Python), never `Generator.uniform`; `Scenario.course` stores the draws `{h0, turns}`, and points are derived per platform with scalar `math.cos`/`math.sin`; acceptance compares `x² + y² ≤ 1.5²`. | contract §9; `disturbances._uniforms`; commit `f78d84b` | §8.3 |
+| S5 | Known-answer hashes cited: bundle `a3b48463…7f5017a9`, protocol hashes per preset, selection (2000..2199) `148b7b6b…dc9e9ea6`, calibration (0..199) `c7b0a50c…0a4156c1`, `ENV_ALGO_VERSION` 1. Phase 1 already pins per-preset protocol hashes and the standard payload text (with the `ScoreConfig` dump); the 2b golden list and file names follow (`tests/test_golden.py`, `tests/test_challenge.py`; there is no `test_golden_balance.py`). | `tests/test_golden.py`, `tests/test_challenge.py`; computed with the merged code | §2.3, §8.1, §8.9 |
+| S6 | Export reads checkpoint npz files through Phase 1's trajectory reader parts (`topple._zip.Archive`, the hand-parsed npy header), moved into `topple/_npz.py`; no `zipfile`, `np.lib.format` or `np.load`. The note "the same header rule applies to Phase 1 `load_npz`" is dropped: it already holds. | contract §14; `_zip.py`, `traj.py` | §3.3, §6 |
+| S7 | Policy directories follow the loader's rules: each file read once and `submission_sha256` computed from those bytes (the hash covers what runs), exact names as `os.scandir` returns them, a bounded listing, non-UTF-8 names refused, `OSError` → `LoadError`; `load_submission(path, *, challenge=None)` extends Phase 1's `load_submission(path)`. | contract §8; `loader.py` | §3.1, §3.5, §3.6, §6 |
+| S8 | Recorded termination reasons: `timeout` only for survivors, `error` for an episode the harness stopped. Waypoint event rows, `fall_cause`, `fell` (fall reasons only) and success (`survived`) use them; compare `termination[]` holds them; the hero pane plays an epilogue after a fall or an error. | contract §11, §12, §14; `BalanceEnv._recorded_end`, `evaluate.FALL_REASONS`, `scoring.SURVIVED` | §5.2, §5.3, §8.5, §8.6 |
+| S9 | The control loop is bounded by `max_steps` and raises `RuntimeError` for a harness bug; the finite-observation check does the same instead of an `assert`. Training wrappers never change `max_steps` or truncation. | contract §8; `evaluate._control_loop` | §2.1, §3.5, §6 |
+| S10 | `results.json` is strict: the new `Versions` and `ControllerInfo` fields are optional and bounded; every gate input is read like `read_results` (regular file, ≤ 16 MiB, exact JSON types, `format` required); compare JSON gets the same model rules; waypoint metrics include `steps`, `termination`, `survived`, `time_upright_s` (needed by `summarize` and the complete-run check) and `rms_tilt_rad`, 18 in all (≤ 32). | contract §15; `results.py` (`read_results`, `summarize`, `MAX_METRICS`) | §3.6, §4, §5.3, §8.6 |
+| S11 | The trusted API includes `verify_with_seed` and `verify_run` → `RunVerdict` (`failed`, `ok`): both are in the 2b dispatch list, and 2b item 3 requires `verify_run(...).failed == 0`. §10 notes that the Phase 3 job named `rescore` re-runs policies, unlike `topple.verify.rescore`. | contract §16; `verify.py`, `cli.py` | preamble, §8.1, §8.9, §10 |
+| S12 | `EvalProtocol.is_named` is dropped: `--seeds` replaces a named protocol's seeds with `dataclasses.replace` (as `topple run --seed` does; ≤ 10,000 seeds), compare JSON's `complete` is defined, Phase 2 pools carry public protocols only, and §10 states the private salt range. | contract §8, §15; `evaluate.EvalProtocol` (salt rules, redacted `repr`), `cli.run` | §2.3, §3.5, §5.3, §10 |
+| S13 | Waypoint robot and scene against the robot rules: the robot is byte-identical (passes `validate_robot`); the scene is balance-v1's except `offheight="960"` for the 960×960 video, with no other world geom or site, so gates and the dock are drawn by the renderer; course parameters reach `TaskSpec.extras` as floats. | contract §3, §8; `robot.validate_robot`, `build_model`, `video._playback`, `contract.TaskSpec` | §8.2 |
+| S14 | New CLI outputs follow the output rules: `cli._check_output` for relative paths (never through a symlinked directory), atomic writes (`_atomic.replacement`, `write_results`), one-line escaped errors (`cli._fail`); export's `--out` swap uses `tempfile.mkdtemp`. | contract §14, §16; `_atomic.py`, `cli.py` | §3.3, §5.3, §6 |
+| S15 | Inputs: `read_regular_file` sits in `topple/_inputs.py` beside `open_regular` (stricter: no symlinks or hard links); `load_train_config` reads with `open_regular`. | `_inputs.py`; contract §14, §15 | §2.1, §3.4 |
+| S16 | F41: `topple.traj/2` for challenges whose obs schema is not `balancer.obs.v1` (see below). | contract §14; `traj.py` (`_SCHEMA["obs"]` fixed at 10 columns) | §8.1a, §6, §8.9, §10 |
+| S17 | CI and packaging as merged: jobs `python` (`not slow`, coverage) and `python-slow` (`slow`); `test_shipped_policy` is slow, so `python-slow` runs the ubuntu compare and uploads; G9 covers `python`, `python-slow` and `python-train`; markers `render`, `slow` plus `train`; coverage config in pyproject; existing mypy overrides, deps and `.gitignore` entries named. | `.github/workflows/ci.yml`, `pyproject.toml`, `.gitignore` | §4, §6, §7 |
+| S18 | Video limits: rendered sizes are multiples of 16 px (`MACRO_BLOCK`) within the scene's offscreen buffer; GIF ladder rungs resample the composed frame. | `video.py` | §5.2, §8.2 |
+| S19 | `phase2b_done.sh` syncs `.venv-eval` with the dev group (pytest lives there; `--no-dev` dropped it), still without extras, so still torch-free. | `pyproject.toml` (`[dependency-groups] dev`, `default-groups`) | §8.9 |
+| S20 | Dims and action bounds come from the challenge's `TaskSpec` (`Challenge.task_spec(wheel_radius_m, track_width_m)` also wants robot geometry, which does not change them); the driver's gains are named (`controllers.lqr.DEFAULT_GAINS`). | `challenge.py`, `contract.ActionSpec`, `controllers/lqr.py` | §3.2, §3.3, §3.5, §8.7 |
+| S21 | Phase 1 is merged: the "train after the fix merges" gate, the `phase-1-sim-core/…` path and "fix I/J" references are replaced by the merged code, contract and tests; residual Phase 1 risks go to `docs/design/deferred-risks.md`, linked from §10. | main `f997394` | preamble, §3.1, §9, §10 |
+
+### F41 decision: `topple.traj/2`
+
+`topple.traj/1` fixes `obs` at 10 columns (contract §14; `traj._SCHEMA`), so waypoint-v1's
+15-feature observation cannot be recorded in it. Options: (1) widen `/1` in place (it is
+unpublished), (2) a new format for non-balance challenges, (3) store extra features in a separate
+member. Decision: (2). `/1` stays byte-for-byte as merged and is the only format for challenges
+whose `obs_schema` is `balancer.obs.v1`, so balance-v1 records, readers, goldens and the
+canonical-layout red-team tests are untouched. `topple.traj/2` equals `/1` except `meta.format`
+and an `obs` width D = `len(TaskSpec.obs_features)` (1 ≤ D ≤ 64), with `meta.obs_features` naming
+exactly D features. The reader takes the width from the trusted protocol (`layout` =
+`protocol_traj_layout(protocol)`; the default `TRAJ_V1` fails closed), checks the `obs` header
+before reading data, and checks `meta.format` and the feature count; verification's step 5 still
+compares `obs` and `obs_schema`/`obs_features` with the replay. (1) was rejected: it changes a
+layout that the merged contract, reader and red-team tests pin at 10 columns, and a format id is
+how the contract versions a layout change (contract §1); a width read from `meta` would also let
+an upload choose its own limit, so the trusted width is needed either way. (3) was rejected
+because it changes the member set, which every zip-layout check pins. Specified normatively in
+`phase-2.md` §8.1a with its tests; the contract text (§1, a new §14a, §16) is a 2b deliverable
+(§8.9 item 4).
+
+### Round-3 HIGH issues re-checked after the sync
+
+- **rl #1 (linear LR).** Still resolved: §2.2's config keeps `learning_rate: {schedule: linear,
+  initial: 3.0e-4, final: 0.0}` with the clamp, §2.1 `lr_fn`, the `test_train_config` clamp
+  test and the `late_regression` flag are unchanged. The sync labels §0's constant-vs-linear table
+  as a fix-branch pilot (E_ref 13.3); the decision rests on late collapse under a constant LR, not
+  on E_ref, and the LQR it was compared with moved only from 80.14 to 80.06 on 0..199.
+- **security #1 (Phase 3 `rescore` job).** Still resolved: §10 (i) keeps `permissions: {}`, no
+  secrets, `persist-credentials: false`, base-branch code only, fetch by `head_sha`, and a separate
+  `publish` job that never parses ONNX. The sync only names the trajectory formats it may emit,
+  makes the boundary (iii) read them with `load_npz` and the protocol's layout, and states the
+  private salt range; none of this widens what the token-holding job sees.
+- **product #1 (2b learnability).** Still resolved: §8.8 eligibility (score > creeper, docked ≥
+  0.65, `fell ≤ driver_fell + 0.20`, paired lower bound > −5), the 6-run shipping fallback and
+  item 6 on calibration seeds 0..399 are unchanged. The sync defines `fell` as the fall reasons
+  only (`fell`, `floor_contact`), which the fall term depends on, and success through `survived`;
+  an errored episode still scores 0 and cannot pass the docked or score gates.

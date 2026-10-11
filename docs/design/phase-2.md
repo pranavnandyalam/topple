@@ -1,14 +1,19 @@
-# Phase 2 design: Learn (v5, normative)
+# Phase 2 design: Learn (v5.1, normative)
 
 v5 resolves re-critique round 3. Every issue from the six critiques (`wf_3f0c2a9a-a51`,
 `wf_2fb93652-cd0`, `wf_bc1d1edf-2dc`) and the three re-critiques is decided in
-`docs/design/phase-2-decisions.md`.
+`docs/design/phase-2-decisions.md`. v5.1 syncs the spec with the merged Phase 1 (main `f997394`,
+PR #3); its changes are rows S1–S21 of the log's "Sync with merged Phase 1".
 
-The design targets the **post-fix** Phase 1 APIs (`phase-1-sim-core/docs/design/phase-1-fixes.md`):
-`controller_obs(obs_arr, t)`, `wants_epilogue`, trusted `verify_episode` / `rescore`, error codes
-`incomplete`, `not_reproducible`, `missing`, aggregate = fsum/N, no self-attested `rankable`,
-`ENV_ALGO_VERSION` in `protocol_hash`, float32-quantized observations. **2a training starts only
-after the Phase 1 fix branch has merged** (§2.3 binds every run to the env version).
+The design builds on the merged Phase 1 code and `docs/contract.md` ("contract §n", also for a
+list such as "contract §9, §14"; a bare §n is this spec): `controller_obs(obs_arr, t)`,
+`wants_epilogue(termination_reason, has_error)`, trusted `verify_episode` / `verify_with_seed` /
+`rescore` / `verify_run` (→ `RunVerdict`), verification codes `incomplete`, `not_reproducible`,
+`missing` and the runner's `RunnerError` codes, aggregate = fsum/N, no self-attested `rankable`,
+`ENV_ALGO_VERSION` (1) in `protocol_hash`, float32-quantized observations, portable scenario draws,
+the canonical-layout trajectory reader and strict `results.json` (contract §9, §14, §15). Phase 2
+reuses these; it never re-implements them. Phase 1 has merged, so 2a training may start (§2.3
+binds every run to the env version).
 
 "MUST" marks a check the gate enforces. Phase 2 has two parts, each with its own done-when and
 review gate:
@@ -18,22 +23,32 @@ review gate:
   starts after 2a passes.
 
 **No literals for E_ref.** E_ref means `challenge.config.score.e_ref_j` of the protocol in use
-(balance-v1: 13.3 J today). Code reads it from the `ScoreConfig`; `train_meta.json` and
-`phase2.json` record the value used. Every number this spec quotes from a pilot is replaced in
-`phase2.md` by a template filled from `phase2.json` (§5.1).
+(balance-v1: 13.0 J = 2 × PID's median 6.49 J; 13.3 before the Phase 1 recalibration). Code reads
+it from the `ScoreConfig`; `train_meta.json` and `phase2.json` record the value used. Every number
+this spec quotes from a pilot is replaced in `phase2.md` by a template filled from `phase2.json`
+(§5.1).
 
 ## 0. Facts used
 
-Balance-v1/standard. Gates compare against baselines **measured in the same run**.
+Balance-v1/standard. Gates compare against baselines **measured in the same run**. Baselines on the
+merged Phase 1 env (E_ref 13.0, darwin-arm64; survival equals success in every row; mean saturation
+on 0..199: PID 0.074, LQR 0.046):
 
-| Controller | Seeds | Env | Score | Success | Median energy |
-|---|---|---|---|---|---|
-| PID (`submissions/pid_example.py`) | 0..199 | pre-fix | 68.88 | 0.66 | 6.65 J |
-| PID | 2000..2199 | post-fix | 70.29 | 0.64 | — |
-| LQR (`submissions/lqr_example.py`) | 0..199 | post-fix | 80.14 | 0.865 | 3.31 J (pre-fix) |
-| PID | eval_v1 (1000..1019) | pre-fix | 71.88 | 0.70 | — |
+| Controller | Seeds | Score | Success | Median energy |
+|---|---|---|---|---|
+| PID (`submissions/pid_example.py`) | 0..199 | 68.70 | 0.645 | 6.49 J |
+| PID | 2000..2199 | 70.63 | 0.655 | 5.89 J |
+| PID | eval_v1 (1000..1019) | 73.05 | 0.75 | 7.38 J |
+| LQR (`submissions/lqr_example.py`) | 0..199 | 80.06 | 0.865 | 3.26 J |
+| LQR | 2000..2199 | 82.51 | 0.90 | 2.76 J |
+| LQR | eval_v1 | 85.42 | 0.95 | 2.84 J |
 
-- **PPO** (post-fix env, 8 envs × 2048, batch 2048, 10 epochs, penalty box 2 / weight 0.1, 5M
+Every PPO and SAC number below is a pilot on the Phase 1 fix branch before the merge (E_ref 13.3;
+there LQR scored 80.14 / 0.865 on 0..199 and PID 70.29 / 0.64 on 2000..2199). It motivates the
+recipe only: every gate bar is relative to PID, LQR or E_ref measured in the same run (§2.4, §4),
+so the bars follow the recalibration without edits; the energy bar is now 13.0 J.
+
+- **PPO** (pilot env, 8 envs × 2048, batch 2048, 10 epochs, penalty box 2 / weight 0.1, 5M
   steps; pick by selection on 2000..2199, fresh score / success on 0..199, PPO − LQR paired 95% CI):
 
   | LR | seed 0 | seed 1 | seed 2 | mean (sd) |
@@ -45,12 +60,12 @@ Balance-v1/standard. Gates compare against baselines **measured in the same run*
   0.108–0.149 from 3.5M (ineligible); policy std 0.057–0.073 by 5M. Linear LR: every checkpoint
   from 1.5–1.75M on is eligible, mean saturation ≤ 0.029, no regression after the peak. The
   pick's selection → calibration shrinkage was −0.75 to −1.33 points in all 6 runs; selection
-  seeds are easier (LQR 82.57 vs 80.14, PID 70.29 vs 68.82). Pre-fix at 1–1.5M steps: 14–23 J,
-  12–24% saturated, success 0.49–0.60.
+  seeds are easier (merged: LQR 82.51 vs 80.06, PID 70.63 vs 68.70). With the original, unfixed
+  Phase 1 env at 1–1.5M steps: 14–23 J, 12–24% saturated, success 0.49–0.60.
 - **Determinism:** two seed-1 runs (311,296 steps, 8 forkserver workers, torch 1 thread) gave the
   same params + `obs_rms` sha at loads 6.9 and 5.9; a seed-1 5M run matched bit-for-bit where
   compared (std 0.8825 at step 262,144).
-- **SAC** (the §2.2 config, post-fix, seed 0, 1.0M steps): selection success by 100k step .12 .125
+- **SAC** (the §2.2 config, pilot env, seed 0, 1.0M steps): selection success by 100k step .12 .125
   .145 .225 .355 .39 .315 .38 .29 .355 (PID 0.64); best 0.39 / 65.2 at 600k; final 0.355 / 67.72,
   survival 0.54, never eligible; `ent_coef` 0.031 → 0.066. Tested and worse: `target_entropy −4`
   (≤ 0.205 / 52.5); UTD 1 (2 envs × gs 2: 400k steps in 729 s, 0.27 / 54.3, 549 steps/s). SAC does
@@ -136,6 +151,7 @@ def safe_load_capped(data: bytes, cap: int = 64 * 1024, max_depth: int = 32) -> 
 #   LrSchedule: {schedule: Literal["constant", "linear"], initial: float > 0, final: float >= 0}
 def lr_fn(s: LrSchedule) -> Callable[[float], float]   # linear: lambda p: final + (initial - final) * max(p, 0.0)
 def load_train_config(path: Path, *, seed: int | None = None) -> TrainConfig   # applies --seed; result is the effective config
+    # reads the file with topple._inputs.open_regular(path, 64 KiB): never blocks on a FIFO, refuses non-regular files
 def config_sha256(cfg: TrainConfig) -> str   # of the EFFECTIVE config (seed included): sha256(json.dumps(model_dump(mode="json"), sort_keys=True, separators=(",", ":")))
 # topple/train/wrappers.py  gymnasium only
 TRAIN_SEED_LO = 2**52
@@ -144,6 +160,8 @@ class TrainingSeeds(gym.Wrapper):        # reset seed = TRAIN_SEED_LO + int(rng.
 class ActionExcessPenalty(gym.Wrapper):  # PPO only; action_space Box(-box, box, (2,)); env still clips to [-1, 1]
     def __init__(self, env, box: float, weight: float)      # r -= weight * min(mean_i(max(|a_i| - 1, 0)**2), 1); info["excess_penalty"]
 def make_train_env(cfg: TrainConfig, env_index: int) -> gym.Env  # env -> Monitor -> penalty -> TrainingSeeds
+    # env: the kind's env class (§8.1; balance: BalanceEnv(preset, challenge=load_challenge(id), reward=RewardConfig(...),
+    # max_drift_m=...), record=False). No wrapper changes max_steps or truncation: the env ends every episode itself (contract §8, §11).
 # topple/train/selection.py  ONNX bytes through the real harness
 @dataclass(frozen=True)
 class SelectionResult:
@@ -239,7 +257,7 @@ Rules:
 - **log_std.** PPO `log_std_init` 0.0 (−0.5 and −1.0 measured worse).
 - **Learning rate.** PPO uses the linear schedule: `lr(p) = 3e-4·max(p, 0)` with SB3's
   `progress_remaining` p. The clamp is required: p reaches 1 − 5,013,504/5,000,000 = −0.0027 on the
-  last update (lr −8e-7 would be gradient ascent). Constant LR collapsed 1 of 3 post-fix seeds
+  last update (lr −8e-7 would be gradient ascent). Constant LR collapsed 1 of 3 pilot seeds
   after 2.3M steps (§0). A fine-tune restarts the schedule at 3e-4.
 - **SAC.** UTD 0.25 is the best of the three measured settings for this budget (§0); it is a
   shared-machine choice, not SAC's default (UTD 1).
@@ -262,9 +280,13 @@ Rules:
     frac_mean_outside_1, excess_penalty_mean, cpu_s, wall_s, onnx_sha256), `best`, `flags`,
     `num_timesteps`. Per-seed `scores` of every eval go to `selection_scores.npz` (float64
     `[n_evals, n_seeds]`, `steps` int64), read by the 2b budget rule and the learning curves.
-- `phase2_gate.py` recomputes `EvalProtocol(balance-v1/standard, seeds 2000..2199).protocol_hash()`
-  and the current `ENV_ALGO_VERSION` and fails if **any** reported run (PPO, SAC, ablation)
-  differs, or if the shipped run has `git_dirty: true`.
+- `phase2_gate.py` recomputes the selection protocol's hash (`balance-v1/standard` with seeds
+  2000..2199, built with `dataclasses.replace` from `EvalProtocol.from_id`, as `topple run` builds
+  its one-seed protocol) and the current `ENV_ALGO_VERSION` and fails if **any** reported run (PPO,
+  SAC, ablation) differs, or if the shipped run has `git_dirty: true`. Known answers at v5.1 (they
+  move only with a reviewed re-pin, contract §13): selection `148b7b6b9ec392c09f32e2a053df3894c4d2d93e820bdac00b786db6dc9e9ea6`,
+  calibration 0..199 `c7b0a50cdb33c55dd26bff880232d5c1ab37f57eb371f69a35ee13d50a4156c1`, bundle
+  `a3b4846310a1a174f288da82d9532fe986a4b0428ab5069d1620e1237f5017a9`, `ENV_ALGO_VERSION` 1.
 - **Determinism per (config, seed, platform, start_method) is required and tested** (CLAUDE.md:
   seeded runs are deterministic per platform). `test_train_smoke` runs each smoke config twice
   with the same seed and asserts identical sha256 of every `actor.npz` / `critic.npz`, identical
@@ -374,6 +396,11 @@ by the CLI), all regular files with `st_nlink == 1`.
 - Anything else is `LoadError("unexpected entry: <safe(name)>")`, including subdirectories, hidden
   files (`.DS_Store`), FIFOs, sockets and `.py/.pyc/.so/.pkl/.pickle/.zip/.pt/.pth/.joblib/.ckpt/
   .onnx.data`. `policy.json` plus any `.py` is `LoadError("ambiguous submission kind")`.
+- As contract §8 rules for `controller.py`: names match exactly as `os.scandir` returns them
+  (`POLICY.JSON` is unexpected on macOS too), non-UTF-8 names are refused, the listing stops at the
+  4th entry (a bounded walk), and a path that cannot be examined is a `LoadError`, never `OSError`.
+- **Read once.** Each file is read once (`read_regular_file`); `submission_sha256` (contract §8's
+  recipe) is computed from those bytes, and those `policy.onnx` bytes are validated and run.
 - The loader checks for `policy.json` before `controller.py`. Python submissions are unchanged.
 
 `policy.json` is the normative manifest (onnxruntime-web cannot read `metadata_props`).
@@ -417,8 +444,8 @@ Every other claims string matches `PRINTABLE`.
 so this is also `policy.json` `onnx.sha256`, `LoadedPolicy.policy_sha256`, the R2 key and the
 Phase 8 header hash. It identifies **bytes**: canonical form removes all non-semantic content, but
 two functionally equal graphs (e.g. an extra `Mul` by 1) can still differ; function-level near-copy
-detection is the Phase 3 fingerprint (§10). `submission_sha256` (fix I) remains the record of the
-whole directory.
+detection is the Phase 3 fingerprint (§10). `submission_sha256` (contract §8) remains the record
+of the whole directory.
 
 ### 3.2 Graph construction (`topple/policy/build.py`, torch-free)
 
@@ -444,7 +471,7 @@ def reference_actions(w: MlpWeights, norm: ObsNorm, action_rule: str, obs: NDArr
 - **Initializer shapes** (PPO; SAC identical): `mean [D]`, `inv_std [D]`, `lo []`, `hi []`,
   `W0 [H1,D]`, `b0 [H1]`, `W1 [H2,H1]`, `b1 [H2]`, `W2 [A,H2]`, `b2 [A]`, `act_lo []`, `act_hi []`.
   Clip bounds are rank 0 (ONNX Clip requires scalars). `lo = −clip_obs`, `hi = +clip_obs`;
-  `act_lo = −1.0`, `act_hi = +1.0` come from `challenge.task_spec` action bounds, **never** from
+  `act_lo = −1.0`, `act_hi = +1.0` come from the challenge's `TaskSpec.action` bounds, **never** from
   `model.action_space` (Box(−2, 2) under the penalty wrapper). Gemm sets only `transB = 1`;
   attributes equal to their schema default are never written.
 - **Names (canonical, §3.4):** input `obs` `["batch", D]`, output `action` `["batch", 2]`, nodes
@@ -473,19 +500,20 @@ def reference_actions(w: MlpWeights, norm: ObsNorm, action_rule: str, obs: NDArr
    is replaced if present (report-only implies `--replace` for that path only, so
    `phase2_results.py` is idempotent). `claims.selection_eligible` records the flag.
 2. **Read** only `best.json`, `train_meta.json` (json ≤ 64 KiB), `meta.json`, `normalize.json`,
-   `actor.npz`, `parity_ref.npz` (npz ≤ 8 MiB), each with `read_regular_file`. npz files are opened
-   via `zipfile`: ≤ 8 members, expected names only, total uncompressed ≤ 8 MiB; each member's
-   header is parsed with `np.lib.format.read_magic` / `read_array_header_{1,2}_0` and MUST satisfy
-   `prod(shape)·itemsize + header_len == info.file_size` before `np.load(BytesIO,
-   allow_pickle=False)` (a header declaring 2^42 elements otherwise allocates first); dtypes
-   float32/float64/uint8/str only. The same header rule applies to Phase 1 `load_npz`. JSON
-   rejects NaN/Infinity.
+   `actor.npz`, `parity_ref.npz` (npz ≤ 8 MiB), each with `read_regular_file`. npz bytes go through
+   the Phase 1 trajectory reader's parts (contract §14), moved from `topple/traj.py` into
+   `topple/_npz.py` with no change to `load_npz`: `topple._zip.Archive` (numpy's canonical layout
+   only, exactly the expected member names, directory ≤ 16 KiB, members ≤ 8 MiB in total) and the
+   hand-parsed npy header (never evaluated; header ≤ 4096 bytes; the exact expected dtype, C order;
+   the shape checked against the expected one and needing exactly the member's bytes before any
+   data is read, so a header declaring 2^42 elements allocates nothing). dtypes `<f4`, `<f8`,
+   `|u1`, `<U64` (`onnx_sha256`) only. JSON rejects NaN/Infinity.
 3. **Build and bind.** Build (§3.2); `sha256(bytes)` MUST equal `meta.json.onnx_sha256` and
    `parity_ref.npz` `onnx_sha256`. **Constant binding**, bitwise and independent of parity (a
    wrong ε of 1e-6 differs from SB3 by only 2.9e-6 for SAC): initializers by §3.2 position MUST
    equal `f32(mean)`, `f32(1/sqrt(var + ε))`, `∓f32(clip_obs)`, the `actor.npz` arrays, and
-   `∓1.0` from `challenge.task_spec`. `validate_policy_bytes` MUST accept it; `smoke_test` MUST
-   pass.
+   `∓1.0` from the challenge's action spec (`TaskSpec.action.low/high`, §3.5).
+   `validate_policy_bytes` MUST accept it; `smoke_test` MUST pass.
 4. **Parity (normative).** Every `parity_ref` row at batch 1 through `make_session`. `max |a_onnx
    − a_ref| ≤ 1e-5` always MUST hold. Coverage: ≥ 300 rows with `max_i |a_ref_i| < 0.99`
    (`n_unsaturated`), ≥ 32 rows with `max_i |a_ref_i| ≥ 0.999` (`n_saturated`; exercises the head
@@ -493,7 +521,9 @@ def reference_actions(w: MlpWeights, norm: ObsNorm, action_rule: str, obs: NDArr
    hold; with it, a coverage miss sets `export_parity.vacuous = true` instead of failing, so every
    G7 row exists.
 5. **Write.** `--out` MUST NOT exist, unless `--replace`: the new directory is written as a temp
-   sibling, the old one renamed aside, the new one renamed in, the old one removed. Claims come from
+   sibling (`tempfile.mkdtemp` beside it), the old one renamed aside, the new one renamed in, the
+   old one removed; a relative `--out` through a symlinked directory exits 2 first (contract §14;
+   §5.3). Claims come from
    `meta.json` and `train_meta.json` through a whitelist. `--test-fixture NAME`
    (`^[a-z0-9_]{1,32}$`) writes `tests/data/NAME_parity.npz` (copy), `tests/data/NAME_parity.bin`
    and `tests/data/NAME_parity.json` for C and JS consumers. **`.bin` layout v1**, little-endian:
@@ -552,11 +582,13 @@ def structure_match(proto: onnx.ModelProto) -> Literal["clip(mean)", "tanh(mean)
 Every Python-side pattern check uses `re.fullmatch` with an unanchored pattern (`re.match` with
 `$` accepts a trailing `"\n"`); patterns quoted below with `^…$` mean full match.
 
-**`read_regular_file`:** `st = lstat(path)` (not a symlink, `S_ISREG`, `st_nlink == 1`, size ≤
-cap); `fd = os.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC |
-getattr(os, "O_BINARY", 0))` (`O_NONBLOCK`: a FIFO swapped in after the lstat cannot block the
-open); `fstat(fd)` MUST be `S_ISREG` with (st_dev, st_ino) equal to the lstat; read at most
-cap+1 bytes.
+**`read_regular_file`** (in `topple/_inputs.py`, beside Phase 1's `open_regular`, which follows
+symlinks and serves `results.json` and trajectories, contract §14–§15; this stricter sibling is for
+files inside submission and run directories): `st = lstat(path)` (not a symlink, `S_ISREG`,
+`st_nlink == 1`, size ≤ cap); `fd = os.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY |
+O_CLOEXEC | getattr(os, "O_BINARY", 0))` (`O_NONBLOCK`: a FIFO swapped in after the lstat cannot
+block the open); `fstat(fd)` MUST be `S_ISREG` with (st_dev, st_ino) equal to the lstat; read at
+most cap+1 bytes. `OSError` becomes `LoadError` naming the file (contract §8).
 
 **Checks, in order, short-circuiting:** the first check that produces any message returns. No onnx
 C++ checker, shape inference, `numpy_helper`, `onnx.external_data_helper` or ORT call ever runs on
@@ -683,32 +715,41 @@ def eval_pool(workers: int) -> ProcessPoolExecutor
   `session.strict_shape_type_inference=1`; `providers=["CPUExecutionProvider"]`, asserted via
   `get_providers()`. Bytes only; scrub `ORT_*` from `os.environ` before the first session.
 - **`act()`** feeds `obs.to_array()[None]`, checks float32 `(1, A)`, returns Python floats.
-  Non-finite **observations are outside the policy domain** (contract §17): the harness asserts
-  `np.isfinite(obs).all()` before every `act()` (true by construction: `sim_unstable` ends the
-  episode first). Runtimes disagree on NaN inputs (ORT 1.31 Python on arm64 maps an all-NaN
-  observation to a finite [0.943, 0.892]; ORT-web 1.20/1.30 return NaN), so the mapping of
-  non-finite **actions** to `invalid_action` via `validate_action` applies only to runtimes that
-  propagate NaN.
-- **`load_policy_dir`:** directory rules (§3.1), `read_regular_file` both files, manifest parse,
-  `sha256 == manifest.onnx.sha256`, `validate_policy_bytes`, `check_against_model`, structure
-  match, metadata vs manifest, `check_against_challenge`, `smoke_test`. Dims come only from
-  `challenge.task_spec`. Any failure is one `LoadError`.
+  Non-finite **observations are outside the policy domain** (contract §17): `evaluate`'s control
+  loop checks `np.isfinite(obs_arr).all()` before every `act()` and raises `RuntimeError`, a
+  harness bug like its `max_steps` bound (contract §8; not an `assert`, which `python -O` strips).
+  It holds by construction: `sim_unstable` rolls the bad substep back and ends the episode, and a
+  non-finite reset raises (contract §9, §11). Runtimes disagree on NaN inputs (ORT 1.31 Python on
+  arm64 maps an all-NaN observation to a finite [0.943, 0.892]; ORT-web 1.20/1.30 return NaN), so
+  the mapping of non-finite **actions** to `invalid_action` via `validate_action` applies only to
+  runtimes that propagate NaN.
+- **`load_policy_dir`:** directory rules (§3.1), `read_regular_file` both files (read once),
+  manifest parse, `sha256 == manifest.onnx.sha256`, `validate_policy_bytes`,
+  `check_against_model`, structure match, metadata vs manifest, `check_against_challenge`,
+  `smoke_test`. Dims and action bounds come only from the challenge's `TaskSpec` (`obs_features`,
+  `action`; `Challenge.task_spec` also wants the robot geometry, which does not change them, so a
+  caller without an env reads them from the kind entry, §8.1). Any failure is one `LoadError`.
 - **Pools.** The parent builds a `PolicyRef` once: ONNX → (canonical bytes ≤ 1 MiB,
   `policy_sha256`); Python → (path, `submission_sha256`). A worker calls `policy_from_bytes(...,
   expected_sha256=...)` or re-hashes the Python submission and raises on mismatch before its
   first episode. `LoadedPolicy`, sessions and factories are never pickled. Results return by
   pickle; this is acceptable locally only (local eval is not a security boundary; §10 (iii)).
+  Workers receive public protocols only (Phase 2 never runs a private one; a private
+  `EvalProtocol`'s salt would reach every worker, and only its `repr` is redacted, contract §8).
 - **Determinism** (contract §17): bit-exact per (os, arch, `cpu_isa`, onnxruntime version);
   across runtimes within 1e-5, never bit-exact, so replays play stored trajectories. No test pins
   an ONNX episode score; tests compare orderings only (PPO > PID).
 
 ### 3.6 Loader, results, contract
 
-- **Loader.** `load_submission(path, *, challenge)`: `challenge` is required for `kind == "onnx"`
-  (`TypeError` if missing). CLI `eval`, `run`, `compare` pass the protocol's challenge.
-- **Results** (before `topple.results/1` is published): `Versions` gains `onnxruntime`, `onnx`,
-  `cpu_isa: str | None` (`avx512f` / `avx2` / `sse4` from `/proc/cpuinfo` on Linux; `arm64-sme` /
-  `arm64-neon` from `sysctl hw.optional` on macOS); `ControllerInfo` gains `policy_sha256`.
+- **Loader.** `load_submission(path, *, challenge: Challenge | None = None)` (Phase 1 takes
+  `path` only): `challenge` is required for `kind == "onnx"` (`TypeError` if missing). CLI `eval`,
+  `run`, `compare` pass the protocol's challenge. `Submission.sha256` is §3.1's read-once hash.
+- **Results** (before `topple.results/1` is published; contract §15's strict reader stays as is):
+  `Versions` gains `onnxruntime`, `onnx`, `cpu_isa` (`avx512f` / `avx2` / `sse4` from
+  `/proc/cpuinfo` on Linux; `arm64-sme` / `arm64-neon` from `sysctl hw.optional` on macOS), each
+  `VersionStr | None = None`; `ControllerInfo` gains `policy_sha256: Sha256 | None = None` (JSON
+  `null` for a Python submission; `read_results` reads both).
 - **Contract.** §8 (submission kinds), new §17 (`topple.policy/1` = §3.1–§3.5), §15.
 
 ## 4. Done-when for 2a (every gate MUST pass)
@@ -741,7 +782,8 @@ uv run python scripts/phase2_gate.py out/cmp_cal.json out/cmp_eval_v1.json out/p
   databaseId,status,conclusion,headSha` and fails with distinct messages: no run for HEAD, in
   progress, cancelled (concurrency cancel-in-progress), failure. It passes only on a completed
   `success` run with `headSha == HEAD`.
-- **Ubuntu evidence.** In CI's `python` job, after `test_shipped_policy`, `topple compare
+- **Ubuntu evidence.** In CI's `python-slow` job (where `slow` tests run, §7), after
+  `test_shipped_policy`, `topple compare
   submissions/pid_example.py submissions/lqr_example.py submissions/ppo_balance -p
   balance-v1/standard --seeds 0..199 --workers 4 --json out/cmp_cal_ci.json` (about 1 min on a
   4-vCPU runner; 15 s locally) runs, and both it and `test_shipped_policy`'s `results.json` are
@@ -755,10 +797,12 @@ uv run python scripts/phase2_gate.py out/cmp_cal.json out/cmp_eval_v1.json out/p
 
 `phase2_gate.py` exits 0 iff every gate in `PASS_GATES = ("G1", "G2", "G2b", "G3", "G4", "G5",
 "G6", "G7", "G8", "G10", "G11")` passes (G9 is `phase2_ci_check.py`), naming each failure; the
-constants live in `scripts/phase2_common.py` with `SHIP_GATES` (§2.5). Mean saturation is the
-unweighted mean of per-episode `saturation_fraction`. Paired rows are read from the compare JSON
-and recomputed with `topple.stats.paired_bootstrap` from the per-seed arrays; the two MUST be
-equal. **G2, G2b, G3 (0..199 part) and G4 are evaluated on both** the Mac compare
+constants live in `scripts/phase2_common.py` with `SHIP_GATES` (§2.5). Every input file is read
+as contract §15 reads `results.json`: `open_regular` (≤ 16 MiB, never blocking), strict JSON
+types, `format` required (`read_results` for results, the §5.3 model for compare JSON). Mean
+saturation is the unweighted mean of per-episode `saturation_fraction`. Paired rows are read from
+the compare JSON and recomputed with `topple.stats.paired_bootstrap` from the per-seed arrays; the
+two MUST be equal. **G2, G2b, G3 (0..199 part) and G4 are evaluated on both** the Mac compare
 (`out/cmp_cal.json`) and the ubuntu one (`ci_ubuntu/cmp_cal.json`, `cpu_isa` and `onnxruntime`
 recorded); both MUST pass (measured: three parity-equivalent runtimes changed all 200 episode
 scores, one by 22.8 points, and moved the PPO − LQR lower bound over 3.07–3.17).
@@ -774,7 +818,7 @@ scores, one by 22.8 points, and moved the PPO − LQR lower bound over 3.07–3.
 | G6 | `results.json` `controller.policy_sha256` == `onnx.sha256` and `controller.sha256` == `submission_sha256(submissions/ppo_balance)`; `versions.onnxruntime` set; `load_policy_dir` accepts it |
 | G7 | `phase2.json` has 3 PPO + 3 SAC runs, each with a fresh-eval row (ineligible ones via `--report-only`, marked "below PID gate") |
 | G8 | every required `docs/results/phase2/` file (§5.2, incl. `ci_ubuntu/*`) exists within the §5.2 caps, is tracked (`git ls-files --error-unmatch`) and unmodified (`git diff --quiet -- docs/results`); `ci_ubuntu/results.json` `policy_sha256` == `onnx.sha256` |
-| G9 | `phase2_ci_check.py`: CI on HEAD succeeded (both jobs, coverage ≥ 80% in each scope, §7, `test_shipped_policy` and the ubuntu compare) |
+| G9 | `phase2_ci_check.py`: CI on HEAD succeeded (all three jobs `python`, `python-slow`, `python-train`; coverage ≥ 80% in each scope, §7; `test_shipped_policy` and the ubuntu compare) |
 | G10 | every reported run: no abort flag and no `nondeterministic`, `num_timesteps ≥ total_timesteps`, `peak_tree_rss_mib < 6144`, `selection_protocol_hash` and `env_algo_version` equal the recomputed current values; shipped run `git_dirty: false` (§2.3) |
 | G11 | ≥ 2 of 3 PPO runs have `best.eligible` and their exported policies pass G2, G3 and G4 on 0..199 in fresh evals; per-run table in `phase2.json` with a G2b column (reported, not gating) |
 
@@ -812,7 +856,9 @@ per episode (§3.5) and are shown in the second block, from `docs/results/phase2
 run {ci_run}, policy {policy_sha256[:12]})."
 
 **GIF ladders** (each rung in order; the rung used goes into `phase2.json`; the build fails only
-if the last rung exceeds the cap):
+if the last rung exceeds the cap; `video.py` renders only sizes that are multiples of 16 px
+(`MACRO_BLOCK`) and fit the scene's offscreen buffer, so a rung below the rendered size resamples
+the composed frame):
 - hero: pane 480×240 at 20 → 15 → 12 fps, then pane × 0.9 three times at 12 fps (432, 389, 350 px
   wide);
 - failure galleries: 320 px at 10 → 8 → 6 fps, then × 0.9 three times at 6 fps;
@@ -823,8 +869,9 @@ if the last rung exceeds the cap):
    largest score(PPO) − score(PID), ties to the lowest index; if none, the largest difference
    overall. Caption template: "Seed chosen as the largest PPO−PID gap among eval_v1 seeds where PID
    fell; a median seed is below." Also MP4s of the median-difference seed (lower median) for PID vs
-   PPO and LQR vs PPO. Both panes play stored trajectories on one clock; a terminated pane plays its
-   epilogue, then holds its last frame stamped `FELL at 4.31 s`.
+   PPO and LQR vs PPO. Both panes play stored trajectories on one clock; a pane whose episode ended
+   in a fall or an error plays its epilogue (`wants_epilogue`, contract §11), then holds its last
+   frame stamped `FELL at 4.31 s` (or `ERROR at`).
 2. **Scoreboard.** Rows PID, LQR, "PPO (shipped: best of 3 by selection seeds)", "PPO recipe (3
    seeds)" (mean ± sd and min of fresh score and success), each PPO seed, each SAC seed (label
    "SAC (1.0M steps, UTD 0.25)"); "k of 3 PPO seeds reached the PID gate" and "j of 3 at LQR level
@@ -832,7 +879,8 @@ if the last rung exceeds the cap):
    survival, success, median energy, mean saturation, median drift, parameter count, env steps,
    train CPU-minutes. Paired PPO − PID and PPO − LQR. Rows below the gate are marked "below PID
    gate".
-3. **Shove test.** Preset `clean`, seeds 0..99, one push at 2.0 s (0.1 s pulse, lateral 0),
+3. **Shove test.** Preset `clean`, seeds 0..99, one push at 2.0 s (0.1 s pulse, lateral 0;
+   injected with the trusted `reset(options={"pushes": …})` hook, contract §9),
    impulses 0.30:0.65:0.025 N·s (15 levels), `forward_sign` +1 and −1. Survival vs impulse for both
    directions; i50 per direction (first downward 50% crossing, linear interpolation) and their
    minimum. Pilot: PID 0.42/0.42, LQR 0.45/0.45, PPO 0.48–0.50.
@@ -880,23 +928,31 @@ def render_side_by_side(trajs, labels, out: Path, *, pane: int = 480, fps: int =
 def render_overlay(trajs, labels, out: Path, *, alphas, frame_m: tuple[float, float]) -> None  # waypoint ghost
 ```
 
-`topple.compare/1` JSON (pydantic, frozen): `{format, protocol, protocol_hash, complete, seeds[],
-entries[{id, policy_sha256|null, sha256, scores[], success[], energy_j[], saturation_fraction[],
-termination[], extras{}}], paired[{a, b, mean, lo, hi, n_resamples, seed}]}`; arrays in seed order.
-`extras` maps a metric name to its per-seed array: for waypoint `docked`, `fell`, `fall_cause`,
-`t_finish_s`, `course_pts`, `speed_pts`, `alive_pts`, `battery_pts` (§8.6).
+`topple.compare/1` JSON (pydantic, frozen, `extra="forbid"`, `allow_inf_nan=False`; read like
+contract §15's `read_results`): `{format, protocol, protocol_hash, complete, seeds[], entries[{id,
+policy_sha256|null, sha256, scores[], success[], energy_j[], saturation_fraction[], termination[],
+extras{}}], paired[{a, b, mean, lo, hi, n_resamples, seed}]}`; arrays in seed order, bounded as
+in contract §15. `termination` is the recorded reason (contract §11; `error` for an episode the
+harness stopped). `complete` iff every entry has all N episodes and none is `missing`. `extras` maps
+a metric name to its per-seed array: for waypoint `docked`, `fell`, `fall_cause`, `t_finish_s`,
+`course_pts`, `speed_pts`, `alive_pts`, `battery_pts` (§8.6).
 
 CLI: `topple train CONFIG --out DIR [--seed S]` (without the train extra: message + exit 2);
 `topple export ...`; `topple policy pack ...`; `topple compare SUB... -p P [--seeds A..B]
 [--workers N] [--json PATH]`; `topple shove SUB... [--impulses 0.30:0.65:0.025] [--seeds 0..99]
 [--direction both]`; `topple video --side-by-side A.npz B.npz --labels A B --out X.mp4 [--fps N]
-[--size W]`. `--seeds` builds a non-protocol `EvalProtocol`: `EvalProtocol` gains `is_named:
-bool` (True only for registry protocols; False for `--seeds` and `topple run`), and
-`build_results` sets `complete = is_named and len(episodes) == len(seeds)`.
+[--size W]`. `--seeds A..B` replaces the named protocol's seeds, as `topple run --seed` does
+(`dataclasses.replace(EvalProtocol.from_id(P), seeds=...)`, ≤ 10,000, contract §8), so
+`protocol_hash` covers them; there is no `is_named` field. Every new command checks a relative
+output path with `cli._check_output` before anything runs (never through a symlinked directory,
+contract §14), writes through `_atomic.replacement` (`results.json` via `write_results`) and
+fails through `cli._fail` (one escaped line, exit 2). `topple video` loads inputs with `load_npz`,
+bounded by their challenge's `max_steps` and layout (§8.1a).
 
 ## 6. Tests
 
-**Default CI job** (`-m "not train"`, torch-free):
+**Default CI jobs** (`python`: `-m "not slow and not train"`; `python-slow`: `-m "slow and not
+train"`; torch-free):
 
 | Test file | What it checks |
 |---|---|
@@ -910,12 +966,13 @@ bool` (True only for registry protocols; False for `--seeds` and `topple run`), 
 | `test_policy_manifest` | Round-trip from bytes on disk of a real first-party `policy.json`; 16 KiB cap; BOM, NaN, Infinity, 1e400, duplicate keys, lone surrogate, 5,000-digit int, `3.0` for an int rejected; `1` for a float accepted; extra key `<script>` and `claims.name` `<img ...>` give no `<` in the error; claims charset; `check_against_model` per field; challenge mismatches named. |
 | `test_onnx_policy` | CPU-only providers; tuple of Python floats; LoadError on sha/metadata/challenge mismatch; one `ideal` episode via `evaluate`; smoke timer: fresh RunOptions per call, cancelled timer, terminate mapped to its message. |
 | `test_pool` | `PolicyRef` for ONNX and Python; mutating the files after the parent load leaves the compare on the original sha; a worker given a wrong sha raises. |
-| `test_loader_policy` | Detection; ambiguous kind; extra/pickle-family/hidden/subdir entries named; missing `challenge` → TypeError; hard-linked `policy.json`. Red-team (Linux, macOS): symlinked `policy.onnx`, symlink to `/dev/zero`, symlinked dir, lstat/open swap to a regular file and to a FIFO (rejected, never blocks; 5 s test timeout); oversize rejected before read. |
-| `test_export_inputs` | Ignores `best.json.dir`; rejects step ≥ 2^53, symlinked or escaping step dirs, npz with 9 members / bad names / oversize / object dtype / a header declaring 2^42 elements (clean error, no allocation), NaN in `normalize.json`, bad fixture name, sha mismatch, a constant-binding mismatch, a run with an abort or `nondeterministic` flag (without `--report-only`); existing `--out` without `--replace` → exit 2; `--report-only` twice succeeds (idempotent); vacuous coverage recorded, not failed; `.bin` v1 layout (magic, version, N, D, A, set) and `.json` sidecar fields. |
+| `test_loader_policy` | Detection; ambiguous kind; extra/pickle-family/hidden/subdir entries named; missing `challenge` → TypeError; hard-linked `policy.json`; `POLICY.JSON` and a non-UTF-8 name refused on every OS; a directory of 10,000 entries refused after at most 4; `Submission.sha256` == `submission_sha256(dir)` from the same single read. Red-team (Linux, macOS): symlinked `policy.onnx`, symlink to `/dev/zero`, symlinked dir, lstat/open swap to a regular file and to a FIFO (rejected, never blocks; 5 s test timeout); oversize rejected before read. |
+| `test_export_inputs` | Ignores `best.json.dir`; rejects step ≥ 2^53, symlinked or escaping step dirs, npz with 9 members / bad names / oversize / object dtype / a header declaring 2^42 elements (clean error, no allocation) / bytes prepended to the archive (contract §14 layout), NaN in `normalize.json`, bad fixture name, sha mismatch, a constant-binding mismatch, a run with an abort or `nondeterministic` flag (without `--report-only`); existing `--out` without `--replace` → exit 2; a relative `--out` under a symlinked `out` → exit 2 before any write (also `compare --json`, `policy pack`, `video`, `train`); `--report-only` twice succeeds (idempotent); vacuous coverage recorded, not failed; `.bin` v1 layout (magic, version, N, D, A, set) and `.json` sidecar fields. |
 | `test_shipped_policy` (slow; parametrized over `ppo_balance` and, once it exists, `ppo_waypoint`) | The submission loads; fixture sha equals `onnx.sha256`; parity ≤ 1e-5 with ≥ 300 unsaturated and ≥ 32 saturated rows; balance: eval_v1 PPO > PID; writes `results.json` as a CI artifact. |
 | `test_c_reference` | Generates a C header from `submissions/ppo_balance/policy.onnx` initializers by §3.2 position (`float.hex` literals; `tests/c/genc.py`), compiles `tests/c/mlp.c` (about 40 lines) with the system `cc -O2`, with and without `-ffp-contract=off`, and checks every `.bin` row within 1e-5 (measured ≤ 6.6e-7). Skips locally without `cc`; CI sets `TOPPLE_REQUIRE_CC=1`. |
-| `test_harness_finite_obs` | The harness asserts finite observations before `act()`; a fake env emitting NaN trips the assertion. |
+| `test_harness_finite_obs` | A fake env emitting NaN makes `evaluate` raise `RuntimeError` before `act()` is called, also under `python -O`. |
 | `test_driver_golden` (2b) | `submissions/waypoint_pid_example.py` scores on `waypoint-v1/clean` seeds 0..4 pinned to 1e-9; docked/fell on `standard` 0..19 pinned. `WaypointScore` dump pinned. |
+| `test_traj_v2` (2b) | The §8.1a cases. |
 | `test_import_hygiene` | Importing `topple.cli`, `topple.export`, `topple.policy.*`, `topple.pool`, `topple.controllers.onnx_policy` leaves no `torch`, `stable_baselines3`, `tensorboard`, `psutil` in `sys.modules`. |
 | `test_no_unsafe_loads` | AST scan of `python/topple`, `scripts/`, `tests/`. Outside `topple/train/`: no `pickle, cloudpickle, dill, joblib, shelve, marshal, torch, stable_baselines3` imports (tests: only `train`-marked tests in `test_snapshot_reference`). Torch-free tree: onnx entry point only `onnx.ModelProto.FromString`; banned `onnx.load(`, `load_external_data_for_model`, `onnx.external_data_helper`, `numpy_helper.to_array`, `register_custom_ops_library`; `InferenceSession(` and `add_session_config_entry` (the three §3.5 literal keys) only in `runtime.make_session`. `PPO.load`, `SAC.load`, `VecNormalize.load`, `load_from_zip_file` only in `learn.resume_from`. Everywhere: no `yaml.load/full_load/unsafe_load`, `allow_pickle=True`, `torch.load` without `weights_only=True`. Name-based; `getattr` evasion out of scope. |
 | `test_repo_hygiene` | No pickle-family, `.onnx.data` or hidden files under `submissions/`; `.gitignore` covers `runs/`, `*.pkl`, `.venv-eval/`, `.DS_Store`; `git check-ignore docs/results/phase2/hero.mp4` and `.../waypoint.mp4` return non-zero. |
@@ -936,28 +993,33 @@ bool` (True only for registry protocols; False for `--seeds` and `topple run`), 
 
 ## 7. CI and packaging
 
-- **pyproject.** Base deps: `onnx>=1.23.2,<1.24`, `onnxruntime>=1.31,<1.32`, `protobuf>=7.36,<8`
-  (canonical bytes depend on it; the golden sha tests catch drift). An upgrade of any of them is a
-  deliberate re-score. `train` extra: `stable-baselines3>=2.9`, `torch>=2.14`, `tensorboard>=2.21`,
-  `psutil>=6`; no onnxscript. `dev` gains `matplotlib`. New marker `train`.
-- **mypy.** `ignore_missing_imports` for `torch.*`, `stable_baselines3.*`, `tensorboard.*`,
-  `psutil.*`. Strict stays on everywhere except one override: `[[tool.mypy.overrides]] module =
-  ["topple.train.learn", "topple.train.callbacks", "topple.train.snapshot",
-  "topple.train.surgery", "topple.train.resources"]`, `disallow_subclassing_any = false` (the
-  default job has no SB3, so `class SelectionCallback(BaseCallback)` subclasses `Any`). The train
-  job runs the same mypy config with the extra installed.
-- **Coverage.** Default job omits `topple/train/{learn,snapshot,callbacks,surgery,resources}.py`;
-  `.coveragerc-train` sets `include` to exactly those five files, and the train job runs
-  `--cov=topple.train --cov-config=.coveragerc-train`, `fail_under = 80`, so the two 80% scopes
-  are disjoint.
-- **ci.yml.** Triggers: `pull_request`, and `push` to `main` and `phase-*`. Job `python` adds
-  `-m "not train"`, sets `TOPPLE_REQUIRE_CC=1`, runs the ubuntu `topple compare` of §4 after the
-  tests, and uploads `test_shipped_policy`'s `results.json` and `out/cmp_cal_ci.json`. Job
+- **pyproject.** Base deps: `onnx>=1.23.2,<1.24` (moved from the merged `train` extra),
+  `onnxruntime>=1.31,<1.32` (merged: `>=1.31`, unbounded), `protobuf>=7.36,<8` (canonical bytes
+  depend on it; the golden sha tests catch drift). An upgrade of any of them is a deliberate
+  re-score. `train` extra: `stable-baselines3>=2.9`, `torch>=2.14`, `tensorboard>=2.21`,
+  `psutil>=6`; no onnxscript. `dev` gains `matplotlib`. New marker `train` (beside `render`,
+  `slow`).
+- **mypy.** The merged `ignore_missing_imports` list (`onnxruntime.*`, `stable_baselines3.*`, …)
+  gains `torch.*`, `tensorboard.*`, `psutil.*`. Strict stays on everywhere except one override:
+  `[[tool.mypy.overrides]] module = ["topple.train.learn", "topple.train.callbacks",
+  "topple.train.snapshot", "topple.train.surgery", "topple.train.resources"]`,
+  `disallow_subclassing_any = false` (the default job has no SB3, so `class
+  SelectionCallback(BaseCallback)` subclasses `Any`). The train job runs the same mypy config with
+  the extra installed.
+- **Coverage.** pyproject's `[tool.coverage.run]` (merged: `source = ["topple"]`, with
+  `[tool.coverage.report] fail_under = 80`; the `python` job measures it) gains `omit` for
+  `topple/train/{learn,snapshot,callbacks,surgery,resources}.py`; `.coveragerc-train` sets
+  `include` to exactly those five files, and the train job runs `--cov=topple.train
+  --cov-config=.coveragerc-train`, `fail_under = 80`, so the two 80% scopes are disjoint.
+- **ci.yml.** Triggers: `pull_request`, and `push` to `main` and `phase-*` (merged: `main` only).
+  Merged jobs keep their roles: `python` (`-m "not slow and not train"`, coverage) also sets
+  `TOPPLE_REQUIRE_CC=1`; `python-slow` (`-m "slow and not train"`) runs `test_shipped_policy`, then
+  §4's ubuntu `topple compare`, and uploads that `results.json` and `out/cmp_cal_ci.json`. New job
   `python-train` (ubuntu-24.04, 20 min): `uv sync --locked --extra train`, ruff, mypy, `pytest -m
   train -n 2 --cov...` (`test_pack_torch_legacy` advisory), torch from the pytorch-cpu index.
-- **Repository.** `.gitignore` adds `runs/`, `*.pkl`, `.venv-eval/`, `.DS_Store` and the negation
-  `!docs/results/**/*.mp4` (the existing `*.mp4` rule would otherwise drop every results video).
-  `cli.py` imports `topple.train.learn` only inside `train`.
+- **Repository.** `.gitignore` (merged: `runs/`, `.DS_Store`, `*.mp4`, `/out/`) adds `*.pkl`,
+  `.venv-eval/` and the negation `!docs/results/**/*.mp4` (the `*.mp4` rule would otherwise drop
+  every results video). `cli.py` imports `topple.train.learn` only inside `train`.
 
 ## 8. Phase 2b: `waypoint-v1` (frozen at the end of 2b)
 
@@ -978,35 +1040,82 @@ metric keys may be added (`fall_cause`, §8.5). Golden tests pin the existing ke
   constant lives in code; its dump is pinned by a golden test.
 - **Presets.** A bundle may define `preset_defs`. `Challenge.preset(name) -> Preset` returns
   `config.preset_defs[name]` if defined, else `PRESETS[name]`, and accepts only names in
-  `config.presets`. Every lookup goes through it: env init / `set_preset` / reset (sensors),
-  `make_scenario` callers, trusted `verify_episode`, `protocol_hash` (dumps the resolved preset)
-  and `Scenario.from_dict(challenge=...)`. `_MAX_PUSHES` stays 3.
+  `config.presets`. Every lookup goes through it: `ChallengeConfig`'s preset-name validator, env
+  init / `set_preset` / reset (sensors), `make_scenario` callers, trusted verification (its env),
+  `protocol_hash` (dumps the resolved preset; for balance-v1 exactly today's
+  `PRESETS[name].model_dump(mode="json")`) and `Scenario.from_dict(data, *, clock=None,
+  challenge=None)` (Phase 1 checks the name against `PRESETS`). `topple.disturbances.MAX_PUSHES`
+  (public since Phase 1) stays 3: the PUSHES stream always draws 3 candidates, whatever a preset's
+  `count`.
 - **ENV_ALGO_VERSION** becomes per kind; balance stays 1. Waypoint: **before the 2b freeze**, every
   course-generator, event or observation code change bumps it (nothing is published, and stale
   2b runs become detectable, §8.9 item 11); **at the freeze** its value is recorded in
   `phase2.json`; **after the freeze** any change to a fixed controller's score on a fixed seed
   is `waypoint-v2` (contract §13), and the version only guards against accidental drift. Stream
   `TARGETS = 6` and `balancer-target.obs.v1` freeze at the same point.
-- **Dispatch** through the registry: `iter_episodes`, `verify_episode`, `rescore`,
-  `Challenge.task_spec`, `build_results` (`Versions.obs_schema`), `controller_obs(obs_arr, t, *,
-  schema: str = "balancer.obs.v1")` (returns `BalancerObs` or `BalancerTargetObs`; the 2-arg call
-  is unchanged), `make_scenario(seed, preset, ..., course: CourseConfig | None)`,
-  `load_npz(path, *, max_steps, obs_dim)` (both always from the **trusted** protocol's challenge,
-  never from `meta`), `Trajectory._check_shapes`, and `video.py`.
-- **Golden tests.** Fix-J goldens pass unchanged; new goldens pin balance-v1 `protocol_hash` per
-  preset, the `ScoreConfig` dump, and `make_scenario` for seeds 1000..1019. An AST test forbids
-  `PRESETS[` outside `disturbances.py` and `challenge.py`.
+- **Dispatch** through the registry (Phase 1 hard-codes balance in each): `iter_episodes` and
+  `verify._replay_env` (both construct `BalanceEnv`), `verify_episode`, `verify_with_seed`,
+  `rescore`, `verify_run`, `Challenge.task_spec` (raises for any other schema), `build_results`
+  (`Versions.obs_schema`, `action_spec`), `scoring.episode_metrics`, `controller_obs(obs_arr, t,
+  *, schema: str = "balancer.obs.v1")` (returns `BalancerObs` or `BalancerTargetObs`; the 2-arg
+  call is unchanged), `make_scenario(seed, preset, *, timestep, control_dt, episode_seconds,
+  course: CourseConfig | None = None)`, `load_npz` / `Trajectory._check_shapes` / `save_npz`
+  (§8.1a), the CLI's upload loaders and `video.py`.
+- **Golden tests.** Phase 1's pass unchanged: `tests/test_golden.py` (bundle `a3b48463…7f5017a9`;
+  `protocol_hash` ideal `6ad4cf45…`, clean `f30f5119…`, standard `a3251741…`, a salted private one;
+  `ENV_ALGO_VERSION` 1; scenarios of seeds 0, 1000, 2**53−1 per preset; PID/LQR scores per platform)
+  and `tests/test_challenge.py` (the standard payload text, `ScoreConfig` dump included). New:
+  `make_scenario` for standard seeds 1000..1019; an AST test forbidding `PRESETS[` in
+  `python/topple` outside `disturbances.py` and `challenge.py`.
+
+### 8.1a Trajectory format `topple.traj/2` (F41; new contract §14a)
+
+`topple.traj/1` fixes `obs` at 10 columns (contract §14), so a 15-feature waypoint record cannot be
+written in it. `/1` stays exactly as it is (bytes, reader, tests) for challenges whose `obs_schema`
+is `balancer.obs.v1`; every other challenge writes `topple.traj/2`, which is `/1` (members,
+dtypes, other widths, canonical zip layout, every contract §14 cap, `T, E ≤ max_steps`,
+finite-only `meta_json`) except: `meta.format = "topple.traj/2"`, and `obs` is T × D float32 with
+D = `len(TaskSpec.obs_features)` of its challenge, 1 ≤ D ≤ `MAX_OBS_WIDTH = 64`,
+`meta.obs_features` naming exactly D features (waypoint: D = 15).
+- **Reader.** `TrajLayout(format, obs_width)` in `topple/traj.py`, `TRAJ_V1 =
+  TrajLayout("topple.traj/1", 10)`; `load_npz(path, *, max_steps, layout=TRAJ_V1)`. The `obs`
+  header's width must equal `layout.obs_width` before its data is read (like the T limit),
+  `meta.format` must equal `layout.format`, and `len(meta.obs_features)` must equal D. Trusted
+  callers pass `verify.protocol_traj_layout(protocol)`, derived from the protocol's challenge kind
+  and never from the file, as they pass `protocol_max_steps`; the default fails closed on a
+  waypoint file. `read_meta` accepts both formats (it only names the challenge and preset; the
+  load that follows enforces the protocol's layout). `Trajectory` checks `obs` against
+  `len(meta["obs_features"])` (10 without it); `save_npz` writes `/2` iff `meta.obs_schema` is
+  not `balancer.obs.v1`.
+- **Verify / rescore** (contract §16) are unchanged: the replay records its challenge's layout and
+  step 5 compares `obs` (shape, then bytes) and `obs_schema` / `obs_features` with it, so a forged
+  width or feature list fails even past the reader. Every upload loader (`cli._load_upload`,
+  `_UploadFiles`, `_render`, `topple video`, Phase 3 `publish`) passes the protocol's layout.
+- **Tests** (`test_traj_v2`): waypoint round trip; balance-v1 records byte-identical (Phase 1's
+  trajectory and done-when tests pass unchanged); refused before any data is read: 10-wide `obs`
+  under the waypoint layout, 15-wide under `TRAJ_V1`, D = 65; refused: `/2` offered to balance-v1,
+  `/1` to waypoint, `len(obs_features) ≠ D`; contract §14's zip/npy red-team cases over both
+  formats.
 
 ### 8.2 Bundle `challenges/waypoint-v1/`
 
 - **Identity.** gym id `topple/Waypoint-v1`; action `diffdrive.effort.v1`; `robot/` byte-identical
-  to balance-v1's (test on `robot_hash`); `scene.xml` same physics, visual floor ≥ 5 × 5 m.
+  to balance-v1's (test on `robot_hash`), so it passes `validate_robot` (contract §3) as is.
+  `scene.xml` is balance-v1's (same options, lights, `grid` material, 40 × 40 m plane `floor` at
+  z = 0) except `<global offwidth="1280" offheight="960"/>`: `video.py` refuses frames larger than
+  the offscreen buffer, and the §8.9 MP4 is 960×960. The scene holds no other world geom or site
+  (`validate_robot` refuses them) and no name the robot uses (`build_model`), so gates and the dock
+  are drawn by the renderer, never as scene geoms.
 - **Episode.** `episode_seconds: 20.0` (`max_steps` 2000), `control_dt: 0.01`.
 - **Course.** `course: {n_waypoints: 5, leg_m: 0.70, turn_deg: [30, 150], max_radius_m: 1.5,
-  max_attempts: 1000, gate_radius_m: 0.10, dock_hold_steps: 100}`, also in `TaskSpec.extras`.
+  max_attempts: 1000, gate_radius_m: 0.10, dock_hold_steps: 100}`, also in `TaskSpec.extras`
+  (str → float only, contract §8: `turn_deg` becomes `turn_deg_min`, `turn_deg_max`).
 - **Presets** (`preset_defs`). `clean`: full sensors, balance-v1 randomization, no pushes.
-  `standard`: plus 1–2 pushes U(0.15, `impulse_hi`) N·s, 0.1 s pulse, in [2.0, 18.0] s, ≥ 3.0 s
-  apart, lateral share ≤ 0.3, 50 N cap; `impulse_hi` set by calibration (§8.7).
+  `standard`: plus `PushConfig(count=(1, 2), impulse_ns=(0.15, impulse_hi), duration_s=0.1,
+  earliest_s=2.0, latest_s=18.0, min_spacing_s=3.0, lateral_fraction_max=0.3, max_force_n=50)`,
+  existing fields only (so `Preset`'s dump, and balance-v1's hashes, keep their keys); the PUSHES
+  stream still draws `MAX_PUSHES` = 3 candidates; pushes start on steps 200..1800 and satisfy
+  contract §9's clock checks (≤ 5 N·s each); `impulse_hi` set by calibration (§8.7).
 - **Seeds.** Public `wp_eval_v1` = 3000..3049, permanent alias `wp_eval_v1 → waypoint-v1/standard`
   in `ids.py`. Per-episode sd on `standard` is large (pilot: driver 5.7 at 0.30 N·s, 8.5 at 0.35;
   learned 19.7–23.3), so 50-seed public scores are provisional (templated ± from `phase2.json`).
@@ -1018,16 +1127,26 @@ metric keys may be added (`fall_cause`, §8.5). Golden tests pin the existing ke
 
 ### 8.3 Course generation (`topple/course.py`)
 
-`make_course(seed, cfg) -> tuple[tuple[float, float], ...]`, `rng = stream_rng(seed, Stream.TARGETS)`:
-1. Each attempt draws, in order, `h0 = rng.uniform(-π, π)`, `mags = rng.uniform(rad(30),
-   rad(150), size=4)`, `signs = rng.integers(0, 2, size=4)`.
+`make_course(seed, cfg) -> Course`, `rng = stream_rng(seed, Stream.TARGETS)`. Draws follow contract
+§9's portable rule (`disturbances._uniforms`: one `Generator.random()` double `u`, then `low +
+(high − low)·u` in Python), never `Generator.uniform`, whose last bit differs between macOS arm64
+and Linux x86_64:
+1. Each attempt draws, in order, `h0` = U(−π, π) (one double), `mags` = U(rad(30), rad(150)) (four
+   doubles), `signs = rng.integers(0, 2, size=4)` (raw bits).
 2. `θ_0 = h0`, `θ_k = θ_{k−1} ± mags[k−1]` (`+` iff `signs[k−1]`).
-3. `p_k = p_{k−1} + 0.70·(cos θ_k, sin θ_k)` from `p_{−1} = (0, 0)`.
-4. Accept iff every `|p_k| ≤ 1.5` (about 44% accepted); after 1000 failures, `RuntimeError`.
+3. `p_k = p_{k−1} + 0.70·(math.cos θ_k, math.sin θ_k)` from `p_{−1} = (0, 0)`.
+4. Accept iff every `p_x² + p_y² ≤ 1.5²` (about 44% accepted); after 1000 failures, `RuntimeError`.
 
 Path length 3.5 m, mean turn 98°. Points are in the start frame (origin = axle midpoint at reset,
-x = initial heading). `Scenario.course` is serialized only when non-empty. Waypoints 0–3 are
-gates, 4 is the dock.
+x = initial heading). `Scenario.course` stores only the accepted draws `{h0, turns}` (signed
+radians), so the scenario stays portable bit for bit (contract §9); `Scenario.from_dict` checks
+`|h0| ≤ π`, 4 turns, each `|turn|` in [rad(30), rad(150)]. `course_points(course)` derives the 5
+points wherever they are used (env, scorer, video) with the C library's scalar `math.cos` /
+`math.sin`, never numpy's (it can pick SVML on AVX-512, cf. contract §12's arccos rule), so they are
+exact per platform, like physics. Only a radius within a few ulps of 1.5 m could be accepted on one
+platform and refused on another; the waypoint golden scenarios (seeds 0, 3000, 2**53−1 per
+preset) must pass unchanged on every platform, like Phase 1's. `course` is serialized only when
+non-empty (balance-v1's scenarios keep their key set). Waypoints 0–3 are gates, 4 is the dock.
 
 ### 8.4 Observation `balancer-target.obs.v1` (contract §6)
 
@@ -1045,8 +1164,10 @@ the wire 16 float64, `t` first (128 B).
 One pure function, used by the env and the scorer:
 `waypoint_events(qpos_xy, course, cfg, *, terminated: bool) -> WaypointEvents` (`reached_step[0..4]`,
 `docked`, `t_finish_s`, `d_min`, `max_hold_steps`, `waypoints`), distances via `math.hypot`.
-- **Rows.** Reach checks, `d_min` and hold counting use rows k = 1..T if truncated, 1..T−1 if
-  terminated (the env skips the check on the terminating step).
+- **Rows.** Reach checks, `d_min` and hold counting use rows k = 1..T−1 if the env terminated the
+  episode (recorded reason `fell`, `floor_contact` or `sim_unstable`; the env skips the check on
+  the terminating step), else 1..T (`timeout`, or `error` for an episode the harness stopped,
+  contract §11).
 - **Gates.** Waypoint i < 4 is reached at the first k with distance ≤ 0.10 m; at most one
   waypoint advances per step.
 - **Dock.** `hold_k = hold_{k−1} + 1` if `d_k ≤ 0.10` else 0, counting from the step the dock
@@ -1054,11 +1175,13 @@ One pure function, used by the env and the scorer:
   `max_hold_steps` = the longest streak (< 100 unless docked).
 - **Termination.** The full 20 s unless the §11 rules end it (`fell`, `floor_contact`,
   `sim_unstable`); docking does not end it. Eval has no drift termination.
-- **fall_cause** (metric, both kinds; added to the contract's metrics vocabulary): `"push"` if a
-  push started in the 1.5 s before termination, `"self"` if terminated otherwise, `"none"` if not
-  terminated (metrics are `float | int | bool | str`, so never `None`). 1.5 s, not 1.0: measured
-  push-to-fall latency reaches 0.92 s (driver) and 1.26 s (PPO), while every no-push PPO fall
-  happened before 2.0 s, the earliest push time.
+- **fall_cause** (metric, both kinds; added to the contract's metrics vocabulary): for a fall
+  (`termination` in `evaluate.FALL_REASONS` = {`fell`, `floor_contact`}) `"push"` if a push
+  started in the 1.5 s before it, else `"self"`; `"none"` for every other recorded reason
+  (`timeout`, `error`, `sim_unstable`; metrics are `float | int | bool | str`, so never `None`).
+  `fell` (the metric and every "fell" rate below) means the same fall reasons. 1.5 s, not 1.0:
+  measured push-to-fall latency reaches 0.92 s (driver) and 1.26 s (PPO), while every no-push PPO
+  fall happened before 2.0 s, the earliest push time.
 - **Scorer.** Pure function of the trajectory; waypoints from the trusted scenario's course; a
   test asserts env events == scorer events on 50 seeds.
 
@@ -1076,16 +1199,20 @@ With T = 20 s, L = 0.70 m, r = `gate_radius_m` = 0.10, t_par = 5.0 s:
   monotone in closeness and hold and tends to 1 as the hold completes (g + p < 5 until docked).
 - **E**: battery energy, contract §12. **E_ref [calibrated]** = 2 × the driver's median energy on
   `standard` 0..399 at the frozen `impulse_hi`, rounded to 0.1 J (pilot 22.4–22.6 J on 0..199).
-- Errors score 0. **Success:** `docked ∧ not terminated ∧ E ≤ 5·E_ref`. **Ranking:**
-  round(score, 2), then success rate, then median `t_finish` with non-finishers counted as T.
+- t_alive = `time_upright_s` = T·control_dt (contract §12). Errors score 0. **Success:** `docked ∧
+  survived ∧ E ≤ 5·E_ref` (`survived` as in contract §12: reason `timeout` and T = `max_steps`).
+  **Ranking:** round(score, 2), then success rate, then median `t_finish` with non-finishers
+  counted as T.
 - No drift term. **User wording:** "55 for the course, 25 for speed (full marks at a 5 s finish),
   15 for staying up, 5 for battery". t_par 5 keeps the driver's speed optimum at 0.30 m/s (at 0.30
   and 0.35 N·s) and leaves the first PPO baseline about 5.7 speed points of headroom (19.3 of 25
   per docked episode; at t_par 7 it was 22.3). No hand driver finished under 11.4 s, so t_par is
   not lowered below 5 without a feasibility probe.
-- **Metrics:** `waypoints, progress, docked, t_finish_s` (= `episode_seconds` for non-finishers),
-  `max_hold_steps, time_alive_s, energy_j, saturation_fraction, rms_tilt, fall_cause`, and the
-  four score parts `course_pts, speed_pts, alive_pts, battery_pts` (they sum to the score).
+- **Metrics** (18, within contract §15's 32): balance-v1's `steps, termination, survived,
+  time_upright_s, energy_j, saturation_fraction, rms_tilt_rad` (`summarize` and `read_results`'
+  complete-run check need `time_upright_s` in every present episode), then `waypoints, progress,
+  docked, fell, t_finish_s` (= `episode_seconds` for non-finishers), `max_hold_steps, fall_cause`,
+  and the four score parts `course_pts, speed_pts, alive_pts, battery_pts` (they sum to the score).
 - **Exchange rate** (templated in `phase2.md` from `phase2.json`): "a fall costs about {Δ}
   points (mean PPO score of docked survivors minus fallers on 0..399), so each extra 1% of falls
   costs about {Δ/100}; finishing 1 s faster on a docked run earns 25/(T − t_par) = 1.67 points".
@@ -1103,7 +1230,9 @@ With T = 20 s, L = 0.70 m, r = `gate_radius_m` = 0.10, t_par = 5.0 s:
 3. **Position reference.** `x_ref += (v_ref/r)·dt` with r = 0.034 m, clamped to `travel ± 3`
    rad (travel = mean wheel angle).
 4. **Balance.** `drive = (v_ref/r)/30 + k_pitch·pitch + k_pitch_rate·pitch_rate +
-   k_travel·(travel − x_ref) + k_speed·(speed − v_ref/r)`, gains from the shipped `LQRGains`.
+   k_travel·(travel − x_ref) + k_speed·(speed − v_ref/r)`, gains from the shipped LQR
+   (`topple.controllers.lqr.DEFAULT_GAINS`: k_pitch 5.803, k_pitch_rate 0.7635, k_travel 0.2058,
+   k_speed 0.1671).
 5. **Turn.** `turn = clip(0.8·herr, ±0.30) − 0.06·yaw_rate`, with `herr = 0` when d < 0.03 m.
 6. **Output** `(drive − turn, drive + turn)`.
 
@@ -1240,7 +1369,7 @@ records mean gates, docked, fell, median `t_finish`.
 ```bash
 test -z "$(git status --porcelain -- submissions challenges docs/results tests/data configs scripts python)"
 export UV_PROJECT_ENVIRONMENT=.venv-eval
-uv sync --locked --no-dev
+uv sync --locked          # with the dev group (pytest, below); no extras, so still torch-free
 uv run --no-sync python -c 'import importlib.util,sys; sys.exit(importlib.util.find_spec("torch") is not None)'
 A="submissions/waypoint_pid_example.py submissions/anchors/creeper.py submissions/anchors/gates_only.py \
    submissions/anchors/reckless.py submissions/anchors/balance_in_place.py submissions/anchors/spin.py"
@@ -1249,8 +1378,9 @@ uv run --no-sync topple compare submissions/waypoint_pid_example.py submissions/
    -p waypoint-v1/clean --seeds 0..399 --workers 4 --json out/wp_clean.json
 uv run --no-sync topple compare submissions/waypoint_pid_example.py submissions/anchors/creeper.py \
    submissions/ppo_waypoint -p wp_eval_v1 --workers 4 --json out/wp_eval.json
-uv run --no-sync pytest -m "not train" tests/test_golden_balance.py tests/test_waypoint_verify.py \
-   tests/test_driver_golden.py "tests/test_shipped_policy.py::test_shipped[ppo_waypoint]"   # items 2, 3, 9
+uv run --no-sync pytest -m "not train" tests/test_golden.py tests/test_challenge.py tests/test_traj_v2.py \
+   tests/test_waypoint_verify.py tests/test_driver_golden.py \
+   "tests/test_shipped_policy.py::test_shipped[ppo_waypoint]"                              # items 2, 3, 9
 unset UV_PROJECT_ENVIRONMENT
 K=$(uv run python -c 'import json;print(json.load(open("docs/results/phase2.json"))["waypoint"]["shipped"]["run"])')
 D=$(mktemp -d)/p2bx
@@ -1264,20 +1394,22 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
 `phase2_results.py` from `surgery.sanity_check` in the train environment):
 1. **Challenge frozen.** Bundle, scorer and calibration comment frozen; the §8.7 band (falls in
    [3%, 10%], docked ≥ 88%) and all five anchor requirements hold on `standard` 0..399.
-2. **No regression.** balance-v1 golden tests, per-preset `protocol_hash` and `ScoreConfig` dump
-   unchanged (pytest above).
-3. **Verification** (pytest above). `verify_episode` / `rescore` reproduce 5 waypoint
-   trajectories; an edited `meta.scenario.course` gives `not_reproducible`; a 10-wide obs in a
-   waypoint upload and a 15-wide obs in a balance upload are rejected by `load_npz`; trusted and
-   env scenarios are equal on 5 seeds; `waypoint-v1/standard` pushes lie in [2.0, 18.0] s.
-4. **Contract** updated: §1 (gym id, `wp_eval_v1`), §4 (`max_steps` per challenge), §6
-   (`balancer-target.obs.v1`, replacing the "target_x, target_y" example), §9 (`TARGETS = 6`),
-   §10 (per-bundle presets), §11/metrics vocabulary (`fall_cause`), §12a (waypoint score and
-   score parts), §13 (per-kind `ENV_ALGO_VERSION`, the §8.1 versioning rule; mujoco and
-   onnxruntime upgrades mean a re-score, not a challenge bump), §14 (obs width), §16 (trusted
-   scenario includes `course`), §17 (non-finite observations outside the policy domain). Schema
-   id, feature order, gym id and alias frozen. Checked by a grep of `docs/contract.md` for each
-   named term.
+2. **No regression.** balance-v1's Phase 1 goldens (`tests/test_golden.py`: bundle and
+   per-preset `protocol_hash`, scenarios, scores) and the pinned standard payload with its
+   `ScoreConfig` dump (`tests/test_challenge.py`) unchanged (pytest above).
+3. **Verification** (pytest above). `verify_episode` reproduces 5 waypoint trajectories and
+   `verify_run` on them reports `failed == 0` (`topple verify DIR` exits 0); an edited
+   `meta.scenario.course` gives `not_reproducible`; a 10-wide obs in a waypoint upload and a
+   15-wide obs in a balance upload are rejected by `load_npz` (§8.1a); trusted and env scenarios
+   are equal on 5 seeds; `waypoint-v1/standard` pushes lie in [2.0, 18.0] s.
+4. **Contract** updated: §1 (gym id, `wp_eval_v1`, `topple.traj/2`), §4 (`max_steps` per
+   challenge), §6 (`balancer-target.obs.v1`, replacing the "target_x, target_y" example), §9
+   (`TARGETS = 6`), §10 (per-bundle presets), §11/metrics vocabulary (`fall_cause`), §12a
+   (waypoint score and score parts), §13 (per-kind `ENV_ALGO_VERSION`, the §8.1 versioning rule;
+   mujoco and onnxruntime upgrades mean a re-score, not a challenge bump), §14a (`topple.traj/2`,
+   §8.1a), §16 (trusted scenario includes `course`; uploads load with the protocol's layout), §17
+   (non-finite observations outside the policy domain). Schema id, feature order, gym id and alias
+   frozen. Checked by a grep of `docs/contract.md` for each named term.
 5. **Results.** Both arms × 3 seeds in `phase2.md` vs the driver on 0..399 (paired bootstrap) and
    on `wp_eval_v1`, with gates, docked, falls, `t_finish` per selection eval, the headline
    comparison (§8.8) and an anchors-plus-PPO table of score parts, docked, fell and median
@@ -1321,7 +1453,7 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
 
 | Risk | Mitigation |
 |---|---|
-| Phase 1 fixes move PID/LQR/E_ref | Train after the fix merges; baselines measured in the same run; E_ref from ScoreConfig; env version and protocol hash bound in train_meta (G10). |
+| Phase 1 changes move PID/LQR/E_ref (the merge moved E_ref 13.3 → 13.0, §0) | Baselines measured in the same run; E_ref from ScoreConfig; env version and protocol hash bound in train_meta (G10); a Phase 3 recalibration on linux-x86_64 (`deferred-risks.md` (c)) means re-running or excluding stale runs. |
 | A seed lands low | Linear LR decay (constant LR collapsed 1 of 3 seeds), 3 seeds, 200 selection seeds, eligibility mirrors G3/G4, `late_regression` flag, fallback to the next run on any `SHIP_GATES` failure; G11 and the recipe row expose a broken recipe. |
 | Training silently loses determinism | Twice-run smoke test with sha equality; retries must reproduce the aborted attempt's `onnx_sha256` (`nondeterministic` flag). |
 | Mac-only evidence flips on the ranking platform | G2–G4 evaluated on both the Mac and the ubuntu CI compare. |
@@ -1336,7 +1468,8 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
 
 - **Phase 3 runner (MUST).**
   - **Re-run, never replay, for ONNX entries.** Uploaded trajectories are display-only; results
-    come only from the `rescore` job below.
+    come only from the `rescore` job below (it re-runs the policy; `topple.verify.rescore`
+    replays uploaded commands).
   - **(i) No PR code, and untrusted bytes never share a VM with a secret or a write token.**
     `publish.yml` is split into two jobs on separate VMs:
     - `rescore`: `permissions: {}`, no secrets, `actions/checkout` with `persist-credentials:
@@ -1345,10 +1478,11 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
       immutable `github.event.workflow_run.head_sha` (re-checked against the PR API),
       size-capped before parsing (1 MiB, 16 KiB, 64 KiB), validates and runs them in the
       sandbox (workspace not mounted), and emits only length-capped JSON (≤ 64 KiB) plus
-      `topple.traj/1` npz.
+      trajectory npz (`topple.traj/1`, or `/2` for waypoint, §8.1a).
     - `publish` (`needs: rescore`): holds the write token, consumes only that output and
       re-validates it; it never parses ONNX.
-    - Nightly private-seed re-evaluation: the salt lives only in the host process of a job with
+    - Nightly private-seed re-evaluation (a private `EvalProtocol`: salt in [2**64, 2**128),
+      repr redacted, contract §8): the salt lives only in the host process of a job with
       `permissions: {}`; the sandbox gets an empty environment (`docker run --env-file
       /dev/null`, no secret mounts); the salt is rotated each season. Red-team item: the sandbox
       can read neither `GITHUB_TOKEN` nor the salt (env, `/proc/1/environ`, `.git/config`).
@@ -1357,12 +1491,13 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
     acts on M5). The per-act bound is a CPU-time limit, or a wall limit ≥ 50 ms (a 5 ms wall kill
     on a shared 1-CPU container kills on jitter); the 60 s aggregate CPU budget does the real
     bounding. A timed-out episode is retried once before it scores 0; exceeding the aggregate is
-    `timeout`, score 0 for the remaining episodes. `scripts/bench_policy_caps.py` MUST show worst
-    accepted × 400k ≤ 20 s on the ubuntu x86 image, including subnormal activations, and checks
-    in the sandboxed child that ORT does not set FTZ/DAZ.
+    `timeout` (the proxy raises `RunnerError`, contract §15), score 0 for the remaining episodes.
+    `scripts/bench_policy_caps.py` MUST show worst accepted × 400k ≤ 20 s on the ubuntu x86
+    image, including subnormal activations, and checks in the sandboxed child that ORT does not
+    set FTZ/DAZ.
   - **(iii) Boundary.** Data crosses the sandbox boundary only as length-capped JSON or
-    `topple.traj/1` npz (`allow_pickle=False`, validated), never multiprocessing/pickle; Phase 2's
-    pools are not reused there.
+    trajectory npz read by `load_npz` with the protocol's `max_steps` and layout (contract §14,
+    §8.1a), never multiprocessing/pickle; Phase 2's pools are not reused there.
   - **(iv) Ownership.** Community entries live under `submissions/community/<lowercased login>/`;
     first-party entries stay outside that tree, so no login can shadow them. A submission PR may
     change only files under its own directory, else it is not processed as a submission.
@@ -1385,6 +1520,8 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
     len(obs_features)) bytes; waypoint 128 B).
 - **Phases 3 and 5 (display).** `claims`, README, metadata and errors are untrusted: escaped or not
   rendered; `claims` labelled self-reported.
+- **Residual Phase 1 risks** (robot validation gaps, darwin-only calibration, sensor-noise
+  portability): `docs/design/deferred-risks.md`, one owning phase each.
 - **Phase 5 (Arena).** Pin `onnxruntime-web@1.30.0` exactly (lockfile; measured: PPO 7.7e-7, SAC
   4.9e-7 vs SB3 for IR 8–11; 1.20.1 also passes IR 8–10). Canonical bytes from R2 by sha256 in a
   Web Worker with `executionProviders: ['wasm']`, `graphOptimizationLevel: 'disabled'`,
