@@ -1182,6 +1182,34 @@ def test_absurd_push_ends_the_episode_without_nan(preset: str, magnitude: float)
         assert traj.epilogue_qpos.shape[0] == 100
 
 
+UNSTABLE_WARNINGS = (
+    mujoco.mjtWarning.mjWARN_BADQACC,
+    mujoco.mjtWarning.mjWARN_BADQVEL,
+    mujoco.mjtWarning.mjWARN_BADQPOS,
+)
+
+
+def test_an_env_reused_after_a_real_blow_up_runs_like_a_fresh_one() -> None:
+    """A real sim_unstable (an absurd push, not a patched check) leaves MuJoCo's warning counters
+    set, and only the reset's mj_resetData clears them. evaluate and rescore run a protocol on one
+    env and training resets the same env, so the next episode must not inherit the blow-up: with
+    a reset that kept the counters, a PID episode ended sim_unstable at step 1."""
+    env = BalanceEnv("ideal", record=True)
+    blast = Push(5, 50, 1e9, forward_sign=1.0, lateral_ratio=0.0)
+    blown = rollout(env, idle, seed=3, options={"pushes": [blast]})
+    assert blown.reason == "sim_unstable"
+    assert any(env.data.warning[w].number > 0 for w in UNSTABLE_WARNINGS)  # MuJoCo's own
+    again = rollout(env, seed=1000)
+    assert all(env.data.warning[w].number == 0 for w in UNSTABLE_WARNINGS)
+    fresh_env = BalanceEnv("ideal", record=True)
+    fresh = rollout(fresh_env, seed=1000)
+    assert again.truncated
+    assert again.steps == env.max_steps
+    assert_same_episode(again, fresh)
+    for name in ("qpos", "qvel", "obs", "ctrl", "gyro", "accel"):
+        assert_bitwise_equal(getattr(env.trajectory(), name), getattr(fresh_env.trajectory(), name))
+
+
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_pid_on_ideal_is_truncated_exactly_at_max_steps(seed: int) -> None:
     env = BalanceEnv("ideal")

@@ -14,6 +14,7 @@ import topple.evaluate as evaluate_module
 from topple.challenge import load_challenge_dir
 from topple.contract import BalancerObs, TaskSpec, controller_obs
 from topple.controllers.pid import PIDController
+from topple.disturbances import Push
 from topple.envs.balance import BalanceEnv
 from topple.evaluate import (
     RUNNER_ERROR_CODES,
@@ -724,6 +725,32 @@ def test_sim_unstable_scores_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     assert not run.result.success
     assert run.trajectory.meta["termination"]["reason"] == "sim_unstable"
     assert run.trajectory.epilogue_qpos.shape[0] == 0  # nothing to show after a blow-up
+
+
+def test_run_episode_on_an_env_reused_after_a_real_blow_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """iter_episodes runs a whole protocol on one env. After a real sim_unstable (MuJoCo's own
+    warning counters, not a patched check), the next run_episode on that env must equal a fresh
+    env's run: same result, same record."""
+    monkeypatch.chdir(tmp_path)  # MuJoCo logs its warnings to ./MUJOCO_LOG.TXT
+    env = BalanceEnv("ideal", record=True)
+    env.reset(seed=0, options={"pushes": [Push(5, 50, 1e9, forward_sign=1.0, lateral_ratio=0.0)]})
+    for _ in range(env.max_steps):
+        *_, terminated, _, info = env.step((0.0, 0.0))
+        if terminated:
+            break
+    assert info["termination_reason"] == "sim_unstable"
+    reused = run_episode(env, pid, seed=1000, index=0)
+    fresh = run_episode(BalanceEnv("ideal", record=True), pid, seed=1000, index=0)
+    assert reused.result.error is None
+    assert reused.result.metrics is not None
+    assert reused.result.metrics["steps"] == 1000
+    assert reused.result == fresh.result
+    for name in ("qpos", "qvel", "obs", "ctrl", "enc_counts", "gyro", "accel", "push_force"):
+        got, want = getattr(reused.trajectory, name), getattr(fresh.trajectory, name)
+        assert got.tobytes() == want.tobytes(), name
+    assert reused.trajectory.meta == fresh.trajectory.meta
 
 
 # ------------------------------------------------------------------ private seeds (B, §8)

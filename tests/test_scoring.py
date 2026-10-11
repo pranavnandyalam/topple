@@ -1,4 +1,5 @@
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -175,6 +176,21 @@ def test_energy_cap_blocks_success() -> None:
         **{**m.as_dict(), "energy_j": CFG.e_ref_j * CFG.success_energy_factor + 1}
     )  # type: ignore[arg-type]
     assert not episode_success(hungry, CFG)
+
+
+def test_success_boundaries() -> None:
+    """§12: success needs ``drift_m < 1`` (strict) and ``energy_j <= 5·E_ref`` (inclusive), so an
+    episode that ends exactly 1 m out fails and one that used exactly 65 J succeeds."""
+    limit = CFG.success_energy_factor * CFG.e_ref_j
+    assert limit == 65.0
+    at_one_metre = episode_metrics(synthetic(10, x_end=CFG.success_max_drift_m), MOTOR)
+    assert (at_one_metre.survived, at_one_metre.drift_m) == (True, 1.0)
+    assert not episode_success(at_one_metre, CFG)
+    assert episode_success(replace(at_one_metre, drift_m=math.nextafter(1.0, 0.0)), CFG)
+
+    perfect = episode_metrics(synthetic(10), MOTOR)
+    assert episode_success(replace(perfect, energy_j=limit), CFG)
+    assert not episode_success(replace(perfect, energy_j=math.nextafter(limit, math.inf)), CFG)
 
 
 def test_mirrored_wheels_use_sign() -> None:

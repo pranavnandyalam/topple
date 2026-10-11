@@ -1,4 +1,5 @@
 import copy
+import functools
 import itertools
 import json
 import math
@@ -213,9 +214,35 @@ def test_from_dict_accepts_json_integers_for_real_fields() -> None:
     assert Scenario.from_dict(data).init_pitch_rad == 0.0
 
 
+SEED_SEARCH_LIMIT = 1000  # every push count shows up within the first 60 seeds
+
+
+@functools.cache
+def first_seed_with_pushes(count: int) -> int:
+    """The first seed whose ``standard`` scenario has at least ``count`` pushes.
+
+    Bounded: this runs at import (``SCENARIO_PATHS``), where an endless search after a regression
+    in the push draw would hang the whole session before any test runs (``faulthandler_timeout``
+    only covers running tests). It fails here with a message instead, as a collection error.
+    """
+    for seed in range(SEED_SEARCH_LIMIT):
+        if len(scenario(seed).pushes) >= count:
+            return seed
+    raise AssertionError(
+        f"no seed below {SEED_SEARCH_LIMIT} draws {count} or more standard pushes: "
+        "has the push draw (count, _draw_pushes) regressed?"
+    )
+
+
 def with_two_pushes() -> dict[str, Any]:
-    seed = next(seed for seed in itertools.count() if len(scenario(seed).pushes) >= 2)
-    return scenario(seed).to_dict()
+    return scenario(first_seed_with_pushes(2)).to_dict()
+
+
+def test_the_seed_search_is_bounded() -> None:
+    """A push count no preset draws fails after ``SEED_SEARCH_LIMIT`` seeds, with a message."""
+    with pytest.raises(AssertionError, match=rf"no seed below {SEED_SEARCH_LIMIT} draws 4 or more"):
+        first_seed_with_pushes(MAX_PUSHES + 1)
+    assert len(scenario(first_seed_with_pushes(2)).pushes) >= 2
 
 
 def setter(*path: Any, value: Any) -> Callable[[dict[str, Any]], None]:
