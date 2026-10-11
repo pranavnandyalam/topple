@@ -621,11 +621,11 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
 - **Cross-field checks.** `protocol` is one of `challenge`'s (`balance-v1/…` for `balance-v1`).
   An episode with an error has score 0 and is not a success. Public results list their episodes
   with strictly increasing `index` and a `seed` each, `aggregate.episodes == len(episodes)` and
-  `aggregate.errors` equal to the number of episodes with an error. A `complete` result has no `missing` episode, and its aggregate is exactly §12's
-  aggregate of the listed episodes (N = their number; every episode with metrics reports a
-  `time_upright_s` that is a number of seconds from 0 to 10⁹, far beyond any episode, so the
-  sum over at most 10,000 episodes can never overflow). Private-seed results are redacted:
-  `episodes` is null, aggregate only.
+  `aggregate.errors` equal to the number of episodes with an error. A `complete` result has no
+  `missing` episode, and its aggregate is exactly §12's aggregate of the listed episodes (N =
+  their number; every episode with metrics reports a `time_upright_s` that is a number of
+  seconds from 0 to 10⁹, far beyond any episode, so the sum over at most 10,000 episodes can
+  never overflow). Private-seed results are redacted: `episodes` is null, aggregate only.
 - **Reading** (`read_results`) opens only a regular file (symlinks are followed; a FIFO, device
   or directory is refused without blocking on it or reading from it, as `load_npz` does, §14),
   reads at most 16 MiB and validates all of the above, with exact JSON types: nothing is coerced
