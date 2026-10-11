@@ -54,7 +54,8 @@ AXIAL_TIRE_TYPES = frozenset(
 # site's axes as aligned with the chassis's when 1 - cos is, sign included).
 AXIS_TOLERANCE = 1e-6
 # How far a tire's centre may sit from its hinge axis line or from the chassis y axis (the
-# axle), and how far the two centres' y coordinates may be from opposite.
+# axle), how far the two centres' y coordinates may be from opposite, and how far the axle may
+# start from one tire radius above the floor.
 TIRE_CENTRE_TOLERANCE_M = 1e-6
 _FILE_ATTRS = ("file", "fileright", "fileleft", "fileup", "filedown", "filefront", "fileback")
 _MESH_DIR_TAGS = frozenset({"mesh", "skin", "hfield"})  # MuJoCo resolves these via meshdir
@@ -562,6 +563,27 @@ def _axle_problems(model: mujoco.MjModel, chassis: int, tires: tuple[int, int]) 
     return problems
 
 
+def _spawn_problems(model: mujoco.MjModel, chassis: int, tires: tuple[int, int]) -> list[str]:
+    """The chassis origin (the axle) must start one tire radius above the floor, the plane z = 0.
+
+    A reset keeps the root's position from the MJCF and sets only its orientation and velocities
+    (contract §9), so this height is what spawns the tires touching the floor (§5). Checked only
+    while ``root`` is the chassis's free joint (``_root_problems`` reports anything else).
+    """
+    root = _lookup(model, mujoco.mjtObj.mjOBJ_JOINT, ROOT_JOINT)
+    free = root >= 0 and model.jnt_type[root] == mujoco.mjtJoint.mjJNT_FREE
+    if not free or model.jnt_bodyid[root] != chassis:
+        return []
+    radius = float(model.geom_size[tires[0]][0])
+    height = float(model.qpos0[int(model.jnt_qposadr[root]) + 2])
+    if abs(height - radius) <= TIRE_CENTRE_TOLERANCE_M:
+        return []
+    return [
+        f"the chassis must start with its origin (the axle) at z = {radius:g} m, the tire "
+        f"radius, so the tires spawn touching the floor; got z = {height:g} m"
+    ]
+
+
 def _wheel_problems(model: mujoco.MjModel, chassis: int, name: str, side: float) -> list[str]:
     """One wheel joint: an unlimited ±y hinge on a direct child of the chassis, on its side."""
     jid = _lookup(model, mujoco.mjtObj.mjOBJ_JOINT, name)
@@ -640,30 +662,53 @@ def _world_problems(model: mujoco.MjModel, chassis: int, scene_geoms: frozenset[
         if model.site_bodyid[site] == 0:
             name = _name(model, mujoco.mjtObj.mjOBJ_SITE, site)
             problems.append(f"world site '{name}' is not allowed; it could anchor the robot")
-    return problems + _tendon_problems(model, chassis) + _flex_problems(model, chassis)
+    return problems
+
+
+def _wheel_bodies(model: mujoco.MjModel, chassis: int) -> frozenset[int]:
+    """The wheel joints' bodies and every body below them: whatever turns with a wheel."""
+    below: set[int] = set()
+    for name in WHEEL_JOINTS:
+        joint = _lookup(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if joint >= 0 and int(model.jnt_bodyid[joint]) not in (0, chassis):
+            below.add(int(model.jnt_bodyid[joint]))
+    for body in range(1, model.nbody):  # MuJoCo numbers every body after its parent
+        if int(model.body_parentid[body]) in below:
+            below.add(body)
+    return frozenset(below)
 
 
 def _wrap_body(model: mujoco.MjModel, wrap: int) -> int | None:
-    """The body a tendon wrap object is fixed to, or ``None`` (joints, pulleys)."""
+    """The body a tendon wrap object moves with (a joint's: the body it turns), or ``None`` for
+    a pulley, which has no object."""
     kind = int(model.wrap_type[wrap])
     obj = int(model.wrap_objid[wrap])
     if kind == mujoco.mjtWrap.mjWRAP_SITE:
         return int(model.site_bodyid[obj])
     if kind in (mujoco.mjtWrap.mjWRAP_SPHERE, mujoco.mjtWrap.mjWRAP_CYLINDER):
         return int(model.geom_bodyid[obj])
-    return None  # a joint (fixed tendon) belongs to a robot body; a pulley has no object
+    if kind == mujoco.mjtWrap.mjWRAP_JOINT:
+        return int(model.jnt_bodyid[obj])
+    return None
 
 
-def _tendon_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
+def _tendon_problems(model: mujoco.MjModel, chassis: int, wheels: frozenset[int]) -> list[str]:
     """A tendon may only connect parts of the robot: one routed through a world site or geom
-    is a tether that can hold the robot up."""
+    is a tether that can hold the robot up. And none may act on a wheel (its joint, or a site or
+    geom that turns with it): its spring, damping, friction loss or limit would add to the
+    wheel's dynamics, which come from params.yaml alone (contract §3)."""
     problems: list[str] = []
     for tendon in range(model.ntendon):
         start = int(model.tendon_adr[tendon])
-        bodies = (_wrap_body(model, w) for w in range(start, start + int(model.tendon_num[tendon])))
-        if any(b is not None and model.body_rootid[b] != chassis for b in bodies):
-            name = _name(model, mujoco.mjtObj.mjOBJ_TENDON, tendon)
+        span = range(start, start + int(model.tendon_num[tendon]))
+        bodies = {b for b in (_wrap_body(model, w) for w in span) if b is not None}
+        name = _name(model, mujoco.mjtObj.mjOBJ_TENDON, tendon)
+        if any(model.body_rootid[b] != chassis for b in bodies):
             problems.append(f"tendon '{name}' is tied to the world; tendons must stay on the robot")
+        if bodies & wheels:
+            problems.append(
+                f"tendon '{name}' acts on a wheel; a wheel's dynamics come from params.yaml alone"
+            )
     return problems
 
 
@@ -682,15 +727,43 @@ def _flex_bodies(model: mujoco.MjModel, flex: int) -> set[int]:
     return {int(b) for b in (*verts, *nodes) if b >= 0}
 
 
-def _flex_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
+def _flex_problems(model: mujoco.MjModel, chassis: int, wheels: frozenset[int]) -> list[str]:
     """A deformable flex may only join parts of the robot: one with a vertex on the world body
-    (or any body outside the robot) is an elastic tether that can hold the robot up."""
-    return [
-        f"flex '{_name(model, mujoco.mjtObj.mjOBJ_FLEX, flex)}' is tied to the world; "
-        "flexes must stay on the robot"
-        for flex in range(model.nflex)
-        if any(model.body_rootid[b] != chassis for b in _flex_bodies(model, flex))
+    (or any body outside the robot) is an elastic tether that can hold the robot up. And none
+    may be tied to a wheel, whose dynamics come from params.yaml alone (contract §3)."""
+    problems: list[str] = []
+    for flex in range(model.nflex):
+        bodies = _flex_bodies(model, flex)
+        name = _name(model, mujoco.mjtObj.mjOBJ_FLEX, flex)
+        if any(model.body_rootid[b] != chassis for b in bodies):
+            problems.append(f"flex '{name}' is tied to the world; flexes must stay on the robot")
+        if bodies & wheels:
+            problems.append(
+                f"flex '{name}' is tied to a wheel; a wheel's dynamics come from params.yaml alone"
+            )
+    return problems
+
+
+def _contact_problems(model: mujoco.MjModel) -> list[str]:
+    """No explicit contact pairs: a pair sets its own parameters, overriding those the tires'
+    priority gives their floor contacts, and makes any two geoms collide. No contact excludes
+    with the world: they would hide the robot's contacts with the floor (contract §3, §11)."""
+    problems = [
+        f"contact pair '{_name(model, mujoco.mjtObj.mjOBJ_PAIR, pair)}' is not allowed; the env "
+        "sets the tires' contact parameters and collision filtering, which a pair overrides"
+        for pair in range(model.npair)
     ]
+    for exclude in range(model.nexclude):
+        signature = int(model.exclude_signature[exclude])  # (lower body id << 16) + higher
+        first, second = signature >> 16, signature & 0xFFFF
+        if first == 0:
+            name = _name(model, mujoco.mjtObj.mjOBJ_EXCLUDE, exclude)
+            body = _name(model, mujoco.mjtObj.mjOBJ_BODY, second)
+            problems.append(
+                f"contact exclude '{name}' between 'world' and '{body}' is not allowed; it "
+                "would hide the robot's contacts with the floor"
+            )
+    return problems
 
 
 def validate_robot(
@@ -706,9 +779,12 @@ def validate_robot(
     tires = _tires(model)
     if tires is not None:
         problems += _tire_radius_problems(model, tires) + _axle_problems(model, chassis, tires)
+        problems += _spawn_problems(model, chassis, tires)
     problems += _interface_problems(model, chassis)
     problems += _world_problems(model, chassis, scene_geoms)
-    return problems
+    wheels = _wheel_bodies(model, chassis)
+    problems += _tendon_problems(model, chassis, wheels) + _flex_problems(model, chassis, wheels)
+    return problems + _contact_problems(model)
 
 
 def quat_tilt(quat: npt.ArrayLike) -> float:

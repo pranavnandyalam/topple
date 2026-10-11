@@ -258,6 +258,7 @@ LEFT_TIRE = '<geom name="left_tire" type="cylinder"'
 RIGHT_TIRE = '<geom name="right_tire" type="cylinder"'
 WORLD_END = "  </worldbody>"
 FREE_ROOT = '<freejoint name="root"/>'
+CHASSIS_BODY = '<body name="chassis" pos="0 0 0.034">'
 TETHER = (
     '<tendon><spatial limited="true" range="0 0.37">'
     '<site site="anchor"/><site site="imu"/></spatial></tendon>'
@@ -269,10 +270,54 @@ FLEX_TETHER = (
     ' element="0 1"><edge stiffness="2000" damping="50"/><contact contype="0" conaffinity="0"/>'
     "</flex></deformable>"
 )
+# A jointed robot body that is not a wheel: a mast on a hinge, which a flex may spring.
+MAST = (
+    '<body name="mast" pos="0 0 0.16"><joint name="mast_hinge" type="hinge" axis="1 0 0"/>'
+    '<geom name="mast_tip" type="sphere" size="0.01" mass="0.01" contype="0" conaffinity="0"/>'
+    "</body>"
+)
 ROBOT_FLEX = FLEX_TETHER.replace('name="tether"', 'name="bumper"').replace(
     'body="world chassis" vertex="0 0 0.6 0 0 0.10"',
-    'body="chassis left_wheel_body" vertex="0 0 0.10 0 0 0"',
+    'body="chassis mast" vertex="0 0 0.10 0 0 0.05"',
 )
+# Robot-file elements that act on a wheel or a tire's floor contact, or hide the robot's floor
+# contacts (§3, §11): each once passed validate_robot.
+WHEEL_DRAG = (
+    '<tendon><fixed name="drag" damping="0.05"><joint joint="left_wheel" coef="1"/></fixed>'
+    "</tendon>"
+)
+WHEEL_COUPLING = (
+    '<tendon><fixed name="diff"><joint joint="left_wheel" coef="1"/>'
+    '<joint joint="right_wheel" coef="-1"/></fixed></tendon>'
+)
+RIM_SITE = '<site name="rim" pos="0.02 0 0"/>'
+STRAP = (
+    '<tendon><spatial name="strap" stiffness="1"><site site="imu"/><site site="rim"/></spatial>'
+    "</tendon>"
+)
+BELT = (
+    '<tendon><spatial name="belt"><site site="imu"/><geom geom="left_tire"/>'
+    '<site site="push_point"/></spatial></tendon>'
+)
+WHEEL_DAMPER = (
+    '<deformable><flex name="damper" dim="1" body="chassis left_wheel_body"'
+    ' vertex="0 0.07 0.10 0.02 0 0" element="0 1"><edge damping="5"/>'
+    '<contact contype="0" conaffinity="0"/></flex></deformable>'
+)
+TIRE_FLOOR_PAIR = (
+    '<contact><pair name="grip" geom1="left_tire" geom2="floor"'
+    ' friction="5 5 0.005 0.0001 0.0001"/></contact>'
+)
+BRAKE_PAIR = '<contact><pair name="brake" geom1="chassis_box" geom2="right_tire"/></contact>'
+WORLD_EXCLUDE = '<contact><exclude name="ghost" body1="world" body2="chassis"/></contact>'
+ROBOT_EXCLUDE = '<contact><exclude body1="chassis" body2="left_wheel_body"/></contact>'
+
+
+def after_body_tree(xml: str) -> tuple[str, str]:
+    """An edit that adds ``xml`` (tendons, flexes, contacts) after the robot's body tree."""
+    return ("</worldbody>", "</worldbody>" + xml)
+
+
 # A soft block with no passive forces of its own: MuJoCo warns that it is not rigid.
 SOFT_BLOCK_WARNING = "ignore:flex 'soft' is not rigid:UserWarning"
 SOFT_BLOCK = (
@@ -530,6 +575,67 @@ VIOLATIONS = {
             (RIGHT_TIRE_ALONG_Y, RIGHT_TIRE_ALONG_Y + ' pos="0 0.08 0"'),
         ],
         "tire of 'left_wheel' must be on the left (y > 0)",
+    ),
+    # A wheel's dynamics come from params.yaml alone (§3): no tendon or flex may act on a wheel.
+    "damped fixed tendon on a wheel": (
+        [after_body_tree(WHEEL_DRAG)],
+        "tendon 'drag' acts on a wheel",
+    ),
+    "fixed tendon coupling the wheels": (
+        [after_body_tree(WHEEL_COUPLING)],
+        "tendon 'diff' acts on a wheel",
+    ),
+    "spring to a site on a wheel": (
+        [(LEFT_JOINT, LEFT_JOINT + RIM_SITE), after_body_tree(STRAP)],
+        "tendon 'strap' acts on a wheel",
+    ),
+    "spring to a site on a body below a wheel": (
+        [(LEFT_JOINT, LEFT_JOINT + f'<body name="hub">{RIM_SITE}</body>'), after_body_tree(STRAP)],
+        "tendon 'strap' acts on a wheel",
+    ),
+    "tendon wrapped around a tire": ([after_body_tree(BELT)], "tendon 'belt' acts on a wheel"),
+    "flex damper on a wheel": (
+        [after_body_tree(WHEEL_DAMPER)],
+        "flex 'damper' is tied to a wheel",
+    ),
+    # The env sets every tire-floor contact's parameters (§3) and ends an episode when anything
+    # but a tire touches the floor (§11).
+    "contact pair between a tire and the floor": (
+        [after_body_tree(TIRE_FLOOR_PAIR)],
+        "contact pair 'grip' is not allowed",
+    ),
+    "contact pair between the chassis and a tire": (
+        [after_body_tree(BRAKE_PAIR)],
+        "contact pair 'brake' is not allowed",
+    ),
+    "contact exclude between the world and the chassis": (
+        [after_body_tree(WORLD_EXCLUDE)],
+        "contact exclude 'ghost' between 'world' and 'chassis' is not allowed",
+    ),
+    # A reset keeps the root's position from the MJCF and tilts the chassis about the axle (§3,
+    # §9): only a chassis whose origin starts one tire radius above the floor spawns with its
+    # tires touching it (§5).
+    "chassis spawned at the floor": (
+        [(CHASSIS_BODY, '<body name="chassis" pos="0 0 0">')],
+        "the chassis must start with its origin (the axle) at z = 0.034 m, the tire radius, "
+        "so the tires spawn touching the floor; got z = 0 m",
+    ),
+    "chassis spawned in the air": (
+        [(CHASSIS_BODY, '<body name="chassis" pos="0 0 0.2">')],
+        "got z = 0.2 m",
+    ),
+    "chassis a tenth of a millimetre into the floor": (
+        [(CHASSIS_BODY, '<body name="chassis" pos="0 0 0.0339">')],
+        "got z = 0.0339 m",
+    ),
+    # The root's height is then a mount's, not the chassis's: no spawn height is checked.
+    "root on a mount above the chassis": (
+        [
+            (FREE_ROOT, ""),
+            (CHASSIS_BODY, f'<body name="mount" pos="0 0 0.034">{FREE_ROOT}<body name="chassis">'),
+            ("    </body>\n  </worldbody>", "    </body></body>\n  </worldbody>"),
+        ],
+        "free joint 'root' on body 'chassis' is missing",
     ),
 }
 
@@ -1075,24 +1181,19 @@ def test_validate_reports_wheel_and_site_problems(
         [
             (
                 "</worldbody>",
-                '</worldbody><tendon><fixed name="diff"><joint joint="left_wheel" coef="1"/>'
-                '<joint joint="right_wheel" coef="-1"/></fixed></tendon>',
-            )
-        ],
-        [
-            (
-                "</worldbody>",
                 '</worldbody><tendon><spatial name="block"><site site="imu"/>'
                 '<site site="push_point"/><pulley divisor="2"/><site site="push_point"/>'
                 '<site site="imu"/></spatial></tendon>',
             )
         ],
-        [("</worldbody>", "</worldbody>" + ROBOT_FLEX)],
+        [(IMU_SITE, MAST + IMU_SITE), after_body_tree(ROBOT_FLEX)],
         [('<site name="imu"', SOFT_BLOCK + '<site name="imu"')],
         [(IMU_SITE, IMU_SITE + ' euler="0 0.001 0"')],
         [(PUSH_SITE, PUSH_SITE + ' euler="0 0 1"')],
         FLANGE_WHEELS,
         ROTATED_FLANGE_WHEELS,
+        [after_body_tree(ROBOT_EXCLUDE)],
+        [(CHASSIS_BODY, '<body name="chassis" pos="0.5 -0.3 0.034" euler="0 0 1">')],
     ],
     ids=[
         "flipped cylinder axis",
@@ -1104,14 +1205,15 @@ def test_validate_reports_wheel_and_site_problems(
         "rotated wheel body with its tire along the hinge",
         "cylinder axis within tolerance",
         "hinge placed further along the axle",
-        "fixed tendon coupling the wheels",
         "pulley between robot sites",
-        "flex between robot bodies",
+        "flex between the chassis and a jointed body",
         "interpolated flex on the robot",
         "imu board within the axis tolerance",
         "rotated push point (only its position counts)",
         "tires offset along the axle from their wheel bodies",
         "rotated wheel body with its tire offset along the axle",
+        "contact exclude inside the robot (it only removes contacts the robot has with itself)",
+        "chassis placed elsewhere on the floor and turned (a reset sets its orientation)",
     ],
 )
 def test_validate_accepts_variants_that_can_still_fall(
@@ -1176,6 +1278,8 @@ def test_the_env_refuses_a_robot_that_cannot_fall_or_misstates_its_radius(
         ("imu board turned a quarter turn", "site 'imu' must not be rotated"),
         ("axle below the chassis origin", "must be centred on the chassis y axis"),
         ("chassis origin off the axle midpoint", "axle midpoint"),
+        ("chassis spawned at the floor", "the chassis must start with its origin"),
+        ("chassis spawned in the air", "the chassis must start with its origin"),
     ],
 )
 def test_the_env_refuses_a_robot_it_would_sense_or_spawn_wrongly(
@@ -1185,7 +1289,38 @@ def test_the_env_refuses_a_robot_it_would_sense_or_spawn_wrongly(
     chassis's x axis as its y: from 0.1 rad and 20 idle steps the observed pitch read 0.07 while
     the robot lay at 0.21 and fell at 1.3 rad/s, and the shipped PID survived 0 of 10 clean
     seeds. With the chassis frame 8 cm above the axle, a reset at 0.5 rad spawned the tires
-    9.8 mm above the floor and 38 mm off in x."""
+    9.8 mm above the floor and 38 mm off in x. With the chassis at z = 0, clean seeds 1000-1002
+    all ended at step 1 with floor_contact; at z = 0.2 m the robot dropped 166 mm first and the
+    shipped PID scored 88.9-91.5 there, against 96.0-96.4 for the stock robot."""
+    xml = ROBOT_XML.read_text()
+    for old, new in VIOLATIONS[case][0]:
+        xml = xml.replace(old, new, 1)
+    path = tmp_path / "variant.xml"
+    path.write_text(xml)
+    with pytest.raises(ValueError, match=rf"balancer\.robot\.v1.*{message}"):
+        BalanceEnv("clean", robot_xml=path)
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("damped fixed tendon on a wheel", "tendon 'drag' acts on a wheel"),
+        ("flex damper on a wheel", "flex 'damper' is tied to a wheel"),
+        ("contact pair between a tire and the floor", "contact pair 'grip' is not allowed"),
+        ("contact exclude between the world and the chassis", "contact exclude 'ghost'"),
+    ],
+)
+def test_the_env_refuses_a_robot_that_changes_its_wheels_or_floor_contacts(
+    tmp_path: Path, case: str, message: str
+) -> None:
+    """§3: a wheel's dynamics come from params.yaml alone and a tire-floor contact's parameters
+    from the tire alone; §11: only the tires may touch the floor. Each of these once ran. Fixed
+    tendons with damping 0.05 on both wheels made the shipped PID fall on clean seeds 1000-1002
+    at steps 212, 138 and 72 (the stock robot survives all three, scoring about 96); a tire-floor
+    pair held the contact's friction at its own value on every seed, whatever params.yaml and
+    the scenario's friction scale (§10) said; and an exclude between the world and the chassis
+    let a tail reach through the floor for 1000 steps (score 96.21) where the same robot without
+    it ends at step 1 with floor_contact."""
     xml = ROBOT_XML.read_text()
     for old, new in VIOLATIONS[case][0]:
         xml = xml.replace(old, new, 1)

@@ -1107,6 +1107,32 @@ def test_the_first_estimate_errs_by_at_most_one_filter_step_toward_noise() -> No
     assert max(errors) < bound
 
 
+@pytest.mark.parametrize("pitch", [-0.0523, 0.0, 0.0523])
+@pytest.mark.parametrize("placed", [False, True], ids=["stock", "placed elsewhere and turned"])
+def test_the_tires_spawn_exactly_touching_the_floor(
+    tmp_path: Path, pitch: float, placed: bool
+) -> None:
+    """§3, §5: whatever the initial pitch, each tire's lowest point starts on the floor (z = 0).
+    A reset tilts the chassis about the axle and keeps its position from the MJCF, whose height
+    validate_robot requires to be the tire radius; where the MJCF puts the robot on the floor,
+    and how it turns it, do not matter."""
+    robot = None
+    if placed:
+        robot = robot_variant(
+            tmp_path,
+            "placed",
+            (
+                '<body name="chassis" pos="0 0 0.034">',
+                '<body name="chassis" pos="0.5 -0.3 0.034" euler="0 0 1">',
+            ),
+        )
+    env = BalanceEnv("clean", robot_xml=robot)
+    env.reset(seed=0, options={"init_pitch_rad": pitch})
+    for tire in env.binding.wheel_geoms:
+        assert env.data.geom_xpos[tire][2] - env.binding.wheel_radius_m == 0.0
+    assert quat_pitch_yaw(env.data.qpos[3:7]) == pytest.approx((pitch, 0.0), abs=1e-15)
+
+
 @pytest.mark.parametrize(("preset", "saturates"), [("clean", True), ("ideal", False)])
 @pytest.mark.parametrize("direction", [1.0, -1.0])
 def test_gyro_saturates_at_full_scale(preset: str, saturates: bool, direction: float) -> None:

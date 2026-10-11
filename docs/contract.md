@@ -82,12 +82,15 @@ wheels' dynamics:
   0.001, 0.5, 2)`) and `armature`, and nothing else: `damping = 0` (back-EMF lives in the
   actuator) and `stiffness = 0`, polynomial terms included, with no `springdamper`; no
   `actuatorfrcrange` (the motor's `forcerange` is the torque limit). Whatever the MJCF gives
-  them, a wheel's dynamics come from `params.yaml` alone.
+  them, a wheel's dynamics come from `params.yaml` alone, and `validate_robot` refuses a
+  tendon or flex that acts on a wheel (below), which would add to them.
 - Tires: every geom of each wheel body gets `friction[0] = contact.wheel_friction` (its
   torsional and rolling coefficients stay the MJCF's) and `priority = 1`, so a tire–floor
   contact takes all its parameters (friction, `condim`, `solref`, `solimp`) from the tire
   alone. With equal priorities MuJoCo would take the larger of the two sliding frictions, and
-  the per-episode friction scale (§10) could not make a tire more slippery than the floor.
+  the per-episode friction scale (§10) could not make a tire more slippery than the floor. An
+  explicit contact pair would set its own parameters instead, so `validate_robot` refuses
+  pairs (below).
 - Sensors `imu_gyro`, `imu_accel` on site `imu`.
 - A camera `track` on `chassis` (`mode="trackcom"`), the one replay videos are drawn from. The
   name is reserved: `build_model` refuses a robot that has a camera of that name.
@@ -95,7 +98,8 @@ wheels' dynamics:
 `validate_robot(model) -> list[str]` reports every violation of the composed model; robot-ci, CAD
 export (Phase 8), evolved bodies (Phase 10) and generated robots (Phase 12) all go through it.
 Besides the table above it checks that the robot can fall freely, that nothing else shares the
-world, and the geometry the env relies on:
+world, that no tendon, flex or contact rule of the robot's own changes its wheels' dynamics
+or its contacts with the floor, and the geometry the env relies on:
 
 - `root` is a free joint on `chassis` with zero `damping`, `armature` and `frictionloss` on all
   six of its DOFs and zero `stiffness`, polynomial terms included (`damping`/`stiffness` given as
@@ -104,8 +108,16 @@ world, and the geometry the env relies on:
 - every body other than the world belongs to the robot (its root body is `chassis`), the world
   body has no geoms except the scene's own (`floor`) and no sites, no tendon passes through
   a site or wraps a geom that is not on the robot, and no deformable flex has a vertex or node
-  on a body that is not on the robot (a tendon or flex tied to the world is a tether). Tendons
-  and flexes that join parts of the robot are allowed.
+  on a body that is not on the robot (a tendon or flex tied to the world is a tether);
+- no tendon or flex acts on a wheel: no tendon uses a wheel joint or passes through a site or
+  wraps a geom on a wheel body or a body below one, and no flex has a vertex or node on such a
+  body (their springs, dampers, friction loss and limits would add to the wheel's dynamics,
+  above). Tendons and flexes that join other parts of the robot are allowed;
+- no explicit contact pair (`<contact><pair>`): a pair sets its own parameters, overriding
+  those the tires' priority gives their floor contacts (above), and makes any two geoms
+  collide. No contact exclude between the world and a robot body, which would hide that body's
+  contacts with the floor and so the `floor_contact` termination (§11). Excludes between two
+  robot bodies only remove contacts the robot has with itself and are allowed;
 - each tire's centre lies on its wheel's hinge axis line (through the joint's `pos`, along its
   `axis`, both in the wheel body's frame) within 1e-6 m, and each cylinder or capsule tire's axis
   is parallel (or antiparallel) to that hinge axis, within 1e-6 in |cos| of the angle between
@@ -118,6 +130,12 @@ world, and the geometry the env relies on:
   the initial pitch and turns each wheel, relative to the chassis and forward positive (§2), at
   minus the initial pitch rate (§9): only on this axle do the tires then spawn touching the
   floor (§5) and start rolling without slip.
+- the chassis starts with its origin, the axle, one tire radius above the floor (the plane
+  z = 0): the root's initial position is the chassis body's `pos`, whose z must equal `size[0]`
+  within 1e-6 m. A reset keeps that position and sets only the root's orientation and
+  velocities, so this height is what spawns the tires touching the floor (§5); where on the
+  floor the MJCF puts the robot, and how it turns it, do not matter. At z = 0 the robot would
+  start half inside the floor and every episode would end at step 1 with `floor_contact`.
 - the `imu` site is not rotated relative to the chassis: each of its axes lies along the same
   chassis axis, within 1e-6 in 1 − cos of the angle between them. MuJoCo's gyro and
   accelerometer read in the site's frame, which §5 takes as the chassis frame; the board's mount
@@ -145,7 +163,8 @@ hashed with CRLF → LF, exactly as in `bundle_hash` (§13), so a checkout's lin
 `core.autocrlf` on Windows) never change a robot's hash; other files count byte for byte.
 
 The scene (`scene.xml`) owns physics options: `timestep=0.002`, `integrator=implicitfast`,
-`<flag autoreset="disable"/>`, a floor plane and lights. The robot is attached with prefix `""`.
+`<flag autoreset="disable"/>`, a floor plane at z = 0 and lights. The robot is attached with
+prefix `""`.
 
 ## 4. Timing
 
@@ -178,17 +197,18 @@ step from the state at the *start* of the substep: the readings lag the simulate
 substep (2 ms), like a real sample-and-hold. The reading at reset (k = 0, after `mj_forward`) is
 current; it uses one extra SENSOR noise block (§9).
 
-The robot spawns with its tires exactly touching the floor (distance 0), and MuJoCo makes a
-contact a constraint only once it penetrates. So the reset state and the first substep are
-computed as free fall: the reset reading and the first substep's accelerometer sample measure a
-specific force of about 0 (noise only) where a robot at rest reads +g. The first filter update
-(step 3) then pulls the estimate toward `atan2` of noise, an error of at most
-`(1 − a)·(π + |pitch|)` ≈ 12.8 mrad that decays with `tau`. Measured on darwin-arm64: std 7.1 mrad
-after control step 1 over 300 `clean` seeds (0.55 mrad with the tires 0.1 mm into the floor),
-and no effect on the calibration (§10, §12: on `standard` seeds 0..199, LQR 86.5% and PID 64.5%
-survival and E_ref 13.0 either way). Whether a contact at exactly zero distance counts rests on
-rounding, so this first sample can differ by platform, as physics may (§14). It is part of
-balance-v1; changing the spawn changes every score, so it needs a new major version (§13).
+The robot spawns with its tires exactly touching the floor (distance 0: §3 requires the axle to
+start one tire radius above it), and MuJoCo makes a contact a constraint only once it penetrates.
+So the reset state and the first substep are computed as free fall: the reset reading and the
+first substep's accelerometer sample measure a specific force of about 0 (noise only) where a
+robot at rest reads +g. The first filter update (step 3) then pulls the estimate toward `atan2`
+of noise, an error of at most `(1 − a)·(π + |pitch|)` ≈ 12.8 mrad that decays with `tau`.
+Measured on darwin-arm64: std 7.1 mrad after control step 1 over 300 `clean` seeds (0.55 mrad
+with the tires 0.1 mm into the floor), and no effect on the calibration (§10, §12: on `standard`
+seeds 0..199, LQR 86.5% and PID 64.5% survival and E_ref 13.0 either way). Whether a contact at
+exactly zero distance counts rests on rounding, so this first sample can differ by platform, as
+physics may (§14). It is part of balance-v1; changing the spawn changes every score, so it needs
+a new major version (§13).
 
 Per control step (after the 5 substeps):
 4. Encoders: `counts_i = round(wheel_sign_i · q_i · cpr / 2π)` (integer, chassis-relative);
