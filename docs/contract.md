@@ -46,7 +46,7 @@ A robot MJCF (body tree only; no `<option>`, floor or lights) must contain, by e
 | body + free joint | `chassis`, free joint `root` | root of the robot, a child of the world |
 | hinge joints | `left_wheel`, `right_wheel` | unlimited, axes ±y in the chassis frame |
 | wheel bodies | the bodies of the two hinges | direct children of `chassis`; left at y > 0, right at y < 0 |
-| tire geoms | the one collision geom of each wheel body | cylinder, sphere or capsule; size[0] is the wheel radius, equal on both tires; a cylinder's or capsule's axis (its local z) lies along the hinge axis |
+| tire geoms | the one collision geom of each wheel body | cylinder, sphere or capsule, centred on the hinge axis; size[0] is the wheel radius, equal on both tires; a cylinder's or capsule's axis (its local z) lies along the hinge axis |
 | site | `imu` | child of `chassis`; where the IMU board is mounted |
 | site | `push_point` | child of `chassis`; where pushes are applied |
 
@@ -75,11 +75,15 @@ world:
   several coefficients); no equality constraints; no body uses `gravcomp`;
 - both motors and both IMU sensors exist and there are exactly 2 actuators;
 - every body other than the world belongs to the robot (its root body is `chassis`), the world
-  body has no geoms except the scene's own (`floor`) and no sites, and no tendon passes through
-  a site or wraps a geom that is not on the robot (a tendon tied to the world is a tether).
-- each cylinder or capsule tire's axis is parallel (or antiparallel) to its wheel's hinge axis,
-  within 1e-6 in |cos| of the angle between them, so `size[0]` is the radius it rolls on; a
-  sphere needs no check.
+  body has no geoms except the scene's own (`floor`) and no sites, no tendon passes through
+  a site or wraps a geom that is not on the robot, and no deformable flex has a vertex or node
+  on a body that is not on the robot (a tendon or flex tied to the world is a tether). Tendons
+  and flexes that join parts of the robot are allowed.
+- each tire's centre lies on its wheel's hinge axis line (through the joint's `pos`, along its
+  `axis`, both in the wheel body's frame) within 1e-6 m, and each cylinder or capsule tire's axis
+  is parallel (or antiparallel) to that hinge axis, within 1e-6 in |cos| of the angle between
+  them. Together they make `size[0]` the radius the tire rolls on: an off-centre tire would roll
+  as a cam.
 
 `wheel_radius_m` is the tire geom's radius (both tires must agree to within 1e-9 m) and
 `track_width_m` the distance between the wheel bodies along y; both reach the controller through
@@ -88,8 +92,10 @@ world:
 `robot_hash(robot_xml, params)` = sha256 of the MJCF bytes, then the params as sorted-key JSON,
 then, for every file the MJCF references (`<include>` recursively, meshes, skins and height fields
 via `meshdir`, textures via `texturedir`, other `file` attributes relative to the MJCF; `assetdir`
-sets both directories), a record `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths, POSIX
-path relative to the MJCF's directory) in POSIX-path string order (`a-c.obj` before `a/b.obj`). A
+sets both directories; a sub-model `<asset><model file>` together with every file *it*
+references, recursively, resolved as MuJoCo does against the sub-model's own directory and
+`<compiler>`), a record `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths, POSIX path
+relative to the MJCF's directory) in POSIX-path string order (`a-c.obj` before `a/b.obj`). A
 referenced file that does not exist is an error. A robot without asset files (balance-v1) hashes
 the MJCF and params only.
 
@@ -177,7 +183,9 @@ class BalancerObs:            # alias: topple.contract.Observation
   voltage `u = V_cmd / V_nom` for that wheel.
 - `invalid_action` (the episode fails, score 0) when the returned object is: not length 2; not a
   container (`None`, a number); a string, bytes, mapping or set; a one-shot iterator or generator
-  (rejected without being advanced, so its code never runs); not 1-dimensional; or holds a value
+  (rejected without being advanced, so its code never runs); not 1-dimensional (an object that
+  declares `ndim` must declare exactly the `int` 1; any other type of `ndim` is rejected by its
+  class name, never compared or printed); or holds a value
   that is a bool, not real (complex, str), does not fit a float (e.g. `10**400`) or is NaN/±inf.
   The harness reads at most 3 items, so an endless or huge container fails fast. If the object's
   own code raises an `Exception` while it is inspected, iterated or converted, that is also
@@ -224,6 +232,11 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   `invalid_action`. Every message, `invalid_action` details included, names a class only by its
   real name, so no metaclass or `str`-subclass code runs while it is built.
   In-process runs are for trusted code; isolation from hostile code is the runner's job (Phase 3).
+- **Loading never crashes either.** Whatever a submission raises while it is imported, or while
+  its `make_controller` is looked up or its signature read (any `BaseException` except
+  `KeyboardInterrupt`, including `SystemExit`), `load_submission` raises `LoadError` with the
+  same `Type: message` detail, and the CLI exits 2 with that message, never a traceback. A load
+  that fails leaves no submission module behind in `sys.modules`.
 - Submission kinds: a `.py` file, or a directory with `controller.py` plus assets located via
   `Path(__file__).parent` (ONNX policies arrive in Phase 2). A directory may hold at most 50
   regular files and 20 MiB in total (enforced while reading); symlinks, special files,

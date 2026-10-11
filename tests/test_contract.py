@@ -410,6 +410,78 @@ class ClasslessList(list[float]):
         raise ZeroDivisionError("no class for you")
 
 
+SPOOFED_NAMES: list[str] = []  # every time a spoofing metaclass was asked its class's name
+
+
+class _SpoofingNameMeta(type):
+    """A metaclass whose ``__name__`` property answers with a lie (and records that it ran)."""
+
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]
+        SPOOFED_NAMES.append("asked")
+        return "Spoofed"
+
+
+class NamelessValueError(ValueError, metaclass=_HostileNameMeta):
+    """What ``float()`` may raise: a ValueError whose class will not say its name."""
+
+
+class SpoofedValueError(ValueError, metaclass=_SpoofingNameMeta):
+    """A ValueError whose class claims to be called ``Spoofed``."""
+
+
+class RenamedValueError(ValueError):
+    """A ValueError named by a ``str`` subclass that refuses to be formatted."""
+
+
+RenamedValueError.__name__ = CompareBomb("Renamed")
+
+
+def float_raising(exc: Exception) -> float:
+    """A real number whose ``__float__`` raises ``exc`` (the controller's own exception)."""
+
+    class Unconvertible(float):
+        def __float__(self) -> float:
+            raise exc
+
+    return Unconvertible(0.5)
+
+
+class Injected(str):
+    """A ``str`` subclass that, formatted or compared, writes its own text into a message."""
+
+    def __format__(self, spec: str) -> str:
+        return "I am a fake detail " * 3
+
+    def __ne__(self, other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
+
+
+class LyingInt(int):
+    """An int that claims to differ from everything and formats as a forged string."""
+
+    def __ne__(self, other: object) -> bool:
+        return True
+
+    def __format__(self, spec: str) -> str:
+        return "forged"
+
+    __hash__ = int.__hash__
+
+
+def with_ndim(ndim: object) -> list[float]:
+    """A valid 2-item list carrying an arbitrary ``ndim`` attribute."""
+
+    class Shaped(list[float]):
+        pass
+
+    shaped = Shaped([0.1, 0.2])
+    shaped.ndim = ndim  # type: ignore[attr-defined]
+    return shaped
+
+
 def read_action(build: Callable[[], object]) -> tuple[float, ...] | str:
     """``validate_action(build(), 2)``: the floats, or ``"ActionError: <message>"``.
 
@@ -443,6 +515,32 @@ def read_action(build: Callable[[], object]) -> tuple[float, ...] | str:
             lambda: ClasslessList([0.1, 0.2]),
             "ActionError: action could not be read: ZeroDivisionError",
         ),
+        (
+            lambda: [float_raising(NamelessValueError()), 0.0],
+            "ActionError: action[0] cannot be converted to a float: NamelessValueError",
+        ),
+        (
+            lambda: [0.0, float_raising(SpoofedValueError())],
+            "ActionError: action[1] cannot be converted to a float: SpoofedValueError",
+        ),
+        (
+            lambda: [float_raising(RenamedValueError()), 0.0],
+            "ActionError: action[0] cannot be converted to a float: Renamed",
+        ),
+        (
+            lambda: with_ndim(Injected("2")),
+            "ActionError: action must be 1-dimensional, got an ndim of type Injected",
+        ),
+        (
+            lambda: with_ndim(CompareBomb("2")),
+            "ActionError: action must be 1-dimensional, got an ndim of type CompareBomb",
+        ),
+        (
+            lambda: with_ndim(LyingInt(1)),
+            "ActionError: action must be 1-dimensional, got an ndim of type LyingInt",
+        ),
+        (lambda: with_ndim(2), "ActionError: action must be 1-dimensional, got ndim=2"),
+        (lambda: with_ndim(1), (0.1, 0.2)),
     ],
     ids=[
         "exception whose class name raises",
@@ -451,6 +549,14 @@ def read_action(build: Callable[[], object]) -> tuple[float, ...] | str:
         "real number named bool_ by a hostile str",
         "non-container named by a hostile str",
         "container whose __class__ raises",
+        "float() raises an exception whose class name raises",
+        "float() raises an exception whose metaclass lies about its name",
+        "float() raises an exception named by a hostile str",
+        "ndim that formats itself into the message",
+        "ndim that cannot be compared or formatted",
+        "int ndim that lies about its value",
+        "integer ndim of 2",
+        "integer ndim of 1",
     ],
 )
 def test_validate_action_names_classes_without_running_their_code(
@@ -458,7 +564,19 @@ def test_validate_action_names_classes_without_running_their_code(
 ) -> None:
     """The harness reads real class names and never runs metaclass or ``str``-subclass code; a
     float subclass is never mistaken for numpy's bool by its name."""
+    SPOOFED_NAMES.clear()
     assert read_action(build) == expected
+    assert SPOOFED_NAMES == []
+
+
+@pytest.mark.parametrize(
+    "action",
+    [[np.bool_(True), 0.0], np.array([True, False]), [True, 0.0]],
+    ids=["numpy bool item", "numpy bool array", "Python bool item"],
+)
+def test_validate_action_names_bools_as_bools(action: object) -> None:
+    """numpy's bool is not a ``numbers.Real``; it is still reported as a bool, by type."""
+    assert read_action(lambda: action) == "ActionError: action[0] is a bool, expected a number"
 
 
 def test_an_unnameable_failure_still_becomes_an_action_error(

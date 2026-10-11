@@ -111,6 +111,153 @@ def test_load_errors(tmp_path: Path, name: str, text: str, message: str) -> None
         load_submission(write(tmp_path, name, text))
 
 
+HOSTILE_IMPORT_PRELUDE = """
+import sys
+
+
+class Nameless(type):
+    @property
+    def __name__(cls):
+        raise RuntimeError("no name for you")
+
+
+class Liar(type):
+    @property
+    def __name__(cls):
+        sys.modules["topple_test_liar_ran"] = sys
+        return "Spoofed"
+
+
+class Bomb(str):
+    def __format__(self, spec):
+        raise RuntimeError("cannot format myself")
+
+    def __add__(self, other):
+        raise RuntimeError("cannot add myself")
+
+    def __radd__(self, other):
+        raise RuntimeError("cannot add myself")
+"""
+
+
+def load_error_message(path: Path) -> str:
+    """The ``LoadError`` message ``load_submission(path)`` raises, as an exact ``str``.
+
+    Anything else that escapes fails the test outside the ``except`` block, so pytest never has
+    to render a hostile exception itself.
+    """
+    try:
+        load_submission(path)
+    except LoadError as exc:
+        return str.__str__(exc.args[0])
+    except BaseException:
+        outcome = "raised something other than LoadError"
+    else:
+        outcome = "accepted it"
+    pytest.fail(f"load_submission {outcome}")
+
+
+HOSTILE_IMPORTS = {
+    "exception whose class name raises": (
+        "class Boom(Exception, metaclass=Nameless): pass\nraise Boom('why')\n",
+        "Boom: why",
+    ),
+    "exception whose metaclass lies about its name": (
+        "class Real(Exception, metaclass=Liar): pass\nraise Real('why')\n",
+        "Real: why",
+    ),
+    "exception whose __str__ raises": (
+        "class E(Exception):\n    def __str__(self):\n        raise ValueError\nraise E()\n",
+        "E: <str() failed>",
+    ),
+    "exception whose message is a hostile str": (
+        "class E(Exception):\n    def __str__(self):\n        return Bomb('why')\nraise E()\n",
+        "E: why",
+    ),
+    "exception named by a hostile str": (
+        "class E(Exception): pass\nE.__name__ = Bomb('Renamed')\nraise E('why')\n",
+        "Renamed: why",
+    ),
+    "sys.exit at import": ("sys.exit(7)\n", "SystemExit: 7"),
+    "GeneratorExit at import": ("raise GeneratorExit('stop')\n", "GeneratorExit: stop"),
+}
+
+
+@pytest.mark.parametrize(
+    ("body", "detail"), HOSTILE_IMPORTS.values(), ids=list(HOSTILE_IMPORTS.keys())
+)
+def test_a_hostile_import_failure_is_a_clean_load_error(
+    tmp_path: Path, body: str, detail: str
+) -> None:
+    """Contract §8 and spec H: whatever the submission raises while it is imported (any
+    ``BaseException`` but ``KeyboardInterrupt``), the loader raises ``LoadError`` naming the real
+    class, without running metaclass or ``str``-subclass code, so the CLI never shows a
+    traceback."""
+    sys.modules.pop("topple_test_liar_ran", None)
+    path = write(tmp_path, "hostile.py", HOSTILE_IMPORT_PRELUDE + body)
+    assert load_error_message(path) == f"importing hostile.py failed: {detail}"
+    assert "topple_test_liar_ran" not in sys.modules
+
+
+def test_keyboard_interrupt_at_import_still_stops_the_run(tmp_path: Path) -> None:
+    with pytest.raises(KeyboardInterrupt):
+        load_submission(write(tmp_path, "ctrl_c.py", "raise KeyboardInterrupt\n"))
+
+
+HOSTILE_FACTORIES = {
+    "module whose attribute lookup raises": (
+        "import sys, types\n"
+        "class M(types.ModuleType):\n"
+        "    def __getattribute__(self, name):\n"
+        "        raise RuntimeError('no attributes for you')\n"
+        "sys.modules[__name__].__class__ = M\n",
+        "reading make_controller from hostile.py failed: RuntimeError: no attributes for you",
+    ),
+    "factory whose signature raises": (
+        "class Factory:\n"
+        "    @property\n"
+        "    def __signature__(self):\n"
+        "        raise ZeroDivisionError('no signature for you')\n"
+        "    def __call__(self, spec):\n"
+        "        return None\n"
+        "make_controller = Factory()\n",
+        "make_controller in hostile.py has no usable signature: "
+        "ZeroDivisionError: no signature for you",
+    ),
+    "factory whose signature exits": (
+        "import sys\n"
+        "class Factory:\n"
+        "    @property\n"
+        "    def __signature__(self):\n"
+        "        sys.exit(3)\n"
+        "    def __call__(self, spec):\n"
+        "        return None\n"
+        "make_controller = Factory()\n",
+        "make_controller in hostile.py has no usable signature: SystemExit: 3",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("text", "message"), HOSTILE_FACTORIES.values(), ids=list(HOSTILE_FACTORIES.keys())
+)
+def test_a_hostile_factory_lookup_is_a_clean_load_error(
+    tmp_path: Path, text: str, message: str
+) -> None:
+    """Finding and inspecting ``make_controller`` runs submission code too; whatever it raises
+    becomes ``LoadError``, and the half-loaded module is not left in ``sys.modules``."""
+    before = set(sys.modules)
+    assert load_error_message(write(tmp_path, "hostile.py", text)) == message
+    assert [name for name in sys.modules if name not in before] == []
+
+
+def test_a_submission_without_a_factory_leaves_no_module_behind(tmp_path: Path) -> None:
+    before = set(sys.modules)
+    message = load_error_message(write(tmp_path, "nofactory.py", "x = 'only here'\n"))
+    assert message == "nofactory.py must define make_controller(spec)"
+    assert [name for name in sys.modules if name not in before] == []
+
+
 def test_factory_returning_non_controller(tmp_path: Path) -> None:
     sub = load_submission(write(tmp_path, "bad.py", "def make_controller(spec):\n    return 42\n"))
     with pytest.raises(LoadError, match="lacks reset"):
@@ -166,18 +313,39 @@ def test_a_non_controller_is_named_by_its_real_class_name(tmp_path: Path) -> Non
         sub.factory(SPEC)
 
 
+DYNAMIC = """
+import types
+
+
+class Dynamic:
+    \"\"\"Answers every attribute dynamically: a static lookup finds no reset or act.\"\"\"
+
+    def __getattr__(self, name):
+        return lambda *args: (0.0, 0.0)
+
+
+class Exploding:
+    \"\"\"Any dynamic attribute read raises: the static lookup never triggers it.\"\"\"
+
+    def __getattribute__(self, name):
+        raise RuntimeError("dynamic lookup ran")
+"""
+
+
 @pytest.mark.parametrize(
     "returned",
     [
         "types.SimpleNamespace(reset=lambda seed: None, act=lambda obs: (0.0, 0.0))",
         "types.SimpleNamespace(reset=lambda seed: None)",
+        "Dynamic()",
+        "Exploding()",
     ],
-    ids=["instance attributes", "act missing"],
+    ids=["instance attributes", "act missing", "only __getattr__", "raising __getattribute__"],
 )
 def test_controller_methods_may_live_on_the_instance(tmp_path: Path, returned: str) -> None:
     """Methods are looked up as ``isinstance(x, Controller)`` would (statically, instance dict
     included), only without reading ``__class__``."""
-    text = f"import types\n\ndef make_controller(spec):\n    return {returned}\n"
+    text = DYNAMIC + f"\n\ndef make_controller(spec):\n    return {returned}\n"
     sub = load_submission(write(tmp_path, "ns.py", text))
     if "act=" in returned:
         assert isinstance(sub.factory(SPEC), Controller)

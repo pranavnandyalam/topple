@@ -252,6 +252,31 @@ TETHER = (
 )
 
 
+FLEX_TETHER = (
+    '<deformable><flex name="tether" dim="1" body="world chassis" vertex="0 0 0.6 0 0 0.10"'
+    ' element="0 1"><edge stiffness="2000" damping="50"/><contact contype="0" conaffinity="0"/>'
+    "</flex></deformable>"
+)
+ROBOT_FLEX = FLEX_TETHER.replace('name="tether"', 'name="bumper"').replace(
+    'body="world chassis" vertex="0 0 0.6 0 0 0.10"',
+    'body="chassis left_wheel_body" vertex="0 0 0.10 0 0 0"',
+)
+# A soft block with no passive forces of its own: MuJoCo warns that it is not rigid.
+SOFT_BLOCK_WARNING = "ignore:flex 'soft' is not rigid:UserWarning"
+SOFT_BLOCK = (
+    '<flexcomp name="soft" type="grid" count="2 2 2" spacing="0.02 0.02 0.02" pos="0 0 0.3"'
+    ' dim="3" dof="trilinear" mass="0.01"><contact contype="0" conaffinity="0"'
+    ' selfcollide="none"/><edge equality="false"/><pin id="0"/>'
+    "</flexcomp>"
+)
+ROTATED_LEFT_WHEEL = [
+    (LEFT_BODY, LEFT_BODY.replace('">', '" zaxis="0 1 0">')),
+    (LEFT_JOINT, LEFT_JOINT.replace('axis="0 1 0"', 'axis="0 0 1"')),
+]
+LEFT_TIRE_SIZED = LEFT_TIRE + ' size="0.034 0.013"'
+RIGHT_TIRE_SIZED = RIGHT_TIRE + ' size="0.034 0.013"'
+
+
 def free_root(attrs: str) -> str:
     """The root as an explicit free joint carrying ``attrs`` (``<freejoint>`` takes none)."""
     return f'<joint name="root" type="free" {attrs}/>'
@@ -374,6 +399,39 @@ VIOLATIONS = {
         [(LEFT_TIRE + ' size="0.034 0.013" zaxis="0 1 0"', LEFT_TIRE + ' size="0.034 0.013"')],
         "tire of 'left_wheel' must lie along its hinge axis",
     ),
+    "tethered by a flex": (
+        [("</worldbody>", "</worldbody>" + FLEX_TETHER)],
+        "flex 'tether' is tied to the world",
+    ),
+    "interpolated flex pinned to the world": (
+        [(WORLD_END, SOFT_BLOCK + "\n" + WORLD_END)],
+        "flex 'soft' is tied to the world",
+    ),
+    "eccentric cylinder tire": (
+        [(LEFT_TIRE_SIZED, LEFT_TIRE_SIZED + ' pos="0.02 0 0"')],
+        "tire of 'left_wheel' must be centred on its hinge axis",
+    ),
+    "eccentric sphere tire": (
+        [
+            (
+                LEFT_TIRE_SIZED + ' zaxis="0 1 0"',
+                '<geom name="left_tire" type="sphere" size="0.034"',
+            ),
+            (
+                RIGHT_TIRE_SIZED + ' zaxis="0 1 0"',
+                '<geom name="right_tire" type="sphere" size="0.034" pos="0 0 0.01"',
+            ),
+        ],
+        "tire of 'right_wheel' must be centred on its hinge axis",
+    ),
+    "hinge off the tire centre": (
+        [(LEFT_JOINT, LEFT_JOINT.replace("/>", ' pos="0.02 0 0"/>'))],
+        "tire of 'left_wheel' must be centred on its hinge axis",
+    ),
+    "tire left along y on a rotated wheel body": (
+        ROTATED_LEFT_WHEEL,
+        "tire of 'left_wheel' must lie along its hinge axis",
+    ),
     "tilted capsule tire": (
         [
             (
@@ -386,6 +444,7 @@ VIOLATIONS = {
 }
 
 
+@pytest.mark.filterwarnings(SOFT_BLOCK_WARNING)
 @pytest.mark.parametrize(("edits", "message"), VIOLATIONS.values(), ids=VIOLATIONS.keys())
 def test_validate_reports_each_violation(
     params: RobotParams, tmp_path: Path, edits: list[tuple[str, str]], message: str
@@ -607,6 +666,75 @@ def test_nested_includes_resolve_against_the_model_directory(
     assert robot_hash(path, params) != before
 
 
+def submodel_robot(robot_dir: Path, part_compiler: str = "") -> Path:
+    """A robot that attaches ``parts/part.xml`` (an ``<asset><model>``), which has its own mesh.
+
+    MuJoCo loads a sub-model like a model of its own: its files resolve against its directory
+    and its own ``<compiler>``, never against the top-level MJCF's.
+    """
+    parts = robot_dir / "parts"
+    parts.mkdir(parents=True, exist_ok=True)
+    (parts / "part.xml").write_text(
+        f'<mujoco><compiler angle="radian" {part_compiler}/>'
+        '<asset><mesh name="m" file="mesh.obj"/></asset>'
+        '<worldbody><body name="pb"><geom type="mesh" mesh="m" contype="0" conaffinity="0"'
+        ' mass="0.001"/></body></worldbody></mujoco>\n'
+    )
+    compiler = '<compiler angle="radian" autolimits="true"/>'
+    xml = (
+        ROBOT_XML.read_text()
+        .replace(compiler, compiler + '<asset><model name="part" file="parts/part.xml"/></asset>')
+        .replace('<site name="imu"', '<attach model="part" body="pb" prefix="p_"/><site name="imu"')
+    )
+    path = robot_dir / "balancer.xml"
+    path.write_text(xml)
+    return path
+
+
+SUBMODEL_LAYOUTS = {
+    "next to the sub-model": ("", "parts/mesh.obj"),
+    "sub-model meshdir": ('meshdir="pm"', "parts/pm/mesh.obj"),
+}
+
+
+@pytest.mark.parametrize(
+    ("part_compiler", "mesh_rel"), SUBMODEL_LAYOUTS.values(), ids=SUBMODEL_LAYOUTS.keys()
+)
+def test_robot_hash_covers_the_files_of_an_attached_sub_model(
+    params: RobotParams, tmp_path: Path, part_compiler: str, mesh_rel: str
+) -> None:
+    path = submodel_robot(tmp_path / "robot", part_compiler)
+    base = path.parent
+    mesh = base / mesh_rel
+    mesh.parent.mkdir(parents=True, exist_ok=True)
+    mesh.write_text(MESH)
+    for decoy in ("mesh.obj", "pm/mesh.obj"):  # where a resolver using the top level would look
+        (base / decoy).parent.mkdir(parents=True, exist_ok=True)
+        (base / decoy).write_text(MESH)
+    model = build_model(path, SCENE_XML, params)
+    assert validate_robot(model) == []
+    assert referenced_files(path) == tuple(
+        sorted([(base / "parts" / "part.xml").resolve(), mesh.resolve()])
+    )
+    before = robot_hash(path, params)
+    mesh.write_text(MESH.replace("0.01", "0.05"))
+    assert robot_hash(path, params) != before
+    mesh.unlink()  # MuJoCo needs exactly this file: the decoys do not stand in for it
+    with pytest.raises(ValueError, match=r"mesh\.obj"):
+        build_model(path, SCENE_XML, params)
+    with pytest.raises(FileNotFoundError, match=r"mesh\.obj"):
+        robot_hash(path, params)
+
+
+def test_sub_models_that_attach_each_other_are_hashed_once(tmp_path: Path) -> None:
+    """Two sub-models naming each other cannot send ``referenced_files`` round in circles."""
+    a = tmp_path / "a.xml"
+    b = tmp_path / "b.xml"
+    a.write_text('<mujoco><asset><model name="b" file="b.xml"/></asset></mujoco>\n')
+    b.write_text('<mujoco><asset><model name="a" file="a.xml"/></asset></mujoco>\n')
+    assert referenced_files(a) == tuple(sorted([a.resolve(), b.resolve()]))
+
+
 def test_robot_hash_refuses_missing_referenced_files(params: RobotParams, tmp_path: Path) -> None:
     path = mesh_robot(tmp_path)
     (path.parent / "assets" / "logo.obj").unlink()
@@ -664,6 +792,7 @@ def test_validate_reports_wheel_and_site_problems(
     assert any(message in p for p in validate_robot(model)), validate_robot(model)
 
 
+@pytest.mark.filterwarnings(SOFT_BLOCK_WARNING)
 @pytest.mark.parametrize(
     "edits",
     [
@@ -702,6 +831,26 @@ def test_validate_reports_wheel_and_site_problems(
             ),
             ("</worldbody>", "</worldbody>" + TETHER),
         ],
+        [*ROTATED_LEFT_WHEEL, (LEFT_TIRE_SIZED + ' zaxis="0 1 0"', LEFT_TIRE_SIZED)],
+        [(LEFT_TIRE_SIZED + ' zaxis="0 1 0"', LEFT_TIRE_SIZED + ' zaxis="0 1 0.0001"')],
+        [(LEFT_JOINT, LEFT_JOINT.replace("/>", ' pos="0 0.01 0"/>'))],
+        [
+            (
+                "</worldbody>",
+                '</worldbody><tendon><fixed name="diff"><joint joint="left_wheel" coef="1"/>'
+                '<joint joint="right_wheel" coef="-1"/></fixed></tendon>',
+            )
+        ],
+        [
+            (
+                "</worldbody>",
+                '</worldbody><tendon><spatial name="block"><site site="imu"/>'
+                '<site site="push_point"/><pulley divisor="2"/><site site="push_point"/>'
+                '<site site="imu"/></spatial></tendon>',
+            )
+        ],
+        [("</worldbody>", "</worldbody>" + ROBOT_FLEX)],
+        [('<site name="imu"', SOFT_BLOCK + '<site name="imu"')],
     ],
     ids=[
         "flipped cylinder axis",
@@ -710,6 +859,13 @@ def test_validate_reports_wheel_and_site_problems(
         "radii within tolerance",
         "explicit zero root properties",
         "tendon between robot sites",
+        "rotated wheel body with its tire along the hinge",
+        "cylinder axis within tolerance",
+        "hinge placed further along the axle",
+        "fixed tendon coupling the wheels",
+        "pulley between robot sites",
+        "flex between robot bodies",
+        "interpolated flex on the robot",
     ],
 )
 def test_validate_accepts_variants_that_can_still_fall(
@@ -744,7 +900,15 @@ def test_validate_reports_a_tendon_wrapped_around_a_scene_geom(
 
 
 @pytest.mark.parametrize(
-    "case", ["damped root", "root with armature", "tethered by a tendon", "vertical cylinder tire"]
+    "case",
+    [
+        "damped root",
+        "root with armature",
+        "tethered by a tendon",
+        "tethered by a flex",
+        "vertical cylinder tire",
+        "eccentric cylinder tire",
+    ],
 )
 def test_the_env_refuses_a_robot_that_cannot_fall_or_misstates_its_radius(
     tmp_path: Path, case: str

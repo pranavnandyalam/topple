@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
+import topple.contract as contract_module
 import topple.evaluate as evaluate_module
 from topple.challenge import load_challenge_dir
 from topple.contract import BalancerObs, TaskSpec, controller_obs
@@ -503,7 +504,7 @@ def test_an_undescribable_exception_still_becomes_an_error(
     def explode(exc: BaseException) -> str:
         raise MemoryError
 
-    monkeypatch.setattr(evaluate_module, "_exception_detail", explode)
+    monkeypatch.setattr(contract_module, "_exception_detail", explode)
     run = run_contained(lambda spec: Explodes(2, RuntimeError("x")))
     assert run.result.error is not None
     assert run.result.error.code == "exception"
@@ -551,7 +552,7 @@ def test_keyboard_interrupt_while_describing_an_exception_still_stops_the_run(
     def interrupted(exc: BaseException) -> str:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(evaluate_module, "_exception_detail", interrupted)
+    monkeypatch.setattr(contract_module, "_exception_detail", interrupted)
     with pytest.raises(KeyboardInterrupt):
         run_episode(
             BalanceEnv("ideal", record=True),

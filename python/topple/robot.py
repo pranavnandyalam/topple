@@ -47,8 +47,10 @@ AXIAL_TIRE_TYPES = frozenset(
     int(t) for t in (mujoco.mjtGeom.mjGEOM_CYLINDER, mujoco.mjtGeom.mjGEOM_CAPSULE)
 )
 AXIS_TOLERANCE = 1e-6  # |cos| of the angle between two axes that count as parallel, minus 1
+TIRE_CENTRE_TOLERANCE_M = 1e-6  # how far a tire's centre may sit from its hinge axis line
 _FILE_ATTRS = ("file", "fileright", "fileleft", "fileup", "filedown", "filefront", "fileback")
 _MESH_DIR_TAGS = frozenset({"mesh", "skin", "hfield"})  # MuJoCo resolves these via meshdir
+_SUBMODEL_TAG = "model"  # <asset><model file="..."/>: a whole MJCF that <attach> places
 
 
 class _Frozen(BaseModel):
@@ -141,8 +143,27 @@ def referenced_files(xml_path: Path) -> tuple[Path, ...]:
     """Every file an MJCF references, resolved the way MuJoCo resolves it, sorted.
 
     Covers ``<include>`` (recursively), meshes, skins and height fields (``meshdir``), textures
-    including cube faces (``texturedir``), and any other element with a ``file`` attribute
-    (relative to the model's directory). A missing file raises ``FileNotFoundError``.
+    including cube faces (``texturedir``), sub-models (``<asset><model file>``) together with every
+    file *they* reference, and any other element with a ``file`` attribute (relative to the
+    model's directory). A missing file raises ``FileNotFoundError``.
+    """
+    return tuple(sorted(_model_files(xml_path, frozenset({xml_path.resolve()}))))
+
+
+def _asset_subdir(tag: str, meshdir: str, texturedir: str) -> str:
+    """The compiler directory MuJoCo resolves an element's ``file`` against."""
+    if tag in _MESH_DIR_TAGS:
+        return meshdir
+    return texturedir if tag == "texture" else ""
+
+
+def _model_files(xml_path: Path, models: frozenset[Path]) -> frozenset[Path]:
+    """The files the MJCF at ``xml_path`` references, sub-models' files included.
+
+    MuJoCo loads a sub-model (``<asset><model file>``, found relative to this model's directory)
+    as a model of its own: its files resolve against *its* directory and *its* ``<compiler>``, so
+    it is walked the same way. ``models`` holds the sub-models on the current path, so two that
+    name each other are each listed but walked once.
     """
     model_dir = xml_path.parent
     includes: set[Path] = set()
@@ -153,18 +174,13 @@ def referenced_files(xml_path: Path) -> tuple[Path, ...]:
         for element in tree.iter():
             if element.tag in ("include", "compiler"):
                 continue
-            subdir = (
-                meshdir
-                if element.tag in _MESH_DIR_TAGS
-                else texturedir
-                if element.tag == "texture"
-                else ""
-            )
-            for attr in _FILE_ATTRS:
-                name = element.get(attr)
-                if name:
-                    found.add(_resolve(model_dir, subdir, name, xml_path))
-    return tuple(sorted(found))
+            subdir = _asset_subdir(element.tag, meshdir, texturedir)
+            for name in filter(None, (element.get(attr) for attr in _FILE_ATTRS)):
+                target = _resolve(model_dir, subdir, name, xml_path)
+                found.add(target)
+                if element.tag == _SUBMODEL_TAG and target not in models:
+                    found |= _model_files(target, models | {target})
+    return frozenset(found)
 
 
 def _framed(data: bytes) -> bytes:
@@ -406,23 +422,38 @@ def _parallel(a: npt.ArrayLike, b: npt.ArrayLike) -> bool:
     return abs(abs(cos) - 1.0) <= AXIS_TOLERANCE
 
 
+def _off_axis_m(model: mujoco.MjModel, geom: int, joint: int) -> float:
+    """Distance of the geom's centre from the hinge axis line (through ``jnt_pos`` along
+    ``jnt_axis``). All three are in the wheel body's frame."""
+    offset = np.asarray(model.geom_pos[geom], dtype=np.float64) - model.jnt_pos[joint]
+    axis = np.asarray(model.jnt_axis[joint], dtype=np.float64)
+    return float(np.linalg.norm(np.cross(offset, axis)) / np.linalg.norm(axis))
+
+
 def _tire_problems(model: mujoco.MjModel, name: str, joint: int) -> list[str]:
-    """The wheel body's one collision geom is a tire that rolls on radius ``size[0]``."""
+    """The wheel body's one collision geom is a tire that rolls on radius ``size[0]``: a
+    cylinder, sphere or capsule, centred on the hinge axis, with any axis of its own along it."""
     tires = _collision_geoms(model, int(model.jnt_bodyid[joint]))
     if len(tires) != 1:
         return [f"wheel body of '{name}' must have exactly one collision geom, got {len(tires)}"]
-    kind = int(model.geom_type[tires[0]])
+    tire = tires[0]
+    kind = int(model.geom_type[tire])
     if kind not in TIRE_TYPES:
         return [f"tire of '{name}' must be a cylinder, sphere or capsule"]
+    problems: list[str] = []
     # jnt_axis and the geom frame are both in the wheel body's frame.
-    if kind in AXIAL_TIRE_TYPES and not _parallel(
-        _geom_axis(model, tires[0]), model.jnt_axis[joint]
-    ):
-        return [
+    if kind in AXIAL_TIRE_TYPES and not _parallel(_geom_axis(model, tire), model.jnt_axis[joint]):
+        problems.append(
             f"tire of '{name}' must lie along its hinge axis: a cylinder or capsule tire rolls "
             "on radius size[0] only when its z axis is the hinge axis"
-        ]
-    return []
+        )
+    off_axis = _off_axis_m(model, tire, joint)
+    if off_axis > TIRE_CENTRE_TOLERANCE_M:
+        problems.append(
+            f"tire of '{name}' must be centred on its hinge axis: its centre is {off_axis:g} m "
+            "off it, so it would roll as a cam, not on radius size[0]"
+        )
+    return problems
 
 
 TIRE_RADIUS_TOLERANCE_M = 1e-9
@@ -504,7 +535,7 @@ def _world_problems(model: mujoco.MjModel, chassis: int, scene_geoms: frozenset[
         if model.site_bodyid[site] == 0:
             name = _name(model, mujoco.mjtObj.mjOBJ_SITE, site)
             problems.append(f"world site '{name}' is not allowed; it could anchor the robot")
-    return problems + _tendon_problems(model, chassis)
+    return problems + _tendon_problems(model, chassis) + _flex_problems(model, chassis)
 
 
 def _wrap_body(model: mujoco.MjModel, wrap: int) -> int | None:
@@ -529,6 +560,32 @@ def _tendon_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
             name = _name(model, mujoco.mjtObj.mjOBJ_TENDON, tendon)
             problems.append(f"tendon '{name}' is tied to the world; tendons must stay on the robot")
     return problems
+
+
+def _span(start: int, count: int) -> slice:
+    return slice(int(start), int(start) + int(count))
+
+
+def _flex_bodies(model: mujoco.MjModel, flex: int) -> set[int]:
+    """Every body a flex's vertices or nodes move with.
+
+    An interpolated flex (``dof="trilinear"``) moves with its nodes and lists its vertices'
+    bodies as -1, so both tables are read and the -1 placeholders dropped.
+    """
+    verts = model.flex_vertbodyid[_span(model.flex_vertadr[flex], model.flex_vertnum[flex])]
+    nodes = model.flex_nodebodyid[_span(model.flex_nodeadr[flex], model.flex_nodenum[flex])]
+    return {int(b) for b in (*verts, *nodes) if b >= 0}
+
+
+def _flex_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
+    """A deformable flex may only join parts of the robot: one with a vertex on the world body
+    (or any body outside the robot) is an elastic tether that can hold the robot up."""
+    return [
+        f"flex '{_name(model, mujoco.mjtObj.mjOBJ_FLEX, flex)}' is tied to the world; "
+        "flexes must stay on the robot"
+        for flex in range(model.nflex)
+        if any(model.body_rootid[b] != chassis for b in _flex_bodies(model, flex))
+    ]
 
 
 def validate_robot(

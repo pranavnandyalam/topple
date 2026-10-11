@@ -146,6 +146,42 @@ def class_name(value: object) -> str:
     return str.__str__(_TYPE_NAME.__get__(type(value), type))
 
 
+UNDESCRIBABLE = "<exception could not be described>"
+
+
+def _exception_detail(exc: BaseException) -> str:
+    """``Type: message`` as plain ``str``s, whatever the exception's own code does.
+
+    The class name comes from ``class_name`` and the message is copied to an exact ``str`` with
+    ``str.__str__``, so no method the untrusted code defined (a metaclass ``__name__``, a ``str``
+    subclass's ``__format__``, ``__str__`` or ``__radd__``) runs while the detail is assembled.
+    Only the exception's own ``__str__`` runs, and its failure is reported, not raised.
+    """
+    name = class_name(exc)
+    try:
+        message = str(exc)
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        message = "<str() failed>"
+    return name + ": " + str.__str__(message)
+
+
+def describe_exception(exc: BaseException) -> str:
+    """``Type: message`` for an exception raised by untrusted code (contract §8).
+
+    Never raises, except ``KeyboardInterrupt``: if even the description fails (a ``MemoryError``
+    copying a gigantic message), the result is ``UNDESCRIBABLE``. The harness and the loader
+    describe every untrusted exception through this.
+    """
+    try:
+        return _exception_detail(exc)
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        return UNDESCRIBABLE
+
+
 class ActionError(ValueError):
     """The controller returned something that is not a valid action."""
 
@@ -201,9 +237,7 @@ def _read_action(action: object, dim: int) -> tuple[float, ...]:
         raise ActionError(
             f"action must be a sequence of {dim} numbers, not a one-shot generator or iterator"
         )
-    ndim = getattr(action, "ndim", None)
-    if ndim is not None and ndim != 1:
-        raise ActionError(f"action must be 1-dimensional, got ndim={ndim}")
+    _check_ndim(getattr(action, "ndim", None))
     if not isinstance(action, Iterable):
         raise ActionError(f"action must be a sequence of {dim} numbers, got {class_name(action)}")
     items = list(itertools.islice(action, dim + 1))
@@ -212,6 +246,18 @@ def _read_action(action: object, dim: int) -> tuple[float, ...]:
     if len(items) != dim:
         raise ActionError(f"action must have exactly {dim} values, got {len(items)}")
     return tuple(_action_value(i, item) for i, item in enumerate(items))
+
+
+def _check_ndim(ndim: object) -> None:
+    """An action that declares ``ndim`` (a numpy array) must be 1-D. Only an exact ``int`` is
+    compared or printed: anything else is named by its real class, so a controller-supplied
+    ``ndim`` never runs its own ``__ne__`` or ``__format__`` (contract §7, §8)."""
+    if ndim is None:
+        return
+    if type(ndim) is not int:
+        raise ActionError(f"action must be 1-dimensional, got an ndim of type {class_name(ndim)}")
+    if ndim != 1:
+        raise ActionError(f"action must be 1-dimensional, got ndim={ndim}")
 
 
 def _action_value(index: int, item: object) -> float:
@@ -223,7 +269,7 @@ def _action_value(index: int, item: object) -> float:
         value = float(item)
     except (OverflowError, TypeError, ValueError) as exc:
         raise ActionError(
-            f"action[{index}] cannot be converted to a float: {type(exc).__name__}"
+            f"action[{index}] cannot be converted to a float: {class_name(exc)}"
         ) from exc
     if not math.isfinite(value):
         raise ActionError(f"action[{index}] is not finite: {value}")

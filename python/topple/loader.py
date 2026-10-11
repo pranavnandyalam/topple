@@ -18,7 +18,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from topple.contract import Controller, TaskSpec, class_name
+from topple.contract import Controller, TaskSpec, class_name, describe_exception
 
 ENTRY_FILE = "controller.py"
 FACTORY = "make_controller"
@@ -112,8 +112,12 @@ def submission_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _module_name(sha: str) -> str:
+    return f"topple_submission_{sha[:16]}"
+
+
 def _import(entry: Path, sha: str) -> ModuleType:
-    name = f"topple_submission_{sha[:16]}"
+    name = _module_name(sha)
     spec = importlib.util.spec_from_file_location(name, entry)
     if spec is None or spec.loader is None:
         raise LoadError(f"cannot import {entry}")
@@ -122,9 +126,12 @@ def _import(entry: Path, sha: str) -> ModuleType:
     stop_writing_bytecode()
     try:
         spec.loader.exec_module(module)
-    except Exception as exc:
+    except KeyboardInterrupt:
         sys.modules.pop(name, None)
-        raise LoadError(f"importing {entry.name} failed: {type(exc).__name__}: {exc}") from exc
+        raise
+    except BaseException as exc:  # SystemExit, GeneratorExit, ...: all the submission's fault
+        sys.modules.pop(name, None)
+        raise LoadError(f"importing {entry.name} failed: {describe_exception(exc)}") from exc
     return module
 
 
@@ -140,19 +147,30 @@ def stop_writing_bytecode() -> None:
     sys.dont_write_bytecode = True
 
 
+def _factory_arity(raw: Callable[..., Any]) -> tuple[int, bool]:
+    """(required positional parameters, whether there are any parameters) of ``raw``."""
+    parameters = list(inspect.signature(raw).parameters.values())
+    required = [
+        p
+        for p in parameters
+        if p.default is inspect.Parameter.empty
+        and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    return len(required), bool(parameters)
+
+
 def _wrap_factory(raw: Callable[..., Any], entry: Path) -> Callable[[TaskSpec], Controller[Any]]:
-    try:
-        params = [
-            p
-            for p in inspect.signature(raw).parameters.values()
-            if p.default is inspect.Parameter.empty
-            and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-        ]
-    except (TypeError, ValueError) as exc:
-        raise LoadError(f"{FACTORY} in {entry.name} has no usable signature") from exc
-    if len(params) > 1:
-        raise LoadError(f"{FACTORY} must take (spec) or no arguments, got {len(params)} required")
-    takes_spec = len(params) == 1 or bool(inspect.signature(raw).parameters)
+    try:  # a signature can run submission code (``__signature__``, ``__wrapped__``)
+        required, has_params = _factory_arity(raw)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:
+        raise LoadError(
+            f"{FACTORY} in {entry.name} has no usable signature: {describe_exception(exc)}"
+        ) from exc
+    if required > 1:
+        raise LoadError(f"{FACTORY} must take (spec) or no arguments, got {required} required")
+    takes_spec = required == 1 or has_params
 
     def factory(spec: TaskSpec) -> Controller[Any]:
         controller: Controller[Any] = raw(spec) if takes_spec else raw()
@@ -172,6 +190,19 @@ def _has_controller_methods(obj: object) -> bool:
     return all(inspect.getattr_static(obj, name, None) is not None for name in CONTROLLER_METHODS)
 
 
+def _factory_of(module: ModuleType, entry: Path) -> object:
+    """The module's ``make_controller`` (``None`` if absent). The module's own attribute lookup
+    may run submission code (a ``ModuleType`` subclass); whatever it raises is a ``LoadError``."""
+    try:
+        return getattr(module, FACTORY, None)
+    except KeyboardInterrupt:
+        raise
+    except BaseException as exc:
+        raise LoadError(
+            f"reading {FACTORY} from {entry.name} failed: {describe_exception(exc)}"
+        ) from exc
+
+
 def load_submission(path: Path) -> Submission:
     if path.is_symlink():
         raise LoadError(f"{path} is a symlink; submit the file or directory itself")
@@ -183,12 +214,19 @@ def load_submission(path: Path) -> Submission:
         raise LoadError(f"expected a .py file or a directory containing {ENTRY_FILE}")
     sha = submission_sha256(path)
     module = _import(entry, sha)
-    raw = getattr(module, FACTORY, None)
+    try:
+        factory = _factory(module, entry)
+    except LoadError:
+        sys.modules.pop(_module_name(sha), None)  # a failed load leaves nothing behind
+        raise
+    return Submission(
+        id=path.stem if path.is_file() else path.name, sha256=sha, entry=entry, factory=factory
+    )
+
+
+def _factory(module: ModuleType, entry: Path) -> Callable[[TaskSpec], Controller[Any]]:
+    """The submission's checked ``make_controller``, wrapped; ``LoadError`` if it has none."""
+    raw = _factory_of(module, entry)
     if not callable(raw):
         raise LoadError(f"{entry.name} must define {FACTORY}(spec)")
-    return Submission(
-        id=path.stem if path.is_file() else path.name,
-        sha256=sha,
-        entry=entry,
-        factory=_wrap_factory(raw, entry),
-    )
+    return _wrap_factory(raw, entry)

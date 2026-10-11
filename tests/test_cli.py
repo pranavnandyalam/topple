@@ -166,6 +166,32 @@ def test_load_error_exits_2(tmp_path: Path) -> None:
     assert "make_controller" in result.output
 
 
+@pytest.mark.parametrize(
+    ("text", "detail"),
+    [
+        ("import sys\nsys.exit(7)\n", "SystemExit: 7"),
+        (
+            "class Meta(type):\n"
+            "    @property\n"
+            "    def __name__(cls):\n"
+            "        raise RuntimeError('no name for you')\n"
+            "class Boom(Exception, metaclass=Meta):\n"
+            "    pass\n"
+            "raise Boom('at import')\n",
+            "Boom: at import",
+        ),
+    ],
+    ids=["sys.exit at import", "exception whose class name raises"],
+)
+def test_a_hostile_import_exits_2_without_a_traceback(
+    tmp_path: Path, text: str, detail: str
+) -> None:
+    result = runner.invoke(app, ["run", str(_submission(tmp_path, text)), "--no-video"])
+    assert result.exit_code == 2
+    assert f"importing bot.py failed: {detail}" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_bad_protocol_exits_2(tmp_path: Path) -> None:
     result = runner.invoke(
         app, ["run", str(_submission(tmp_path)), "--protocol", "balance-v1/hard", "--no-video"]

@@ -29,8 +29,8 @@ from topple.contract import (
     ActionError,
     Controller,
     TaskSpec,
-    class_name,
     controller_obs,
+    describe_exception,
     validate_action,
 )
 from topple.envs.balance import BalanceEnv
@@ -96,37 +96,6 @@ def wants_epilogue(termination_reason: str, has_error: bool) -> bool:
     return termination_reason in FALL_REASONS or has_error
 
 
-UNDESCRIBABLE = "<exception could not be described>"
-
-
-def _exception_detail(exc: BaseException) -> str:
-    """``Type: message`` as plain ``str``s, whatever the exception's own code does.
-
-    The class name comes from ``contract.class_name`` and the message is copied to an exact
-    ``str`` with ``str.__str__``, so no method the controller defined (a metaclass ``__name__``,
-    a ``str`` subclass's ``__format__``, ``__str__`` or ``__radd__``) runs while the detail is
-    assembled. Only the exception's ``__str__`` runs, and its failure is reported, not raised.
-    """
-    name = class_name(exc)
-    try:
-        message = str(exc)
-    except KeyboardInterrupt:
-        raise
-    except BaseException:
-        message = "<str() failed>"
-    return name + ": " + str.__str__(message)
-
-
-def _describe(exc: BaseException) -> str:
-    """Detail for an exception from untrusted code. Never raises, except ``KeyboardInterrupt``."""
-    try:
-        return _exception_detail(exc)
-    except KeyboardInterrupt:
-        raise
-    except BaseException:  # e.g. MemoryError from a gigantic message
-        return UNDESCRIBABLE
-
-
 def _error(code: str, step: int, detail: str) -> ErrorInfo:
     return ErrorInfo.model_validate({"code": code, "step": step, "detail": detail})
 
@@ -145,7 +114,7 @@ def _start_controller(
     except KeyboardInterrupt:
         raise
     except BaseException as exc:  # SystemExit, GeneratorExit, ...: all the controller's fault
-        return None, _error("exception", 0, _describe(exc))
+        return None, _error("exception", 0, describe_exception(exc))
     return controller, None
 
 
@@ -158,15 +127,15 @@ def _next_action(
     except KeyboardInterrupt:
         raise
     except BaseException as exc:
-        return _error("exception", step, _describe(exc))
+        return _error("exception", step, describe_exception(exc))
     try:
         return validate_action(raw, BALANCE_V1_ACTION.dim)
     except ActionError as exc:
-        return _error("invalid_action", step, _describe(exc))
+        return _error("invalid_action", step, describe_exception(exc))
     except KeyboardInterrupt:
         raise
     except BaseException as exc:  # the returned object's own code raised e.g. SystemExit
-        return _error("exception", step, _describe(exc))
+        return _error("exception", step, describe_exception(exc))
 
 
 def _control_loop(

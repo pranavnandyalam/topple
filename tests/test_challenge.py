@@ -172,3 +172,32 @@ def test_bundle_hash_covers_files_the_scene_references(bundle: Path) -> None:
     assert before == reference_bundle_hash(bundle, (*BUNDLE_FILES, "tiles.png"))
     tiles.write_bytes(b"second")
     assert load_challenge_dir(bundle).bundle_hash() != before
+
+
+def test_bundle_hash_covers_the_files_of_an_attached_sub_model(bundle: Path) -> None:
+    """A mesh used only by a robot sub-model (``<asset><model>``) is part of the bundle."""
+    robot = bundle / "robot" / "balancer.xml"
+    compiler = '<compiler angle="radian" autolimits="true"/>'
+    robot.write_text(
+        robot.read_text()
+        .replace(compiler, compiler + '<asset><model name="part" file="parts/part.xml"/></asset>')
+        .replace('<site name="imu"', '<attach model="part" body="pb" prefix="p_"/><site name="imu"')
+    )
+    parts = bundle / "robot" / "parts"
+    parts.mkdir()
+    (parts / "part.xml").write_text(
+        '<mujoco><asset><mesh name="m" file="mesh.obj"/></asset><worldbody><body name="pb">'
+        '<geom type="mesh" mesh="m" contype="0" conaffinity="0" mass="0.001"/></body>'
+        "</worldbody></mujoco>\n"
+    )
+    mesh = parts / "mesh.obj"
+    mesh.write_text(
+        "v 0 0 0\nv 0.01 0 0\nv 0 0.01 0\nv 0 0 0.01\nf 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n"
+    )
+    challenge = load_challenge_dir(bundle)
+    assert mesh.resolve() in challenge.bundle_files()
+    before = challenge.bundle_hash()
+    rels = (*BUNDLE_FILES, "robot/parts/part.xml", "robot/parts/mesh.obj")
+    assert before == reference_bundle_hash(bundle, rels)
+    mesh.write_text(mesh.read_text().replace("0.01", "0.02"))
+    assert load_challenge_dir(bundle).bundle_hash() != before
