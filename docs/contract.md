@@ -125,8 +125,9 @@ or its contacts with the floor, and the geometry the env relies on:
   as a cam.
 - the axle is the chassis y axis and the chassis origin is its midpoint (§2). A tire's centre in
   the chassis frame is its wheel body's `pos` plus the tire's `pos` rotated by the body's `quat`;
-  each has x and z within 1e-6 m of 0, the left one lies at y > 0 and the right one at y < 0,
-  and their y coordinates sum to 0 within 1e-6 m. A reset tilts the chassis about its origin by
+  each lies within 1e-6 m of the chassis y axis (`√(x² + z²) ≤ 1e-6` m, a distance: x and z of
+  0.8e-6 m each are 1.13e-6 m off), the left one at y > 0 and the right one at y < 0, and their
+  y coordinates sum to 0 within 1e-6 m. A reset tilts the chassis about its origin by
   the initial pitch and turns each wheel, relative to the chassis and forward positive (§2), at
   minus the initial pitch rate (§9): only on this axle do the tires then spawn touching the
   floor (§5) and start rolling without slip.

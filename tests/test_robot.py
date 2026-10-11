@@ -567,6 +567,14 @@ VIOLATIONS = {
         [(LEFT_BODY, '<body name="left_wheel_body" pos="0 0.08 0">')],
         "the chassis origin must be the axle midpoint",
     ),
+    # §3's tolerance is a distance from the axle, not a bound on x and z separately.
+    "tires 0.8e-6 m off the axle in both x and z": (
+        [
+            (LEFT_BODY, '<body name="left_wheel_body" pos="0.8e-6 0.07 0.8e-6">'),
+            (RIGHT_BODY, '<body name="right_wheel_body" pos="0.8e-6 -0.07 0.8e-6">'),
+        ],
+        "its centre is 1.13137e-06 m off it",
+    ),
     "tires crossed under their wheel bodies": (
         [
             (LEFT_BODY, '<body name="left_wheel_body" pos="0 0.01 0">'),
@@ -1235,6 +1243,10 @@ def test_validate_reports_wheel_and_site_problems(
         ROTATED_FLANGE_WHEELS,
         [after_body_tree(ROBOT_EXCLUDE)],
         [(CHASSIS_BODY, '<body name="chassis" pos="0.5 -0.3 0.034" euler="0 0 1">')],
+        [
+            (LEFT_BODY, '<body name="left_wheel_body" pos="0.6e-6 0.07 0.6e-6">'),
+            (RIGHT_BODY, '<body name="right_wheel_body" pos="0.6e-6 -0.07 0.6e-6">'),
+        ],
     ],
     ids=[
         "flipped cylinder axis",
@@ -1255,6 +1267,7 @@ def test_validate_reports_wheel_and_site_problems(
         "rotated wheel body with its tire offset along the axle",
         "contact exclude inside the robot (it only removes contacts the robot has with itself)",
         "chassis placed elsewhere on the floor and turned (a reset sets its orientation)",
+        "tires 0.85e-6 m off the axle (0.6e-6 m in both x and z)",
     ],
 )
 def test_validate_accepts_variants_that_can_still_fall(
