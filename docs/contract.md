@@ -503,14 +503,31 @@ else, including unreadable, truncated or missing files and corrupted members:
 - a regular file (symlinks are followed) of at most `MAX_FILE_BYTES = 33554432` bytes (32 MiB;
   an honest balance-v1 file is about 0.2 MB); a FIFO, device or directory is refused without
   blocking on it or reading from it;
-- a zip archive whose end-of-central-directory record ends the file (no archive comment, no
-  zip64 records, one disk) and whose central directory is at most `MAX_DIRECTORY_BYTES = 16384`
-  bytes (an honest one is under 1 KiB), checked before the directory is parsed: a file listing
-  thousands of entries is refused at the cost of reading its last 42 bytes;
-- exactly the 11 members above, no duplicates, each stored or deflated (no other compression
-  method, no encryption) and at most 16 MiB uncompressed as its directory entry declares.
-  Members are read at most 64 KiB at a time, so neither a size that lies nor a large read can
-  make decompression produce more than the read asked for;
+- a zip archive in the **canonical layout** numpy writes, the one layout every zip reader reads
+  alike. Python's `zipfile` finds the central directory from the end of the file and skips
+  whatever comes before the archive, a browser decoder (fflate) takes the stored offsets as they
+  are, and a streaming reader (libarchive reading a pipe) walks the local headers from byte 0:
+  on any other layout they can decode different trajectories from the same bytes. The members'
+  local headers and data lie back to back from byte 0, in directory order; the central
+  directory starts where the last member's data ends; the end-of-central-directory record
+  follows the directory and ends the file (no archive comment, no zip64 records, one disk, both
+  of its entry counts equal to the directory's). The directory is at most
+  `MAX_DIRECTORY_BYTES = 16384` bytes (an honest one is under 1 KiB), checked before it is
+  parsed: a file listing thousands of entries is refused at the cost of reading its last 42
+  bytes;
+- exactly the 11 members above, by their exact stored names (a name with anything after a NUL,
+  or with a backslash, is another name), no duplicates. Each is stored or deflated (no other
+  compression method), needs zip 4.5 at most to extract, is not encrypted, has no data
+  descriptor and no general-purpose flag but bits 1–2 (deflate options) and 11 (UTF-8 names),
+  has nothing in its directory entry beyond its name (no extra field, no comment), and is at
+  most 16 MiB uncompressed. Its local header agrees with its directory entry: the same name
+  bytes, flags, method, CRC-32 and sizes, the sizes given in the header itself or, as numpy
+  writes them, as 0xFFFFFFFF there and in a zip64 extra field that holds only the two sizes (no
+  other extra field). A stored member's compressed and uncompressed sizes are equal; a deflated
+  member is one deflate stream that ends exactly where its data ends and inflates to exactly its
+  declared size; either way its content matches its CRC-32. Members are read by hand, at most
+  64 KiB of data at a time, so neither a size that lies nor a large read can make decompression
+  produce more than the read asked for;
 - each an `.npy` of format 1.0 or 2.0 whose header is at most `MAX_NPY_HEADER_BYTES = 4096`
   bytes, checked before the header is read. The header text is parsed by the loader, never
   evaluated: exactly `{'descr': <str>, 'fortran_order': <bool>, 'shape': <tuple of ints>}` in
@@ -597,6 +614,10 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
 - **Untrusted input:** the uploaded `traj_*.npz`, loaded with
   `load_npz(path, max_steps=<the protocol's max_steps>)` (§14). It only supplies the commands to
   replay and the records the replay must reproduce bit for bit.
+- **Republishing.** Whoever stores or serves a verified episode (Phase 3's publish step, the
+  replay viewer) writes the verifier's own record, `verdict.replay.save_npz(...)`, never the
+  uploaded bytes. The canonical layout (§14) makes every zip reader decode an accepted upload
+  alike, but only the replay is a record the verifier made.
 
 **API** (`topple.verify`):
 

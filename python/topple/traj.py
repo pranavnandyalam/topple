@@ -15,7 +15,6 @@ import os
 import re
 import stat
 import struct
-import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -27,6 +26,7 @@ import numpy as np
 import numpy.typing as npt
 
 from topple._atomic import replacement
+from topple._zip import READ_CHUNK, Archive, MemberReader
 from topple.contract import BALANCE_V1_ACTION, FEATURES
 
 FORMAT = "topple.traj/1"
@@ -42,13 +42,6 @@ MAX_STATE_DIM = 256
 MAX_META_BYTES = 256 * 1024
 """Most bytes of ``meta_json`` (an honest one is a few KiB)."""
 META = "meta_json"
-_READ_CHUNK = 64 * 1024  # most bytes one read asks a zip member for
-_COMPRESSION = {zipfile.ZIP_STORED: "stored", zipfile.ZIP_DEFLATED: "deflated"}
-_ENCRYPTED = 0x1  # general purpose flag bit 0
-_END_RECORD = struct.Struct("<4s4H2LH")  # end of central directory, without its comment
-_END_SIGNATURE = b"PK\x05\x06"
-_ZIP64_LOCATOR = b"PK\x06\x07"
-_ZIP64_LOCATOR_BYTES = 20
 _NPY_MAGIC = b"\x93NUMPY"
 _NPY_LENGTH = {(1, 0): struct.Struct("<H"), (2, 0): struct.Struct("<I")}
 _NPY_HEADER = re.compile(
@@ -60,7 +53,6 @@ _NPY_HEADER = re.compile(
 """The header dict exactly as numpy writes it (key order fixed, whitespace and a trailing comma
 free): parsed here, never handed to a Python parser."""
 _NPY_DIM = re.compile(r"-?(?:0|[1-9][0-9]{0,18})", re.ASCII)
-_SHOWN_NAMES = 5  # unexpected member names quoted in an error
 _ALLOWED_DTYPES = {np.dtype("<f8"), np.dtype("<f4"), np.dtype("<i4"), np.dtype("|u1")}
 # name -> (dtype, fixed trailing shape, or None for the model-dependent nq / nv widths)
 _SCHEMA: dict[str, tuple[str, tuple[int, ...] | None]] = {
@@ -154,7 +146,7 @@ def load_npz(path: Path, *, max_steps: int) -> Trajectory:
 
     Nothing is unpickled or evaluated, and nothing is allocated beyond what the format allows:
     the file, its zip directory and every member are size-capped before they are parsed, only
-    stored or deflated members are read, at most ``_READ_CHUNK`` bytes at a time, and each npy
+    stored or deflated members are read, at most ``READ_CHUNK`` bytes at a time, and each npy
     header is parsed by hand and checked against the member's size and against the limits (T and
     E at most ``max_steps``, state widths at most ``MAX_STATE_DIM``, ``meta_json`` at most
     ``MAX_META_BYTES``) before any of its data is read. Any problem (including an unreadable or
@@ -182,7 +174,7 @@ def _guarded[R](path: Path, read: Callable[[], R]) -> R:
         raise
     except ValueError as exc:
         raise ValueError(f"{path.name}: {exc}") from exc
-    except Exception as exc:  # BadZipFile, OSError, RecursionError, zlib.error, EOFError, ...
+    except Exception as exc:  # OSError, struct.error, RecursionError, zlib.error, ...
         raise ValueError(
             f"{path.name}: not a readable {FORMAT} file ({type(exc).__name__})"
         ) from exc
@@ -211,98 +203,40 @@ def _open_regular(path: Path) -> tuple[IO[bytes], int]:
         raise
 
 
-def _check_end_record(fh: IO[bytes], size: int) -> None:
-    """Refuse an archive whose zip directory ``zipfile`` could not parse cheaply.
-
-    ``zipfile`` parses the whole central directory, one object per entry, before any member can
-    be checked, and it takes the directory's size from the end-of-central-directory record. That
-    record must end the file (no archive comment) with no zip64 locator before it, so
-    ``zipfile`` reads exactly the record checked here, and its directory must be at most
-    ``MAX_DIRECTORY_BYTES``.
-    """
-    tail = min(size, _END_RECORD.size + _ZIP64_LOCATOR_BYTES)
-    fh.seek(size - tail)
-    data = fh.read(tail)
-    if len(data) < _END_RECORD.size:
-        raise ValueError("not a zip archive")
-    signature, disk, directory_disk, _, _, directory_bytes, _, comment = _END_RECORD.unpack(
-        data[-_END_RECORD.size :]
-    )
-    if signature != _END_SIGNATURE or comment:
-        raise ValueError("not a zip archive whose end-of-central-directory record ends the file")
-    if len(data) == _END_RECORD.size + _ZIP64_LOCATOR_BYTES and data.startswith(_ZIP64_LOCATOR):
-        raise ValueError("zip64 archives are not allowed")
-    if disk or directory_disk:
-        raise ValueError("multi-disk zip archives are not allowed")
-    if directory_bytes > MAX_DIRECTORY_BYTES:
-        raise ValueError(
-            f"the zip central directory has {directory_bytes} bytes, more than "
-            f"{MAX_DIRECTORY_BYTES}"
-        )
-    fh.seek(0)
-
-
 @contextmanager
-def _open_members(path: Path) -> Iterator[zipfile.ZipFile]:
-    """The zip archive at ``path``, once its directory, member list and members are acceptable."""
+def _open_members(path: Path) -> Iterator[Archive]:
+    """The members of the trajectory file at ``path``: a regular file holding a zip archive in
+    the canonical layout (``topple._zip``, contract §14) with exactly the format's members."""
     fh, size = _open_regular(path)
     with fh:
-        _check_end_record(fh, size)
-        with zipfile.ZipFile(fh) as zf:
-            _check_members(zf.infolist())
-            yield zf
-
-
-def _check_members(infos: list[zipfile.ZipInfo]) -> None:
-    """Exactly the format's members, each stored or deflated, unencrypted and size-capped."""
-    names = [info.filename for info in infos]
-    if len(set(names)) != len(names):
-        raise ValueError("duplicate members")
-    if set(names) != _MEMBERS:
-        raise ValueError(f"unexpected members {_quoted(sorted(set(names) ^ _MEMBERS))}")
-    for info in infos:
-        if info.compress_type not in _COMPRESSION:
-            raise ValueError(
-                f"{info.filename}: compression method {info.compress_type} is not allowed "
-                f"(only {' or '.join(_COMPRESSION.values())})"
-            )
-        if info.flag_bits & _ENCRYPTED:
-            raise ValueError(f"{info.filename}: encrypted members are not allowed")
-        if info.file_size > MAX_MEMBER_BYTES:
-            raise ValueError(f"{info.filename} is too large ({info.file_size} bytes)")
-
-
-def _quoted(names: list[str]) -> str:
-    """The first few ``names``, escaped and shortened: they come from the untrusted archive."""
-    shown = ", ".join(_short_repr(name) for name in names[:_SHOWN_NAMES])
-    more = len(names) - _SHOWN_NAMES
-    return f"[{shown}]" + (f" and {more} more" if more > 0 else "")
-
-
-def _short_repr(name: str) -> str:
-    text = repr(name)
-    return text if len(text) <= 40 else text[:37] + "..."
+        yield Archive(
+            fh,
+            size,
+            _MEMBERS,
+            max_directory_bytes=MAX_DIRECTORY_BYTES,
+            max_member_bytes=MAX_MEMBER_BYTES,
+        )
 
 
 def _build(path: Path, max_steps: int) -> Trajectory:
-    with _open_members(path) as zf:
+    with _open_members(path) as archive:
         arrays = {
             name: _read_member(
-                zf, name, np.dtype(dtype), partial(_array_limits, name, max_steps=max_steps)
+                archive, name, np.dtype(dtype), partial(_array_limits, name, max_steps=max_steps)
             )
             for name, (dtype, _) in _SCHEMA.items()
         }
-        meta = _read_meta_member(zf)
+        meta = _read_meta_member(archive)
     return Trajectory(**arrays, meta=meta)
 
 
 def _read_meta_only(path: Path) -> dict[str, Any]:
-    with _open_members(path) as zf:
-        return _read_meta_member(zf)
+    with _open_members(path) as archive:
+        return _read_meta_member(archive)
 
 
-def _read_meta_member(zf: zipfile.ZipFile) -> dict[str, Any]:
-    return _parse_meta(_read_member(zf, META, np.dtype("|u1"), _meta_limits))
+def _read_meta_member(archive: Archive) -> dict[str, Any]:
+    return _parse_meta(_read_member(archive, META, np.dtype("|u1"), _meta_limits))
 
 
 def _array_limits(name: str, shape: tuple[int, ...], *, max_steps: int) -> None:
@@ -337,35 +271,39 @@ def _meta_limits(shape: tuple[int, ...]) -> None:
 
 
 def _read_member(
-    zf: zipfile.ZipFile,
+    archive: Archive,
     name: str,
     dtype: np.dtype[Any],
     limits: Callable[[tuple[int, ...]], None],
 ) -> npt.NDArray[Any]:
     """One ``.npy`` member, read by hand so a lying header can never trigger a big allocation:
-    its shape must pass ``limits`` and fit the bytes the member holds before any data is read."""
-    info = zf.getinfo(f"{name}.npy")
-    with zf.open(info) as fh:
-        shape = _read_header(fh, name, dtype)
-        limits(shape)
-        nbytes = math.prod(shape) * dtype.itemsize
-        if nbytes > info.file_size - fh.tell():
-            raise ValueError(f"{name}: header shape {shape} needs more data than the member holds")
-        data = _read_bounded(fh, nbytes)
-        if len(data) != nbytes or fh.read(1):
-            raise ValueError(f"{name}: member size does not match its header shape {shape}")
+    its shape must pass ``limits`` and need exactly the bytes the member holds before any data
+    is read, and the member must then end exactly there (``MemberReader.finish``)."""
+    member = archive.open(f"{name}.npy")
+    shape = _read_header(member, name, dtype)
+    limits(shape)
+    nbytes = math.prod(shape) * dtype.itemsize
+    left = member.size - member.tell()
+    if nbytes > left:
+        raise ValueError(f"{name}: header shape {shape} needs more data than the member holds")
+    if nbytes < left:
+        raise ValueError(f"{name}: member size does not match its header shape {shape}")
+    data = _read_bounded(member, nbytes)
+    if len(data) != nbytes:
+        raise ValueError(f"{name}: the member holds less data than its size declares")
+    member.finish()
     return np.frombuffer(data, dtype=dtype).reshape(shape)
 
 
-def _read_bounded(fh: IO[bytes], size: int) -> bytes:
-    """Up to ``size`` bytes of a zip member, asking for at most ``_READ_CHUNK`` at a time.
+def _read_bounded(fh: MemberReader, size: int) -> bytes:
+    """Up to ``size`` bytes of a zip member, asking for at most ``READ_CHUNK`` at a time.
 
     A deflated member inflates at most as many bytes as one read asks for, so no single read can
     balloon, whatever the member declares.
     """
     parts: list[bytes] = []
     while size > 0:
-        chunk = fh.read(min(size, _READ_CHUNK))
+        chunk = fh.read(min(size, READ_CHUNK))
         if not chunk:
             break
         parts.append(chunk)
@@ -373,7 +311,7 @@ def _read_bounded(fh: IO[bytes], size: int) -> bytes:
     return b"".join(parts)
 
 
-def _read_header(fh: IO[bytes], name: str, dtype: np.dtype[Any]) -> tuple[int, ...]:
+def _read_header(fh: MemberReader, name: str, dtype: np.dtype[Any]) -> tuple[int, ...]:
     """The shape in the npy header of member ``name``, which must hold C-ordered ``dtype``.
 
     The header's length is checked before the header is read, and its text is parsed here,

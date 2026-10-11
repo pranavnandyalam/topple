@@ -756,10 +756,15 @@ def central_entry(raw: bytes | bytearray, name: str) -> int:
 
 
 def declare_size(path: Path, name: str, size: int) -> None:
-    """Make the central directory lie about ``name``'s uncompressed size."""
+    """Make the archive lie about ``name``'s uncompressed size, consistently: in its central
+    directory entry and in its local header (written by ``zipfile`` with the sizes in the
+    header), so the lie passes the layout checks and reaches the member reader."""
     raw = bytearray(path.read_bytes())
     at = central_entry(raw, name)
     raw[at + 24 : at + 28] = size.to_bytes(4, "little")
+    header = int.from_bytes(raw[at + 42 : at + 46], "little")
+    assert raw[header : header + 4] == b"PK\x03\x04"
+    raw[header + 22 : header + 26] = size.to_bytes(4, "little")
     path.write_bytes(bytes(raw))
 
 
@@ -820,15 +825,17 @@ def test_a_huge_npy_header_length_is_refused_before_the_header_is_read(tmp_path:
 
 
 def test_a_lying_deflated_size_reads_only_what_it_declares(tmp_path: Path) -> None:
-    """A deflated member that holds far more than its directory entry declares: reading stops at
-    the declared size (then the CRC fails), and no read asks the stream for more than a small
-    chunk, so the 32 MiB behind it are never inflated."""
+    """A deflated member that holds far more than its sizes declare: reading stops at the
+    declared size, the stream must end there and does not, and no read asks the stream for more
+    than a small chunk, so the 32 MiB behind it are never inflated."""
     members = honest_members()
     qpos = members.pop("qpos.npy")
     path = tmp_path / "liar.npz"
     write_streamed(path, members, "qpos.npy", [qpos, *[bytes(1 << 20)] * 32], zipfile.ZIP_DEFLATED)
     declare_size(path, "qpos.npy", len(qpos))
     assert peak_traced(lambda: load_npz(path, max_steps=1000)) < 2_000_000
+    with pytest.raises(ValueError, match=r"qpos\.npy: the member inflates to more than its"):
+        load_npz(path, max_steps=1000)
 
 
 MINUS_CHAIN = "{'descr': '|u1', 'fortran_order': False, 'shape': (" + "-" * 9000 + "1,), }"
