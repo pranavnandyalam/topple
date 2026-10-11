@@ -51,6 +51,7 @@ from topple.traj import Trajectory
 
 ControllerFactory = Callable[[TaskSpec], Controller[Any]]
 EPILOGUE_S = 1.0
+SIM_UNSTABLE_DETAIL = "physics became unstable"
 FALL_REASONS = frozenset({"fell", "floor_contact"})
 
 
@@ -152,7 +153,7 @@ def _control_loop(
             return action
         obs_arr, _, terminated, truncated, info = env.step(action)
         if info["termination_reason"] == "sim_unstable":
-            return _error("sim_unstable", int(info["step"]), "physics became unstable")
+            return _error("sim_unstable", int(info["step"]), SIM_UNSTABLE_DETAIL)
         if terminated or truncated:
             return None
 

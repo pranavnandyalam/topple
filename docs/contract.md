@@ -323,14 +323,26 @@ impulse magnitude **[calibrated]** (target: reference LQR survives ≥ 80% and P
 
 ## 12. Metrics and score (`balance-v1`)
 
-Computed from the trajectory by a pure function (re-runnable on stored data):
+Computed from the trajectory by a pure function (`scoring.episode_metrics`), using only stored data,
+so every score is re-runnable on a `topple.traj/1` file. On the trusted path the trajectory is the
+verifier's own replay (§16), never an upload. With T steps, `qpos` rows 0..T−1 are the states the
+controller acted on and row T is the final (possibly terminal) state:
 
-- `upright_frac = steps_alive / max_steps`
-- `rms_tilt` over alive steps (true tilt angle, rad)
-- `drift_m` = final xy distance of the axle midpoint from its start; also `max_drift_m`
-- `energy_j` = Σ over substeps and wheels of `max(0, V_nom·i_stall·u·(u − ω/ω_noload))·dt`
-  (battery energy of an ideal DC motor in slow decay; computable from real logs)
-- `saturation_fraction` = fraction of steps where any |u| ≥ 0.99 after clipping
+- `upright_frac = T / max_steps`; `time_upright_s = T · control_dt`;
+  `survived` = the episode was truncated (`termination.reason == "timeout"` and `T == max_steps`)
+- `rms_tilt_rad`: root mean square of the true tilt angle (between body z and world z, from the
+  root quaternion) over the alive rows 0..T−1 only; the terminal row T never counts (row 0 alone
+  when T = 0). `max_tilt_rad` is the maximum over all rows 0..T
+- `drift_m` = planar (xy) distance of the root from row 0 at the final row T; `max_drift_m` = its
+  maximum over all rows
+- `energy_j`, per control step k and wheel i:
+  `Σ_k Σ_i max(0, V_nom·i_stall·u_i[k]·(u_i[k] − ω_i[k]/ω_noload))·control_dt`, where `u_i[k]` is
+  the clipped command `ctrl` of step k (as issued, before the native actuator delay) and
+  `ω_i[k] = (θ_i[k+1] − θ_i[k]) / control_dt` is the mean wheel speed over the step, from the
+  recorded chassis-relative wheel angles (`qpos` wheel columns times `wheel_sign`, so forward is
+  positive). This is the battery energy of an ideal DC motor in slow decay, summed exactly
+  (`math.fsum`); the same formula applies to real logs (commands plus encoder angles). 0 when T = 0
+- `saturation_fraction` = fraction of the T steps where any |u| ≥ 0.99 after clipping (0 when T = 0)
 
 Episode score (0–100):
 `100 · upright_frac · (0.6 + 0.2·(1 − min(rms_tilt/0.2, 1)) + 0.1·(1 − min(drift_m/1, 1))
@@ -341,8 +353,8 @@ baseline's median energy on `balance-v1/standard`, rounded, frozen.
 
 Protocol score = `fsum` of episode scores in seed order / N, and success rate = successes / N,
 where N is the number of episodes the protocol expects: a missing or errored episode counts as 0.
-Mean time upright is averaged over the episodes present. Ranking: round(score, 2), ties broken by
-success rate, then mean time upright.
+Mean time upright is averaged over the episodes present (those with metrics). Ranking: round(score,
+2), ties broken by success rate, then mean time upright.
 
 ## 13. Bump rule and hashes
 
@@ -378,27 +390,170 @@ pickles, no strings). Row `k` of state arrays is the state at `t = k·control_dt
 |---|---|---|---|
 | `qpos` | T+1 × nq | f8 | state; row T is the final/terminal state |
 | `qvel` | T+1 × nv | f8 | |
-| `obs` | T × 10 | f4 | exactly what the controller received |
-| `action` | T × 2 | f8 | raw controller output, before clipping |
+| `obs` | T × 10 | f4 | the features of observation k, exactly as the controller received them (§6) |
+| `action` | T × 2 | f8 | raw controller output, before clipping (validated, so finite) |
 | `ctrl` | T × 2 | f8 | clipped command issued at step k (before native delay) |
 | `enc_counts` | T × 2 | i4 | encoder counts after the step |
 | `gyro`, `accel` | T × 3 | f4 | last-substep IMU readings (after bias/noise) |
 | `push_force` | T × 3 | f8 | world-frame push force active during step k (0 if none) |
-| `epilogue_qpos` | E × nq | f8 | 1 s after termination, replay only |
-| `meta_json` | n | u1 | UTF-8 JSON: format, challenge, preset, episode_index, scenario, versions, robot_hash, wheel_sign, joint addresses, termination {step, reason}, error (if any), control_dt, timestep, frame_skip, max_steps, obs features |
+| `epilogue_qpos` | E × nq | f8 | the 1 s epilogue (E = 100) after a fall or a controller error (§11); E = 0 otherwise. Replay only |
+| `meta_json` | n | u1 | UTF-8 JSON: format, challenge, preset, episode_index, scenario, versions, robot_hash, wheel_sign, joint addresses, termination {step, reason}, error (null or {code, step, detail}), control_dt, timestep, frame_skip, max_steps, obs schema and features |
 
 If the controller errors at step `k`, the episode stops there (T = k) and the error is stored in
-`meta.error`. The env is a pure function of (protocol, scenario, ctrl sequence): `verify_episode` re-simulates
-open loop from `scenario` + `ctrl` and must reproduce `qpos` exactly on the same platform.
-Loading uses `allow_pickle=False`, an allow-list of keys, dtype checks, `T ≤ max_steps`, and a
-per-member size cap.
+`meta.error`. The env is a pure function of (protocol, scenario, ctrl sequence), so a trajectory
+can be re-simulated open loop and must reproduce exactly on the same platform and MuJoCo version.
+A trajectory file is untrusted data: nothing in it is ever scored directly; the trusted path
+verifies and re-scores it by replay (§16).
+
+**Loading** (`load_npz(path, *, max_steps)`; `max_steps` is required, so every caller bounds T)
+reads each member by hand and raises `ValueError`, naming the file, for anything else, including
+unreadable, truncated or missing files and corrupted members:
+
+- exactly the 11 members above, no duplicates, each at most 16 MiB uncompressed;
+- each an `.npy` of format 1.0 or 2.0, C order, the exact dtype of the table (no object arrays),
+  whose header shape needs exactly the bytes the member holds (a header can never make the
+  loader allocate more than the file contains);
+- the fixed trailing shapes of the table (`obs` 10; `action`, `ctrl`, `enc_counts` 2; `gyro`,
+  `accel`, `push_force` 3), `qpos`/`qvel` with T+1 rows and at least one column, `epilogue_qpos`
+  as wide as `qpos`;
+- `T ≤ max_steps`;
+- `meta_json` a UTF-8 JSON object with `"format": "topple.traj/1"` and no `NaN`/`Infinity`.
+
+`read_meta(path)` applies the same member checks and returns only the metadata.
 
 ## 15. Results `topple.results/1`
 
 `results.json` (pydantic, `extra="forbid"`, no NaN/Inf): format, challenge, protocol,
 protocol_hash, seed_set (`public`/`private`), versions (topple, mujoco, numpy, obs schema, action
-spec), platform, robot_hash, controller {id, sha256}, isolation (`inprocess`/`subprocess`/
-`container`; only `container` is rankable), complete, episodes [{index, success, score, metrics,
-error {code, step, detail}}], aggregate {score, success_rate, metrics}. Error codes: `exception`,
-`invalid_action`, `timeout`, `crash`, `protocol`, `output_limit`, `load_error`, `sim_unstable`.
-Private-seed results are redacted: no per-episode data, aggregate only.
+spec), platform, robot_hash, controller {id, sha256}, isolation, complete,
+episodes [{index, seed, success, score, metrics, error {code, step, detail}}],
+aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
+
+- **Error codes.** A run records `exception`, `invalid_action`, `timeout`, `crash`, `protocol`,
+  `output_limit`, `load_error` or `sim_unstable`. Only trusted verification (§16) assigns
+  `incomplete`, `not_reproducible` and `missing`. Every error scores 0.
+- **`complete`** is true only when every one of the protocol's N episodes is present and none is
+  `missing`. A single-seed `topple run` and a single-file `topple verify --out` write false.
+- **`isolation`** (`inprocess`/`subprocess`/`container`) records how the controller ran. It does
+  not make a run rankable: Phase 3 ranks only results produced by its trusted CI jobs.
+- **Bounds.** `controller.id`, `challenge` and `protocol`: 1–200 characters; `platform` and each
+  version string ≤ 64; `controller.sha256`, `protocol_hash` and `robot_hash`: 64 lowercase hex
+  digits. An error `detail` is untrusted text: it keeps at most 300 characters, and lone
+  surrogates and control characters other than `\n` and `\t` become U+FFFD (one for one, so
+  re-validating a stored detail changes nothing). Escape it before rendering.
+- **Cross-field checks.** Public results list their episodes with strictly increasing `index`
+  and a `seed` each, `aggregate.episodes == len(episodes)` and `aggregate.errors` equal to the
+  number of episodes with an error. Private-seed results are redacted: `episodes` is null,
+  aggregate only.
+- **Writing** is atomic and durable: a temporary file in the target directory, mode 0644
+  whatever the umask, flushed and `fsync`ed, then renamed over the target.
+
+## 16. Trusted verification and re-scoring
+
+**Principle.** The trusted path never scores data that an untrusted party wrote. It covers
+`topple verify`, `topple score`, Phase 3 publishing, nightly re-evaluation and the leaderboard.
+
+- **Trusted inputs:** the protocol (challenge bundle, preset, seed list, salt), the episode
+  index `i` (so the seed is `protocol.seeds[i]`) and the verifier's own Topple and MuJoCo build.
+  The controller identity and isolation that `rescore` records come from the trusted caller.
+- **Untrusted input:** the uploaded `traj_*.npz`, loaded with
+  `load_npz(path, max_steps=<the protocol's max_steps>)` (§14). It only supplies the commands to
+  replay and the records the replay must reproduce bit for bit.
+
+**API** (`topple.verify`):
+
+```python
+VerifyCode = Literal["not_reproducible", "incomplete"]
+
+@dataclass(frozen=True)
+class EpisodeVerdict:
+    index: int
+    ok: bool                       # bound to (protocol, index) and reproduced bit-exactly
+    code: VerifyCode | None
+    reason: str                    # human-readable; the first failing check
+    replay: Trajectory | None      # trusted replay (None if the upload failed before replaying)
+    result: EpisodeResult          # scored only from `replay` and the env's own metadata
+
+def verify_episode(upload, protocol, index) -> EpisodeVerdict
+def verify_with_seed(upload, protocol, seed, *, index=0) -> EpisodeVerdict
+def rescore(protocol, uploads: Mapping[int, Trajectory], controller, isolation) -> EvalResults
+def protocol_max_steps(protocol) -> int
+```
+
+Verification never raises for anything in the upload. `verify_episode` raises `ValueError` only
+for an index outside the protocol, `verify_with_seed` for a seed outside `[0, 2**53)` or a
+negative index (caller bugs).
+`verify_with_seed` is the local/debug binding for seeds outside the protocol list (`topple run
+--seed`): the scenario is still re-derived from the seed, `meta.episode_index` is not checked,
+and `index` only labels the verdict.
+
+**Checks, in order.** The first failing check is the verdict's `reason`; its code is
+`not_reproducible` unless stated otherwise.
+
+1. **Meta binding.** `meta.challenge == protocol.challenge.id`, `meta.preset == protocol.preset`,
+   `meta.robot_hash == robot_hash(<the challenge's robot>)` (all strings) and, for
+   `verify_episode`, `meta.episode_index == index` (an integer, not a boolean). `meta.error`, if
+   present and not null, must be exactly `{code, step, detail}` with `code` a run error code
+   (§15; never a verification code), `step == T` and `detail` a string. A malformed report is a
+   forgery; a well-formed one is sanitized (§15).
+2. **Scenario.** The trusted env (the protocol's own challenge object and preset, recording) is
+   reset on the trusted seed, which materializes the trusted scenario exactly as evaluation does
+   (`make_scenario(seed, preset, timestep, control_dt, episode_seconds)`, §9). `meta.scenario`
+   must equal the trusted scenario's `to_dict()` as canonical JSON (sorted keys, so `1`, `1.0`
+   and `true` all differ): "scenario differs from the scenario of the protocol seed". The replay
+   always runs the trusted scenario, never the uploaded one.
+3. **Commands.** `T ≤ max_steps`; every `ctrl` value finite and in [−1, 1]; every `action` value
+   finite; `clip(action, −1, 1) == ctrl` row by row.
+4. **Replay.** The uploaded `ctrl` rows are stepped in order. If the env terminates or truncates
+   before the rows run out, the upload does not reproduce. Then the episode's trusted error is
+   decided: a `sim_unstable` termination in the replay gives error `sim_unstable` at step T
+   (whatever the upload claims); otherwise the upload's own well-formed error report is kept;
+   otherwise, if the replay neither terminated nor truncated at step T (so T < max_steps), the
+   verdict is **`incomplete`** (score 0): the commands stop early with no explanation, which
+   covers controller errors stripped from `meta`. The epilogue (§11) is simulated when
+   `evaluate.wants_epilogue(<replay termination reason or "timeout">, <trusted error present>)`.
+5. **Integrity.** These arrays must equal the replay's byte for byte (so `−0.0 ≠ 0.0`), compared
+   in this order, the reason naming the first differing array and row: `qpos, qvel, obs, ctrl,
+   enc_counts, gyro, accel, push_force, epilogue_qpos`. Then the env-produced metadata
+   `termination, max_steps, control_dt, timestep, frame_skip, joint_qpos, wheel_sign, obs_schema,
+   obs_features` must equal the replay's as canonical JSON. `meta.versions` is informational.
+6. **Score.** Metrics, score and success come only from the replay and its env-produced metadata
+   (`episode_metrics(replay, motor)`, §12), exactly as `evaluate` scores a live episode. An
+   episode with a trusted error (step 4) scores 0 and is not a success: an honest error report
+   can only lower a score. A failed verdict (`ok == False`) scores 0, is not a success and
+   carries the error `{code: <verify code>, step: T, detail: reason}`; its metrics are the
+   replay's if the replay ran, else null.
+
+An honest run verifies OK and its re-score equals `evaluate()`'s result exactly (score, success,
+metrics, error), on the same platform and MuJoCo version.
+
+**`rescore`.** Exactly `N = len(protocol.seeds)` episodes are expected. An upload keyed by
+anything but an index in `[0, N)` raises `ValueError`. A missing index gives an episode with
+error `missing`, score 0 and no metrics. The aggregate is §12's (score = `fsum`/N, success rate
+= successes/N, mean time upright over the episodes with metrics), and `complete` is true only
+when no episode is missing (§15). Private-protocol results are redacted as usual.
+
+**CLI.** Exit codes: 0 reproduced, 1 verification failed, 2 usage or load error. A crash inside
+the verifier exits 2 with `verification crashed: <Type: message>`, never 1, and never prints a
+traceback.
+
+- `topple verify PATH [--protocol P] [--index I | --seed S] [--out results.json]
+  [--submission SUB] [--isolation inprocess|subprocess|container]`
+  - PATH a **run directory**: every `traj_<index>.npz` in it (1–6 digits) is re-scored with
+    `rescore`; the protocol is `--protocol`, else the challenge/preset named by the
+    lowest-numbered file. An index outside the protocol, two files for one index, a file that
+    does not load, or `--index`/`--seed` exit 2. Exit 1 unless every episode reproduced and
+    none is missing.
+  - PATH a **file**: by default the protocol comes from `meta.challenge`/`meta.preset` and the
+    index from `meta.episode_index`. If that index is outside the protocol or its seed differs
+    from `meta.scenario.seed`, the file is verified with `verify_with_seed` on the scenario's
+    seed and the output says `UNBOUND (seed taken from file)`; the scenario is still re-derived
+    from that seed. `--index I` binds explicitly; `--seed S` verifies unbound on S.
+  - `--out` writes the trusted results (§15): for a directory the `rescore` results, for a file
+    a one-episode result with `complete: false`. The controller is recorded as
+    `{id: <SUB's name>, sha256: <SUB's submission sha256>}`, computed without importing SUB, or
+    `{id: "unknown", sha256: <64 zeros>}` without `--submission`.
+- `topple score FILE [--protocol P] [--index I | --seed S]` verifies first, then prints JSON:
+  `ok, code, reason, bound, protocol, index, seed, score, success, error, metrics`, all from the
+  verdict. Exit 1 if not ok (the score is then 0); an errored episode prints score 0.
+- `--seed` (here and in `topple run`) must be an integer in `[0, 2**53)`; `--index` ≥ 0.

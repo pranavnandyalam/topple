@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+import re
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Any, NoReturn
 
 import typer
 
 from topple import __version__
+from topple.rng import MAX_SEED
 
 if TYPE_CHECKING:
     from topple.evaluate import EvalProtocol
     from topple.loader import Submission
-    from topple.results import EpisodeResult, EvalResults
+    from topple.results import ControllerInfo, EpisodeResult, EvalResults, Isolation
+    from topple.traj import Trajectory
+    from topple.verify import EpisodeVerdict
 
 app = typer.Typer(help="Topple: CI for robots.", no_args_is_help=True)
 
@@ -32,11 +36,42 @@ class VideoFormat(StrEnum):
     gif = "gif"
 
 
+class IsolationChoice(StrEnum):
+    inprocess = "inprocess"
+    subprocess = "subprocess"
+    container = "container"
+
+
+MAX_MESSAGE_CHARS = 500  # error messages can quote untrusted file contents
+UNKNOWN_CONTROLLER_ID = "unknown"
+UNKNOWN_SHA256 = "0" * 64
+TRAJ_NAME = re.compile(r"traj_([0-9]{1,6})\.npz")
+
+
 ProtocolOpt = Annotated[
     str, typer.Option("--protocol", "-p", help="Protocol id, e.g. balance-v1/standard or eval_v1.")
 ]
 OutOpt = Annotated[Path, typer.Option("--out", "-o", help="Output directory.")]
 FormatOpt = Annotated[VideoFormat, typer.Option("--video-format", help="Video container.")]
+SeedOpt = Annotated[
+    int | None,
+    typer.Option(min=0, max=MAX_SEED - 1, help="Episode seed, an integer in [0, 2**53)."),
+]
+IndexOpt = Annotated[
+    int | None, typer.Option(min=0, help="Episode index in the protocol (default: from the file).")
+]
+BindProtocolOpt = Annotated[
+    str | None,
+    typer.Option("--protocol", "-p", help="Protocol id (default: the file's challenge/preset)."),
+]
+
+
+def _fail(message: str) -> NoReturn:
+    """Usage, load or internal error: a clean one-line message and exit code 2."""
+    if len(message) > MAX_MESSAGE_CHARS:
+        message = message[: MAX_MESSAGE_CHARS - 3] + "..."
+    typer.echo(f"error: {message}", err=True)
+    raise typer.Exit(code=2)
 
 
 @app.command()
@@ -68,8 +103,7 @@ def _load(path: Path) -> Submission:
     try:
         return load_submission(path)
     except LoadError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+        _fail(str(exc))
 
 
 def _protocol(protocol_id: str) -> EvalProtocol:
@@ -77,9 +111,8 @@ def _protocol(protocol_id: str) -> EvalProtocol:
 
     try:
         return EvalProtocol.from_id(protocol_id)
-    except ValueError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(code=2) from exc
+    except (ValueError, OSError) as exc:  # bad grammar or preset; unknown challenge bundle
+        _fail(str(exc))
 
 
 def _episode_line(e: EpisodeResult) -> str:
@@ -93,7 +126,7 @@ def _episode_line(e: EpisodeResult) -> str:
     drift = float(m.get("drift_m", 0))
     energy = float(m.get("energy_j", 0))
     return (
-        f"  #{e.index:<3d} seed {e.seed!s:>6}  score {e.score:6.2f}  {status:<14} "
+        f"  #{e.index:<3d} seed {e.seed!s:>6}  score {e.score:6.2f}  {status:<22} "
         f"upright {upright:5.2f}s  drift {drift:.3f} m  energy {energy:6.2f} J"
     )
 
@@ -108,47 +141,64 @@ def _print_results(results: EvalResults) -> None:
     )
 
 
-def _render(traj_path: Path, out: Path, fmt: VideoFormat) -> None:
+def _render(traj_path: Path, out: Path, fmt: VideoFormat, protocol: EvalProtocol) -> None:
     from topple.rendering import RenderingUnavailableError
     from topple.traj import load_npz
+    from topple.verify import protocol_max_steps
     from topple.video import render_trajectory
 
     try:
-        render_trajectory(load_npz(traj_path), out.with_suffix(f".{fmt.value}"))
-    except RenderingUnavailableError as exc:
+        traj = load_npz(traj_path, max_steps=protocol_max_steps(protocol))
+        render_trajectory(traj, out.with_suffix(f".{fmt.value}"))
+    except (RenderingUnavailableError, ValueError, OSError) as exc:
         typer.echo(f"warning: video skipped: {exc}", err=True)
 
 
-def _evaluate(sub: Submission, protocol: EvalProtocol, out: Path) -> EvalResults:
+def _evaluate(
+    sub: Submission, protocol: EvalProtocol, out: Path, *, complete: bool = True
+) -> EvalResults:
+    """Run, save the trajectories and ``results.json``; ``complete=False`` marks a partial run."""
     from topple.evaluate import evaluate
-    from topple.results import ControllerInfo, write_results
+    from topple.results import MAX_ID_CHARS, ControllerInfo
 
-    results = evaluate(
-        protocol, sub.factory, ControllerInfo(id=sub.id, sha256=sub.sha256), traj_dir=out
-    )
-    write_results(results, out / "results.json")
+    info = ControllerInfo(id=sub.id[:MAX_ID_CHARS], sha256=sub.sha256)
+    try:
+        results = evaluate(protocol, sub.factory, info, traj_dir=out)
+    except OSError as exc:
+        _fail(f"cannot write to {out}: {exc}")
+    if not complete:
+        results = results.model_copy(update={"complete": False})
+    _write(results, out / "results.json")
     return results
+
+
+def _write(results: EvalResults, path: Path) -> None:
+    from topple.results import write_results
+
+    try:
+        write_results(results, path)
+    except OSError as exc:
+        _fail(f"cannot write {path}: {exc}")
 
 
 @app.command()
 def run(
     controller: Annotated[Path, typer.Argument(help="Submission .py file or directory.")],
     protocol: ProtocolOpt = "balance-v1/standard",
-    seed: Annotated[
-        int | None, typer.Option(help="Episode seed (default: first public seed).")
-    ] = None,
+    seed: SeedOpt = None,
     out: OutOpt = Path("out/run"),
     video: Annotated[bool, typer.Option("--video/--no-video", help="Render the episode.")] = True,
     video_format: FormatOpt = VideoFormat.mp4,
 ) -> None:
-    """Run one episode: writes results.json, traj_000.npz and a video."""
+    """Run one episode (default: the first public seed): writes results.json (complete: false),
+    traj_000.npz and a video."""
     sub = _load(controller)
     proto = _protocol(protocol)
     proto = replace(proto, seeds=(proto.seeds[0] if seed is None else seed,))
-    results = _evaluate(sub, proto, out)
+    results = _evaluate(sub, proto, out, complete=False)
     _print_results(results)
     if video:
-        _render(out / "traj_000.npz", out / "episode", video_format)
+        _render(out / "traj_000.npz", out / "episode", video_format, proto)
 
 
 @app.command("eval")
@@ -161,7 +211,8 @@ def eval_cmd(
 ) -> None:
     """Evaluate on every seed of a protocol: results.json, trajectories, videos."""
     sub = _load(controller)
-    results = _evaluate(sub, _protocol(protocol), out)
+    proto = _protocol(protocol)
+    results = _evaluate(sub, proto, out)
     _print_results(results)
     episodes = results.episodes or []
     chosen: list[int] = []
@@ -172,39 +223,259 @@ def eval_cmd(
     elif videos is Videos.worst and episodes:
         chosen = [min(episodes, key=lambda e: (e.score, e.index)).index]
     for index in chosen:
-        _render(out / f"traj_{index:03d}.npz", out / f"episode_{index:03d}", video_format)
+        _render(out / f"traj_{index:03d}.npz", out / f"episode_{index:03d}", video_format, proto)
+
+
+# ------------------------------------------------------------------ trusted verification
+
+
+@dataclass(frozen=True)
+class _Binding:
+    """Which episode a trajectory file is verified as (contract §16)."""
+
+    protocol: EvalProtocol
+    index: int
+    seed: int
+    bound: bool  # True: episode ``index`` of ``protocol``; False: an explicit or file seed
+    note: str  # printed when the verdict is not bound to the protocol
+
+
+def _read_meta(path: Path) -> dict[str, Any]:
+    from topple.traj import read_meta
+
+    try:
+        return read_meta(path)
+    except ValueError as exc:
+        _fail(str(exc))
+
+
+def _load_upload(path: Path, protocol: EvalProtocol) -> Trajectory:
+    from topple.traj import load_npz
+    from topple.verify import protocol_max_steps
+
+    try:
+        return load_npz(path, max_steps=protocol_max_steps(protocol))
+    except ValueError as exc:
+        _fail(str(exc))
+
+
+def _file_protocol(meta: dict[str, Any], protocol_id: str | None) -> EvalProtocol:
+    """``--protocol``, else the challenge and preset the file names."""
+    if protocol_id is not None:
+        return _protocol(protocol_id)
+    challenge, preset = meta.get("challenge"), meta.get("preset")
+    if not isinstance(challenge, str) or not isinstance(preset, str):
+        _fail("the trajectory does not name its challenge and preset; pass --protocol")
+    return _protocol(f"{challenge}/{preset}")
+
+
+def _meta_int(value: object) -> int | None:
+    return value if type(value) is int and 0 <= value < MAX_SEED else None
+
+
+def _bind(
+    meta: dict[str, Any], protocol: EvalProtocol, index: int | None, seed: int | None
+) -> _Binding:
+    """Explicit flags win; otherwise the file's episode index, unless its seed disagrees."""
+    n = len(protocol.seeds)
+    file_index = _meta_int(meta.get("episode_index"))
+    if index is not None and seed is not None:
+        _fail("pass either --index or --seed, not both")
+    if seed is not None:
+        return _Binding(protocol, file_index or 0, seed, False, "UNBOUND (seed from --seed)")
+    if index is not None:
+        if index >= n:
+            _fail(f"--index {index} is outside {protocol.id}'s {n} episodes")
+        return _Binding(protocol, index, protocol.seeds[index], True, "")
+    scenario = meta.get("scenario")
+    file_seed = _meta_int(scenario.get("seed")) if isinstance(scenario, dict) else None
+    if (
+        file_index is not None
+        and file_index < n
+        and file_seed in (None, protocol.seeds[file_index])
+    ):
+        return _Binding(protocol, file_index, protocol.seeds[file_index], True, "")
+    if file_seed is None:
+        _fail("cannot tell which episode this is; pass --index or --seed")
+    return _Binding(protocol, file_index or 0, file_seed, False, "UNBOUND (seed taken from file)")
+
+
+def _verify_file(
+    path: Path, protocol_id: str | None, index: int | None, seed: int | None
+) -> tuple[_Binding, EpisodeVerdict]:
+    from topple import verify as trusted
+    from topple.contract import describe_exception
+
+    meta = _read_meta(path)
+    binding = _bind(meta, _file_protocol(meta, protocol_id), index, seed)
+    upload = _load_upload(path, binding.protocol)
+    try:
+        if binding.bound:
+            return binding, trusted.verify_episode(upload, binding.protocol, binding.index)
+        return binding, trusted.verify_with_seed(
+            upload, binding.protocol, binding.seed, index=binding.index
+        )
+    except Exception as exc:  # a verifier bug must never look like a verification failure
+        _fail(f"verification crashed: {describe_exception(exc)}")
+
+
+def _controller_info(submission: Path | None) -> ControllerInfo:
+    """The submission's hash (computed, never imported), or the ``unknown`` placeholder."""
+    from topple.loader import LoadError, submission_sha256
+    from topple.results import MAX_ID_CHARS, ControllerInfo
+
+    if submission is None:
+        return ControllerInfo(id=UNKNOWN_CONTROLLER_ID, sha256=UNKNOWN_SHA256)
+    try:
+        sha = submission_sha256(submission)
+    except (LoadError, OSError) as exc:
+        _fail(f"cannot hash {submission}: {exc}")
+    name = submission.stem if submission.is_file() else submission.name
+    return ControllerInfo(id=(name or UNKNOWN_CONTROLLER_ID)[:MAX_ID_CHARS], sha256=sha)
+
+
+def _traj_files(directory: Path) -> dict[int, Path]:
+    """The ``traj_<index>.npz`` files of a run directory, by index, in index order."""
+    files: dict[int, Path] = {}
+    for path in sorted(directory.iterdir()):
+        match = TRAJ_NAME.fullmatch(path.name)
+        if match is None:
+            continue
+        index = int(match.group(1))
+        if index in files:
+            _fail(f"two files for episode {index}: {files[index].name} and {path.name}")
+        files[index] = path
+    if not files:
+        _fail(f"no traj_<index>.npz files in {directory}")
+    return dict(sorted(files.items()))
+
+
+def _verify_directory(
+    directory: Path, protocol_id: str | None, controller: ControllerInfo, isolation: Isolation
+) -> EvalResults:
+    """``rescore`` every trajectory of a run directory against its protocol."""
+    from topple import verify as trusted
+    from topple.contract import describe_exception
+
+    files = _traj_files(directory)
+    protocol = _file_protocol(_read_meta(next(iter(files.values()))), protocol_id)
+    n = len(protocol.seeds)
+    for index, path in files.items():
+        if index >= n:
+            _fail(f"{path.name}: index outside {protocol.id}'s {n} episodes")
+    uploads = {index: _load_upload(path, protocol) for index, path in files.items()}
+    try:
+        return trusted.rescore(protocol, uploads, controller, isolation)
+    except Exception as exc:  # a verifier bug must never look like a verification failure
+        _fail(f"verification crashed: {describe_exception(exc)}")
+
+
+def _report_directory(results: EvalResults) -> bool:
+    """Print the trusted results; True if every expected episode reproduced."""
+    from topple.results import VERIFY_ERROR_CODES
+
+    _print_results(results)
+    episodes = results.episodes or []
+    failed = [e for e in episodes if e.error is not None and e.error.code in VERIFY_ERROR_CODES]
+    n = len(episodes)
+    if failed or not results.complete:
+        typer.echo(f"FAIL: {len(failed)} of {n} episodes failed verification")
+        return False
+    typer.echo(f"OK: all {n} episodes reproduced")
+    return True
+
+
+def _report_file(binding: _Binding, verdict: EpisodeVerdict) -> None:
+    head = "OK" if verdict.ok else f"FAIL ({verdict.code})"
+    typer.echo(f"{head}: {verdict.reason}")
+    if not binding.bound:
+        typer.echo(
+            f"{binding.note}: seed {binding.seed} is checked against {binding.protocol.id}'s "
+            "challenge and preset, not as one of its episodes"
+        )
+    typer.echo(_episode_line(verdict.result))
+
+
+def _single_results(
+    binding: _Binding, verdict: EpisodeVerdict, controller: ControllerInfo, isolation: Isolation
+) -> EvalResults:
+    from topple.evaluate import build_results
+
+    protocol = replace(binding.protocol, seeds=(binding.seed,))
+    results = build_results(protocol, [verdict.result], controller, isolation)
+    return results.model_copy(update={"complete": False})
 
 
 @app.command()
 def verify(
-    trajectory: Annotated[Path, typer.Argument(help="traj_*.npz to re-simulate.")],
+    path: Annotated[Path, typer.Argument(help="A traj_*.npz file, or a run directory of them.")],
+    protocol: BindProtocolOpt = None,
+    index: IndexOpt = None,
+    seed: SeedOpt = None,
+    out: Annotated[
+        Path | None, typer.Option("--out", "-o", help="Write the trusted results.json here.")
+    ] = None,
+    submission: Annotated[
+        Path | None,
+        typer.Option(help="Submission to record in --out results (hashed, never imported)."),
+    ] = None,
+    isolation: Annotated[
+        IsolationChoice, typer.Option(help="How the controller ran, recorded in --out results.")
+    ] = IsolationChoice.inprocess,
 ) -> None:
-    """Re-simulate a trajectory open loop and check it reproduces exactly."""
-    from topple.traj import load_npz
-    from topple.verify import verify_episode
+    """Re-simulate uploaded trajectories open loop and re-score them from the replay only.
 
-    result = verify_episode(load_npz(trajectory))
-    typer.echo(f"{'OK' if result.ok else 'FAIL'}: {result.reason}")
-    if not result.ok:
+    Exit 0: reproduced. Exit 1: verification failed. Exit 2: usage or load error.
+    """
+    iso: Isolation = isolation.value
+    if path.is_dir():
+        if index is not None or seed is not None:
+            _fail("--index and --seed apply to a single trajectory file")
+        results = _verify_directory(path, protocol, _controller_info(submission), iso)
+        ok = _report_directory(results)
+    elif path.is_file():
+        binding, verdict = _verify_file(path, protocol, index, seed)
+        _report_file(binding, verdict)
+        ok = verdict.ok
+        results = _single_results(binding, verdict, _controller_info(submission), iso)
+    else:
+        _fail(f"{path} does not exist")
+    if out is not None:
+        _write(results, out)
+    if not ok:
         raise typer.Exit(code=1)
 
 
 @app.command()
 def score(
-    trajectory: Annotated[Path, typer.Argument(help="traj_*.npz to score.")],
+    trajectory: Annotated[Path, typer.Argument(help="traj_*.npz to verify and score.")],
+    protocol: BindProtocolOpt = None,
+    index: IndexOpt = None,
+    seed: SeedOpt = None,
 ) -> None:
-    """Recompute an episode's metrics and score from its trajectory."""
-    from topple.challenge import load_challenge
-    from topple.scoring import episode_metrics, episode_score, episode_success
-    from topple.traj import load_npz
+    """Verify a trajectory, then print the replay's metrics and score as JSON.
 
-    traj = load_npz(trajectory)
-    challenge = load_challenge(traj.meta["challenge"])
-    metrics = episode_metrics(traj, challenge.params.motor)
-    cfg = challenge.config.score
+    Exit 1 if verification fails (the score is then 0). An errored episode scores 0.
+    """
+    if trajectory.is_dir():
+        _fail("topple score takes one trajectory file; use topple verify for a run directory")
+    if not trajectory.is_file():
+        _fail(f"{trajectory} does not exist")
+    binding, verdict = _verify_file(trajectory, protocol, index, seed)
+    result = verdict.result
     payload = {
-        "score": episode_score(metrics, cfg),
-        "success": episode_success(metrics, cfg),
-        "metrics": metrics.as_dict(),
+        "ok": verdict.ok,
+        "code": verdict.code,
+        "reason": verdict.reason,
+        "bound": binding.bound,
+        "protocol": binding.protocol.id,
+        "index": verdict.index,
+        "seed": binding.seed,
+        "score": result.score,
+        "success": result.success,
+        "error": result.error.model_dump() if result.error else None,
+        "metrics": result.metrics,
     }
     typer.echo(json.dumps(payload, indent=2))
+    if not verdict.ok:
+        raise typer.Exit(code=1)

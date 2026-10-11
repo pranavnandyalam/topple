@@ -2,17 +2,32 @@
 
 from __future__ import annotations
 
+import itertools
 import os
 import tempfile
+import unicodedata
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 FORMAT: Literal["topple.results/1"] = "topple.results/1"
 MAX_DETAIL_CHARS = 300
+MAX_ID_CHARS = 200
+MAX_PLATFORM_CHARS = 64
+MAX_VERSION_CHARS = 64
+RESULTS_FILE_MODE = 0o644
+REPLACEMENT_CHAR = "�"
+_KEPT_CONTROLS = frozenset("\n\t")
 
-ErrorCode = Literal[
+RunErrorCode = Literal[
     "exception",
     "invalid_action",
     "timeout",
@@ -22,7 +37,31 @@ ErrorCode = Literal[
     "load_error",
     "sim_unstable",
 ]
+"""Errors a run can record: the controller's (and ``sim_unstable``, the physics')."""
+VerifyErrorCode = Literal["incomplete", "not_reproducible", "missing"]
+"""Errors only trusted verification assigns (contract §16)."""
+ErrorCode = RunErrorCode | VerifyErrorCode
+RUN_ERROR_CODES: frozenset[str] = frozenset(get_args(RunErrorCode))
+VERIFY_ERROR_CODES: frozenset[str] = frozenset(get_args(VerifyErrorCode))
 Isolation = Literal["inprocess", "subprocess", "container"]
+
+Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
+Identifier = Annotated[str, StringConstraints(min_length=1, max_length=MAX_ID_CHARS)]
+VersionStr = Annotated[str, StringConstraints(max_length=MAX_VERSION_CHARS)]
+
+
+def sanitize_detail(text: str) -> str:
+    """Make untrusted error text safe to store: at most ``MAX_DETAIL_CHARS`` characters, with
+    lone surrogates and control characters (other than newline and tab) replaced by U+FFFD.
+
+    One character in, one character out, so the result is idempotent and keeps positions.
+    """
+    return "".join(
+        ch
+        if ch in _KEPT_CONTROLS or unicodedata.category(ch) not in ("Cc", "Cs")
+        else REPLACEMENT_CHAR
+        for ch in text[:MAX_DETAIL_CHARS]
+    )
 
 
 class _Strict(BaseModel):
@@ -36,8 +75,8 @@ class ErrorInfo(_Strict):
 
     @field_validator("detail")
     @classmethod
-    def _truncate(cls, value: str) -> str:
-        return value[:MAX_DETAIL_CHARS]
+    def _sanitize(cls, value: str) -> str:
+        return sanitize_detail(value)
 
 
 class EpisodeResult(_Strict):
@@ -58,46 +97,75 @@ class Aggregate(_Strict):
 
 
 class Versions(_Strict):
-    topple: str
-    mujoco: str
-    numpy: str
-    obs_schema: str
-    action_spec: str
+    topple: VersionStr
+    mujoco: VersionStr
+    numpy: VersionStr
+    obs_schema: VersionStr
+    action_spec: VersionStr
 
 
 class ControllerInfo(_Strict):
-    id: str
-    sha256: str
+    id: Identifier
+    sha256: Sha256
 
 
 class EvalResults(_Strict):
+    """One evaluation's results. ``isolation`` records how the controller ran; it does not make a
+    run rankable (Phase 3 decides that from which trusted job produced the file)."""
+
     format: Literal["topple.results/1"] = FORMAT
-    challenge: str
-    protocol: str
-    protocol_hash: str
+    challenge: Identifier
+    protocol: Identifier
+    protocol_hash: Sha256
     seed_set: Literal["public", "private"]
     versions: Versions
-    platform: str
-    robot_hash: str
+    platform: Annotated[str, StringConstraints(max_length=MAX_PLATFORM_CHARS)]
+    robot_hash: Sha256
     controller: ControllerInfo
     isolation: Isolation
     complete: bool
     episodes: list[EpisodeResult] | None
     aggregate: Aggregate
 
-    @property
-    def rankable(self) -> bool:
-        return self.complete and self.isolation == "container"
+    @model_validator(mode="after")
+    def _consistent(self) -> EvalResults:
+        if self.seed_set == "private":
+            if self.episodes is not None:
+                raise ValueError("private results are redacted: episodes must be null")
+            return self
+        if self.episodes is None:
+            raise ValueError("public results must list their episodes")
+        _check_public_episodes(self.episodes, self.aggregate)
+        return self
+
+
+def _check_public_episodes(episodes: list[EpisodeResult], aggregate: Aggregate) -> None:
+    if aggregate.episodes != len(episodes):
+        raise ValueError(
+            f"aggregate.episodes is {aggregate.episodes} but {len(episodes)} episodes are listed"
+        )
+    indices = [e.index for e in episodes]
+    if any(b <= a for a, b in itertools.pairwise(indices)):
+        raise ValueError("episode index values must be strictly increasing")
+    if any(e.seed is None for e in episodes):
+        raise ValueError("every public episode must carry its seed")
+    errors = sum(e.error is not None for e in episodes)
+    if aggregate.errors != errors:
+        raise ValueError(f"aggregate.errors is {aggregate.errors} but {errors} episodes errored")
 
 
 def write_results(results: EvalResults, path: Path) -> None:
-    """Atomic write: readers never see a half-written file."""
+    """Atomic, durable write: readers never see a half-written file, and once this returns the
+    file is on disk (fsync before the rename), mode 0644 whatever the umask."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), RESULTS_FILE_MODE)
             fh.write(results.model_dump_json(indent=2))
             fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)

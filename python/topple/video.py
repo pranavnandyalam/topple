@@ -1,10 +1,12 @@
 """Replay videos: render a stored trajectory to MP4 or GIF.
 
 Playback only, never re-simulation: each frame poses the challenge's robot at a recorded state
-(``qpos`` rows, then ``epilogue_qpos``) with ``mj_forward`` and draws it from the chassis-tracking
-camera. Rows are recorded at the control rate and subsampled to ``fps``. An active push appears as
-a red arrow along the world-frame force, its tip touching the robot where the force's line of
-action through the ``push_point`` site enters the body, its length proportional to the force.
+(``qpos`` rows, then ``epilogue_qpos`` when the epilogue rule of contract §11 calls for one) with
+``mj_forward`` and draws it from the chassis-tracking camera. A trajectory recorded with another
+robot (``meta.robot_hash``) is refused rather than drawn as the wrong robot. Rows are recorded at
+the control rate and subsampled to ``fps``. An active push appears as a red arrow along the
+world-frame force, its tip touching the robot where the force's line of action through the
+``push_point`` site enters the body, its length proportional to the force.
 """
 
 from __future__ import annotations
@@ -22,8 +24,9 @@ import numpy as np
 import numpy.typing as npt
 
 from topple.challenge import load_challenge
+from topple.evaluate import wants_epilogue
 from topple.rendering import make_renderer
-from topple.robot import PUSH_SITE, TRACK_CAMERA, build_model
+from topple.robot import PUSH_SITE, TRACK_CAMERA, build_model, robot_hash
 from topple.traj import Trajectory
 
 SUFFIXES = (".mp4", ".gif")
@@ -130,7 +133,8 @@ def _playback(
         names = [model.camera(i).name for i in range(model.ncam)]
         raise ValueError(f"camera {camera!r} does not exist; cameras: {names}")
     stride = _stride(fps, control_dt)
-    rows = np.concatenate([traj.qpos, traj.epilogue_qpos]) if include_epilogue else traj.qpos
+    with_epilogue = include_epilogue and _shows_epilogue(traj.meta)
+    rows = np.concatenate([traj.qpos, traj.epilogue_qpos]) if with_epilogue else traj.qpos
     starts = range(0, rows.shape[0], stride)
     pushes = tuple(_push_at(traj.push_force, k, stride) if show_pushes else None for k in starts)
     return _Playback(model, rows[::stride], pushes, width, height, camera)
@@ -142,12 +146,29 @@ def _model(traj: Trajectory) -> tuple[mujoco.MjModel, float]:
     if not isinstance(challenge_id, str):
         raise ValueError("trajectory meta does not name its challenge")
     challenge = load_challenge(challenge_id)
+    expected = robot_hash(challenge.robot_xml, challenge.params)
+    recorded = traj.meta.get("robot_hash")
+    if recorded != expected:
+        shown = recorded[:16] + "..." if isinstance(recorded, str) else repr(recorded)[:20]
+        raise ValueError(
+            f"trajectory meta.robot_hash {shown} is not {challenge_id}'s robot "
+            f"({expected[:16]}...); refusing to draw the wrong robot"
+        )
     model = build_model(challenge.robot_xml, challenge.scene_xml, challenge.params)
     if model.nq != traj.qpos.shape[1]:
         raise ValueError(
             f"trajectory qpos has {traj.qpos.shape[1]} columns but {challenge_id} has nq={model.nq}"
         )
     return model, challenge.config.control_dt
+
+
+def _shows_epilogue(meta: dict[str, Any]) -> bool:
+    """Contract §11: epilogue frames only after a fall or a controller error."""
+    termination = meta.get("termination")
+    reason = termination.get("reason") if isinstance(termination, dict) else None
+    if not isinstance(reason, str):
+        return False
+    return wants_epilogue(reason, has_error=meta.get("error") is not None)
 
 
 def _stride(fps: int, control_dt: float) -> int:

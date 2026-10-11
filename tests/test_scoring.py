@@ -7,7 +7,6 @@ from topple.challenge import ScoreConfig, load_challenge
 from topple.robot import MotorParams
 from topple.scoring import (
     EpisodeMetrics,
-    aggregate_score,
     battery_energy_j,
     episode_metrics,
     episode_score,
@@ -142,10 +141,59 @@ def test_zero_step_episode() -> None:
     assert episode_score(m, CFG) == 0.0
 
 
-def test_aggregate_score() -> None:
-    assert aggregate_score([]) == 0.0
-    assert aggregate_score([100.0, 0.0, 50.0]) == pytest.approx(50.0)
-    assert aggregate_score([0.1] * 10) == 0.1 * 10 / 10
+def test_scoring_module_has_no_aggregate() -> None:
+    """Protocol aggregates live in evaluate.summarize (score / N over the expected episodes)."""
+    import topple.scoring
+
+    assert not hasattr(topple.scoring, "aggregate_score")
+
+
+def with_rows(traj: Trajectory, qpos: np.ndarray) -> Trajectory:
+    return Trajectory(**{**traj.__dict__, "qpos": qpos})
+
+
+def test_final_drift_differs_from_max_drift() -> None:
+    """Out 0.8 m and back to 0.1 m: drift_m is the final distance, max_drift_m the farthest."""
+    traj = synthetic(10)
+    qpos = traj.qpos.copy()
+    qpos[:, 0] = [0.0, 0.2, 0.4, 0.6, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]
+    qpos[:, 1] = 0.0
+    m = episode_metrics(with_rows(traj, qpos), MOTOR)
+    assert m.drift_m == pytest.approx(0.1)
+    assert m.max_drift_m == pytest.approx(0.8)
+    assert episode_score(m, CFG) == pytest.approx(100 * (0.6 + 0.2 + 0.1 * 0.9 + 0.1))
+
+
+def test_drift_is_planar_and_relative_to_the_start() -> None:
+    traj = synthetic(4)
+    qpos = traj.qpos.copy()
+    qpos[:, 0] = 5.0 + np.array([0.0, 0.0, 0.0, 0.3, 0.3])
+    qpos[:, 1] = -2.0 + np.array([0.0, 0.0, 0.0, 0.4, 0.4])
+    qpos[:, 2] = np.linspace(0.0, 9.0, 5)  # height never counts
+    m = episode_metrics(with_rows(traj, qpos), MOTOR)
+    assert m.drift_m == pytest.approx(0.5)
+    assert m.max_drift_m == pytest.approx(0.5)
+
+
+def test_rms_tilt_counts_alive_rows_only() -> None:
+    """Row T is the terminal state (already fallen): it counts for max_tilt, never for RMS tilt."""
+    traj = synthetic(4, max_steps=10, pitch=0.1, termination="fell")
+    qpos = traj.qpos.copy()
+    qpos[-1, 3:7] = quat_pitch(1.2)
+    m = episode_metrics(with_rows(traj, qpos), MOTOR)
+    assert m.rms_tilt_rad == pytest.approx(0.1)
+    assert m.max_tilt_rad == pytest.approx(1.2)
+    all_rows = math.sqrt((4 * 0.1**2 + 1.2**2) / 5)
+    assert m.rms_tilt_rad != pytest.approx(all_rows)
+
+
+def test_rms_tilt_is_a_root_mean_square() -> None:
+    traj = synthetic(4)
+    qpos = traj.qpos.copy()
+    for row, pitch in enumerate([0.0, 0.1, -0.2, 0.2, 0.9]):
+        qpos[row, 3:7] = quat_pitch(pitch)
+    m = episode_metrics(with_rows(traj, qpos), MOTOR)
+    assert m.rms_tilt_rad == pytest.approx(math.sqrt((0.0 + 0.01 + 0.04 + 0.04) / 4))
 
 
 def test_score_config_is_frozen_constant() -> None:

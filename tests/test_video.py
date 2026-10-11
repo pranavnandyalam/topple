@@ -367,3 +367,44 @@ def test_meta_must_name_the_challenge(
 def test_unknown_camera(fallen: Trajectory, tmp_path: Path) -> None:
     with pytest.raises(ValueError, match=r"camera 'overhead' does not exist; cameras: \['track'\]"):
         render_trajectory(fallen, tmp_path / "episode.mp4", camera="overhead")
+
+
+# ---------------------------------------------------------------- trust (spec I, C)
+
+
+@pytest.mark.parametrize("robot_hash", ["0" * 64, None, 7])
+def test_refuses_a_trajectory_of_another_robot(
+    fallen: Trajectory, tmp_path: Path, robot_hash: Any
+) -> None:
+    """Never draw the wrong robot: the recorded robot_hash must be the bundle's."""
+    meta = {**fallen.meta, "robot_hash": robot_hash}
+    with pytest.raises(ValueError, match="robot_hash"):
+        render_trajectory(replace(fallen, meta=meta), tmp_path / "episode.mp4")
+    assert list(tmp_path.iterdir()) == []
+
+
+def played_rows(traj: Trajectory, include_epilogue: bool = True) -> int:
+    play = topple.video._playback(traj, 100, SMALL, "track", include_epilogue, False)
+    return int(play.rows.shape[0])
+
+
+def test_epilogue_follows_the_epilogue_rule(fallen: Trajectory) -> None:
+    """Epilogue frames only after a fall or a controller error (contract §11), never after a
+    survival or sim_unstable, whatever rows the file carries."""
+    assert played_rows(fallen) == n_rows(fallen)
+    assert played_rows(fallen, include_epilogue=False) == fallen.qpos.shape[0]
+    for reason in ("timeout", "sim_unstable"):
+        meta = {**fallen.meta, "termination": {"step": fallen.steps, "reason": reason}}
+        assert played_rows(replace(fallen, meta=meta)) == fallen.qpos.shape[0]
+    errored = {
+        **fallen.meta,
+        "termination": {"step": fallen.steps, "reason": "timeout"},
+        "error": {"code": "exception", "step": fallen.steps, "detail": "x"},
+    }
+    assert played_rows(replace(fallen, meta=errored)) == n_rows(fallen)
+
+
+@pytest.mark.parametrize("termination", [None, "fell", {"reason": 3}, {}])
+def test_malformed_termination_shows_no_epilogue(fallen: Trajectory, termination: Any) -> None:
+    meta = {**fallen.meta, "termination": termination}
+    assert played_rows(replace(fallen, meta=meta)) == fallen.qpos.shape[0]

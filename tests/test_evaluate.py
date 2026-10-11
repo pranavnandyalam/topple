@@ -6,7 +6,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, overload
 
-import numpy as np
 import pytest
 from pydantic import ValidationError
 
@@ -34,8 +33,6 @@ from topple.results import (
 )
 from topple.rng import controller_seed
 from topple.robot import challenge_dir
-from topple.traj import load_npz
-from topple.verify import verify_episode
 
 INFO = ControllerInfo(id="test", sha256="0" * 64)
 
@@ -202,7 +199,6 @@ def test_results_round_trip_and_atomic_write(tmp_path: Path) -> None:
     data = json.loads(path.read_text())
     assert data["format"] == "topple.results/1"
     assert data["isolation"] == "inprocess"
-    assert not results.rankable
     assert [p.name for p in path.parent.iterdir()] == ["results.json"]
 
 
@@ -229,49 +225,6 @@ def test_private_seed_set_redacts_episodes() -> None:
 def test_error_info_codes_are_closed() -> None:
     with pytest.raises(ValidationError):
         ErrorInfo.model_validate({"code": "teleported", "step": 0})
-
-
-def test_saved_trajectory_verifies_and_rescores(tmp_path: Path) -> None:
-    results = evaluate(protocol("standard", 2), pid, INFO, traj_dir=tmp_path)
-    assert results.episodes is not None
-    for i in range(len(results.episodes)):
-        traj = load_npz(tmp_path / f"traj_{i:03d}.npz")
-        verification = verify_episode(traj)
-        assert verification.ok, verification.reason
-        assert traj.meta["episode_index"] == i
-
-
-def test_tampered_trajectory_fails_verification(tmp_path: Path) -> None:
-    evaluate(protocol("clean", 1), pid, INFO, traj_dir=tmp_path)
-    traj = load_npz(tmp_path / "traj_000.npz")
-    qpos = traj.qpos.copy()
-    qpos[-1, 0] += 1e-9
-    forged = type(traj)(**{**traj.__dict__, "qpos": qpos})
-    verification = verify_episode(forged)
-    assert not verification.ok
-    assert "qpos" in verification.reason
-
-
-def test_truncated_trajectory_fails_verification(tmp_path: Path) -> None:
-    """Claiming survival with fewer commands than the real episode needed is caught."""
-    evaluate(protocol("clean", 1), lambda spec: Zero(), INFO, traj_dir=tmp_path)
-    traj = load_npz(tmp_path / "traj_000.npz")
-    ctrl = np.vstack([traj.ctrl, np.zeros((5, 2))])
-    longer = type(traj)(
-        **{
-            **traj.__dict__,
-            "ctrl": ctrl,
-            "action": np.vstack([traj.action, np.zeros((5, 2))]),
-            "obs": np.vstack([traj.obs, np.zeros((5, 10), np.float32)]),
-            "enc_counts": np.vstack([traj.enc_counts, np.zeros((5, 2), np.int32)]),
-            "gyro": np.vstack([traj.gyro, np.zeros((5, 3), np.float32)]),
-            "accel": np.vstack([traj.accel, np.zeros((5, 3), np.float32)]),
-            "push_force": np.vstack([traj.push_force, np.zeros((5, 3))]),
-            "qpos": np.vstack([traj.qpos, np.repeat(traj.qpos[-1:], 5, axis=0)]),
-            "qvel": np.vstack([traj.qvel, np.repeat(traj.qvel[-1:], 5, axis=0)]),
-        }
-    )
-    assert not verify_episode(longer).ok
 
 
 # ------------------------------------------------------------------ controller misbehaviour (B)

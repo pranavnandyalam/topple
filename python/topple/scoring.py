@@ -116,8 +116,3 @@ def episode_success(m: EpisodeMetrics, cfg: ScoreConfig) -> bool:
         and m.drift_m < cfg.success_max_drift_m
         and m.energy_j <= cfg.success_energy_factor * cfg.e_ref_j
     )
-
-
-def aggregate_score(scores: list[float]) -> float:
-    """Mean in seed order with exact summation (platform-independent rounding)."""
-    return math.fsum(scores) / len(scores) if scores else 0.0
