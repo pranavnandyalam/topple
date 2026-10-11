@@ -8,7 +8,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, NoReturn
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn
 
 import typer
 
@@ -366,10 +366,18 @@ def _controller_info(submission: Path | None) -> ControllerInfo:
     return _controller(name, sha)
 
 
+def _cannot_read(path: Path, exc: OSError) -> NoReturn:
+    _fail(f"cannot read {path}: {exc.strerror or type(exc).__name__}")
+
+
 def _traj_files(directory: Path) -> dict[int, Path]:
     """The ``traj_<index>.npz`` files of a run directory, by index, in index order."""
+    try:
+        paths = sorted(directory.iterdir())
+    except OSError as exc:  # e.g. macOS privacy protection, which ``os.access`` does not see
+        _cannot_read(directory, exc)
     files: dict[int, Path] = {}
-    for path in sorted(directory.iterdir()):
+    for path in paths:
         match = TRAJ_NAME.fullmatch(path.name)
         if match is None:
             continue
@@ -436,9 +444,20 @@ def _verify_directory(
         _fail(f"verification crashed: {describe_exception(exc)}")
 
 
-def _not_a_file(path: Path) -> str:
-    """Why ``path`` cannot be verified (a FIFO or device is never opened)."""
-    return f"{path}: not a regular file" if path.exists() else f"{path} does not exist"
+def _kind(path: Path) -> Literal["directory", "file"]:
+    """Whether ``path`` is a directory or a regular file; exit 2 for anything else (a FIFO or
+    device is never opened), including a path that cannot even be examined: Python 3.12's
+    ``Path.is_dir``/``is_file`` raise for a name too long or a directory without search
+    permission on the way, and exit 1 would claim that verification failed (§16)."""
+    try:
+        if path.is_dir():
+            return "directory"
+        if path.is_file():
+            return "file"
+        reason = f"{path}: not a regular file" if path.exists() else f"{path} does not exist"
+    except OSError as exc:
+        _cannot_read(path, exc)
+    _fail(reason)
 
 
 def _report_directory(run: RunVerdict) -> bool:
@@ -503,20 +522,18 @@ def verify(
     Exit 0: reproduced. Exit 1: verification failed. Exit 2: usage or load error.
     """
     iso: Isolation = isolation.value
-    if path.is_dir():
+    if _kind(path) == "directory":
         if index is not None or seed is not None:
             _fail("--index and --seed apply to a single trajectory file")
         run = _verify_directory(path, protocol, _controller_info(submission), iso)
         ok = _report_directory(run)
         results = run.results
-    elif path.is_file():
+    else:
         controller = _controller_info(submission)  # a bad --submission fails before any verdict
         binding, verdict = _verify_file(path, protocol, index, seed)
         _report_file(binding, verdict)
         ok = verdict.ok
         results = _single_results(binding, verdict, controller, iso)
-    else:
-        _fail(_not_a_file(path))
     if out is not None:
         _write(results, out)
     if not ok:
@@ -534,10 +551,8 @@ def score(
 
     Exit 1 if verification fails (the score is then 0). An errored episode scores 0.
     """
-    if trajectory.is_dir():
+    if _kind(trajectory) == "directory":
         _fail("topple score takes one trajectory file; use topple verify for a run directory")
-    if not trajectory.is_file():
-        _fail(_not_a_file(trajectory))
     binding, verdict = _verify_file(trajectory, protocol, index, seed)
     result = verdict.result
     payload = {

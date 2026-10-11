@@ -2,7 +2,7 @@ import json
 import math
 import re
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -1003,6 +1003,120 @@ def test_an_unreadable_part_of_a_submission_exits_2(
     assert f"cannot read 'bot/{locked.name}': Permission denied" in result.output
     assert "Traceback" not in result.output
     assert not (out / "results.json").exists()
+
+
+TOO_LONG = "a" * 260  # over the 255-byte name limit of Linux and macOS file systems
+VIDEOS_OFF = {"run": ["--no-video"], "eval": ["--videos", "none"]}
+
+
+def _locked(path: Path, mode: int, probe: Path) -> None:
+    """``path`` set to ``mode``; skips where permissions do not stop this user (root)."""
+    import os
+
+    path.chmod(mode)
+    if os.access(probe, os.R_OK):
+        path.chmod(0o755)
+        pytest.skip("file permissions are not enforced for this user")
+
+
+@pytest.mark.parametrize("command", ["run", "eval"])
+def test_a_submission_name_too_long_for_the_file_system_exits_2(
+    tmp_path: Path, command: str
+) -> None:
+    """Contract §8: the submission's own path is probed inside the loader's guard too, so the
+    name is a load error (exit 2, one line), never an OSError traceback with exit 1."""
+    out = tmp_path / "out"
+    result = runner.invoke(
+        app,
+        [command, str(tmp_path / f"{TOO_LONG}.py"), "-p", "balance-v1/clean", "--out", str(out)]
+        + VIDEOS_OFF[command],
+    )
+    assert result.exit_code == 2, result.output
+    assert f"error: cannot read '{TOO_LONG}.py': File name too long" in result.output
+    assert "Traceback" not in result.output
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("where", ["parent", "submission"])
+@pytest.mark.parametrize("command", ["run", "eval"])
+def test_a_submission_that_cannot_be_searched_exits_2(
+    tmp_path: Path, command: str, where: str
+) -> None:
+    """``parent``: a ``.py`` in a directory without search permission; ``submission``: a
+    submission directory that can be listed but not searched (mode 0444)."""
+    if where == "parent":
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        submission = _submission(locked)
+        mode, shown = 0, "bot.py"
+    else:
+        locked = submission = tmp_path / "bot"
+        locked.mkdir()
+        (locked / "controller.py").write_text(PID_SUBMISSION)
+        mode, shown = 0o444, "bot/controller.py"
+    probe = submission if where == "parent" else submission / "controller.py"
+    _locked(locked, mode, probe)
+    out = tmp_path / "out"
+    try:
+        result = runner.invoke(
+            app,
+            [command, str(submission), "-p", "balance-v1/clean", "--out", str(out)]
+            + VIDEOS_OFF[command],
+        )
+    finally:
+        locked.chmod(0o755)
+    assert result.exit_code == 2, result.output
+    assert f"error: cannot read '{shown}': Permission denied" in result.output
+    assert "Traceback" not in result.output
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("where", ["name too long", "parent not searchable"])
+@pytest.mark.parametrize("command", ["verify", "score"])
+def test_a_trajectory_path_that_cannot_be_examined_exits_2(
+    tmp_path: Path, command: str, where: str
+) -> None:
+    """Exit 1 means "verification failed" (§16): a path that cannot even be examined is a
+    usage error, exit 2 with one line."""
+    if where == "name too long":
+        path, reason = tmp_path / f"{TOO_LONG}.npz", "File name too long"
+    else:
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        path, reason = locked / "traj_000.npz", "Permission denied"
+        path.write_bytes(b"")
+        _locked(locked, 0, path)
+    try:
+        result = runner.invoke(app, [command, str(path)])
+    finally:
+        path.parent.chmod(0o755)
+    assert result.exit_code == 2, result.output
+    assert result.output.startswith("error: cannot read ")
+    assert result.output.rstrip().endswith(f": {reason}")
+    assert "Traceback" not in result.output
+
+
+def test_verify_a_run_directory_that_cannot_be_listed_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI's own check refuses a directory without read permission, but macOS privacy
+    protection (TCC) refuses to list folders that ``os.access`` calls readable: the listing's
+    ``OSError`` must still be a usage error."""
+    import errno
+
+    run = tmp_path / "run"
+    run.mkdir()
+    real_iterdir = Path.iterdir
+
+    def iterdir(self: Path) -> Iterator[Path]:
+        if self == run:
+            raise PermissionError(errno.EPERM, "Operation not permitted", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    result = runner.invoke(app, ["verify", str(run)])
+    assert result.exit_code == 2, result.output
+    assert result.output == f"error: cannot read {run}: Operation not permitted\n"
 
 
 @pytest.mark.slow

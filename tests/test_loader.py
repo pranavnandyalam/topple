@@ -854,6 +854,51 @@ def test_an_os_error_without_a_path_names_the_submission(
         load_submission(root)
 
 
+TOO_LONG = "a" * 260  # over the 255-byte name limit of Linux and macOS file systems
+
+
+def test_a_name_too_long_for_the_file_system_is_a_load_error(tmp_path: Path) -> None:
+    """Python 3.12's ``Path.is_symlink``/``exists``/``is_file`` re-raise ``ENAMETOOLONG``: the
+    submission's own path is probed inside the same guard as its files (§8)."""
+    path = tmp_path / f"{TOO_LONG}.py"
+    for load in (load_submission, submission_sha256):
+        with pytest.raises(LoadError, match=rf"cannot read '{TOO_LONG}\.py': File name too long"):
+            load(path)
+
+
+def test_a_submission_in_a_directory_that_cannot_be_searched_is_a_load_error(
+    tmp_path: Path,
+) -> None:
+    locked = tmp_path / "locked"
+    entry = write(locked, "bot.py", GOOD)
+    unreadable(locked)
+    try:
+        for load in (load_submission, submission_sha256):
+            with pytest.raises(LoadError, match=r"cannot read 'bot\.py': Permission denied"):
+                load(entry)
+    finally:
+        locked.chmod(0o755)
+
+
+@pytest.mark.parametrize("mode", [0o444, 0o600], ids=["0444", "0600"])
+def test_a_submission_directory_that_cannot_be_searched_is_a_load_error(
+    tmp_path: Path, mode: int
+) -> None:
+    """The directory can be listed but not searched, so ``controller.py`` cannot be examined."""
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    root.chmod(mode)
+    try:
+        if os.access(root / "controller.py", os.R_OK):
+            pytest.skip("file permissions are not enforced for this user")
+        with pytest.raises(LoadError, match=r"cannot read 'bot/controller\.py': Permission denied"):
+            load_submission(root)
+        with pytest.raises(LoadError, match="Permission denied"):
+            submission_sha256(root)
+    finally:
+        root.chmod(0o755)
+
+
 def test_a_path_that_cannot_be_resolved_is_a_load_error(tmp_path: Path) -> None:
     loop = tmp_path / "loop"
     loop.symlink_to(loop)

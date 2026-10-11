@@ -268,8 +268,10 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   regular files in at most 50 subdirectories (at any depth) and 20 MiB in total, enforced while
   it is walked and read, so a huge tree is refused at once; symlinks, special files,
   `__pycache__`, `.pyc` files and names (the submission's own or any file's) that are not valid
-  UTF-8 are refused, and so is a file or directory that cannot be read (a `LoadError` naming it,
-  never an `OSError`). Untrusted names in load errors are quoted with `repr`, so they cannot
+  UTF-8 are refused, and so is a file or directory that cannot be read or even examined, the
+  submission's own path included (a name too long for the file system, a directory without
+  search permission on the way): a `LoadError` naming it, never an `OSError`, so the CLI exits
+  2 with one line. Untrusted names in load errors are quoted with `repr`, so they cannot
   carry terminal escapes or line breaks. Loading a submission turns bytecode writing off for the
   rest of the process (`sys.dont_write_bytecode`), so neither its import nor a later import of a
   sibling module (in `make_controller`, `reset` or `act`) writes bytecode next to it. The
@@ -673,10 +675,12 @@ episode with a run error (§15) that reproduces did verify; it only scores 0.
 
 **CLI.** Exit codes: 0 reproduced, 1 verification failed, 2 usage or load error. A crash inside
 the verifier exits 2 with `verification crashed: <Type: message>`, never 1, and never prints a
-traceback. An error is one line: every character of it that is not printable (control
-characters, line breaks, lone surrogates) is shown as its backslash escape, so untrusted text
-quoted in it (paths, file names, upload contents) can neither drive a terminal nor start a
-GitHub Actions workflow command.
+traceback. So does a PATH that cannot be examined or listed (a name too long for the file
+system, a directory without search permission on the way, a folder the OS refuses to list),
+with `cannot read PATH: <reason>`. An error is one line: every character of it that is not
+printable (control characters, line breaks, lone surrogates) is shown as its backslash escape,
+so untrusted text quoted in it (paths, file names, upload contents) can neither drive a
+terminal nor start a GitHub Actions workflow command.
 
 - `topple verify PATH [--protocol P] [--index I | --seed S] [--out results.json]
   [--submission SUB] [--isolation inprocess|subprocess|container]`

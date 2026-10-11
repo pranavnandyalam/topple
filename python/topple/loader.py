@@ -72,13 +72,14 @@ def _files(path: Path) -> list[Path]:
     """Every file of a submission in POSIX-path order, refusing anything that is not plain data.
 
     The walk stops as soon as it passes ``MAX_FILES`` files or ``MAX_DIRECTORIES`` directories,
-    and a file or directory that cannot be read is a ``LoadError``.
+    and a file or directory that cannot be read, or examined at all (a name too long, a
+    directory without search permission on the way), is a ``LoadError``.
     """
-    if path.is_symlink():
-        raise LoadError(f"{path.name!r} is a symlink; submit the file itself")
-    if path.is_file():
-        return [path]
     try:
+        if path.is_symlink():
+            raise LoadError(f"{path.name!r} is a symlink; submit the file itself")
+        if path.is_file():
+            return [path]
         files = _walk(path)
     except OSError as exc:
         raise _unreadable(exc, path) from exc
@@ -152,10 +153,11 @@ def _digest(path: Path, entry: Path | None = None) -> tuple[str, bytes | None]:
     """The submission sha256 of ``path`` and the exact bytes of ``entry`` that went into it
     (``None`` if ``entry`` is not one of its files)."""
     digest = hashlib.sha256(SHA_TAG)
-    root = path if path.is_dir() and not path.is_symlink() else path.parent
+    files = _files(path)  # refuses a symlinked ``path``; probes it inside its OSError guard
+    root = path.parent if files == [path] else path  # a single file is named by its file name
     remaining = MAX_BYTES
     source: bytes | None = None
-    for f in _files(path):
+    for f in files:
         name = _utf8_name(_rel(f, root))
         try:
             data = _read_capped(f, remaining)
@@ -276,17 +278,7 @@ def submission_id(path: Path) -> str:
 
 def load_submission(path: Path) -> Submission:
     _utf8_name(path.name)  # the name becomes the controller id
-    if path.is_symlink():
-        raise LoadError(f"{path} is a symlink; submit the file or directory itself")
-    try:
-        path = path.resolve()
-    except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop on the way
-        raise LoadError(f"cannot resolve {path}: {exc}") from exc
-    if not path.exists():
-        raise LoadError(f"{path} does not exist")
-    entry = path / ENTRY_FILE if path.is_dir() else path
-    if entry.suffix != ".py" or not entry.is_file():
-        raise LoadError(f"expected a .py file or a directory containing {ENTRY_FILE}")
+    path, entry = _locate(path)
     sha, source = _digest(path, entry)
     if source is None:  # cannot happen: the entry is always one of the hashed files
         raise LoadError(f"{entry.name} was not hashed")
@@ -296,7 +288,34 @@ def load_submission(path: Path) -> Submission:
     except LoadError:
         sys.modules.pop(_module_name(sha), None)  # a failed load leaves nothing behind
         raise
-    return Submission(id=submission_id(path), sha256=sha, entry=entry, factory=factory)
+    # ``submission_id`` without probing the file system again: a directory's name, a file's stem
+    sub_id = path.stem if entry == path else path.name
+    return Submission(id=sub_id, sha256=sha, entry=entry, factory=factory)
+
+
+def _locate(path: Path) -> tuple[Path, Path]:
+    """The resolved submission and its entry file, else ``LoadError``.
+
+    Every probe is inside one ``OSError`` guard: Python 3.12's ``Path.is_symlink``, ``exists``,
+    ``is_dir`` and ``is_file`` re-raise every error but ENOENT, ENOTDIR, EBADF and ELOOP (so a
+    name too long, or a directory without search permission on the way, raises), and such a
+    path is a ``LoadError`` naming it (§8).
+    """
+    try:
+        if path.is_symlink():
+            raise LoadError(f"{path} is a symlink; submit the file or directory itself")
+        try:
+            path = path.resolve()
+        except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop on the way
+            raise LoadError(f"cannot resolve {path}: {exc}") from exc
+        if not path.exists():
+            raise LoadError(f"{path} does not exist")
+        entry = path / ENTRY_FILE if path.is_dir() else path
+        if entry.suffix != ".py" or not entry.is_file():
+            raise LoadError(f"expected a .py file or a directory containing {ENTRY_FILE}")
+    except OSError as exc:
+        raise _unreadable(exc, path) from exc
+    return path, entry
 
 
 def _factory(module: ModuleType, entry: Path) -> Callable[[TaskSpec], Controller[Any]]:
