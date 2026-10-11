@@ -145,6 +145,18 @@ step from the state at the *start* of the substep: the readings lag the simulate
 substep (2 ms), like a real sample-and-hold. The reading at reset (k = 0, after `mj_forward`) is
 current; it uses one extra SENSOR noise block (§9).
 
+The robot spawns with its tires exactly touching the floor (distance 0), and MuJoCo makes a
+contact a constraint only once it penetrates. So the reset state and the first substep are
+computed as free fall: the reset reading and the first substep's accelerometer sample measure a
+specific force of about 0 (noise only) where a robot at rest reads +g. The first filter update
+(step 3) then pulls the estimate toward `atan2` of noise, an error of at most
+`(1 − a)·(π + |pitch|)` ≈ 12.8 mrad that decays with `tau`. Measured on darwin-arm64: std 7.1 mrad
+after control step 1 over 300 `clean` seeds (0.55 mrad with the tires 0.1 mm into the floor),
+and no effect on the calibration (§10, §12: on `standard` seeds 0..199, LQR 86.5% and PID 64.5%
+survival and E_ref 13.0 either way). Whether a contact at exactly zero distance counts rests on
+rounding, so this first sample can differ by platform, as physics may (§14). It is part of
+balance-v1; changing the spawn changes every score, so it needs a new major version (§13).
+
 Per control step (after the 5 substeps):
 4. Encoders: `counts_i = round(wheel_sign_i · q_i · cpr / 2π)` (integer, chassis-relative);
    `wheel_pos_i = (counts_i − counts_i(reset)) · 2π / cpr`.

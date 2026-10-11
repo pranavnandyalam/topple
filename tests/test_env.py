@@ -891,6 +891,25 @@ def test_full_sensor_pitch_estimate_tracks_the_truth(seed: int) -> None:
     assert np.abs(error).mean() > 1e-4  # an estimate, not ground truth
 
 
+def test_the_first_estimate_errs_by_at_most_one_filter_step_toward_noise() -> None:
+    """§5: the tires spawn exactly touching the floor, and MuJoCo makes a contact a constraint
+    only once it penetrates, so (on darwin-arm64; it rests on rounding) the first substep is
+    free fall and its accelerometer sample is noise. The first filter update then moves the
+    estimate by at most (1 - a)·(π + |pitch + offset|) toward a random angle, which decays with
+    tau. Measured on 300 clean seeds: std 7.1 mrad after step 1, max 12.8 mrad."""
+    env = BalanceEnv("clean")
+    tau, dt = env.params.estimation.cf_tau_s, float(env.model.opt.timestep)
+    worst_lean = math.radians(3.0 + 1.0)  # initial pitch plus mount offset (§10)
+    bound = dt / (tau + dt) * (math.pi + worst_lean) + 1e-3  # 1 mrad for noise and contacts
+    errors = []
+    for seed in range(40):
+        env.reset(seed=seed)
+        obs, *_ = env.step((0.0, 0.0))
+        truth = quat_pitch_yaw(env.data.qpos[3:7])[0] + env.scenario.sensors.imu_pitch_offset_rad
+        errors.append(abs(float(obs[0]) - truth))
+    assert max(errors) < bound
+
+
 @pytest.mark.parametrize(("preset", "saturates"), [("clean", True), ("ideal", False)])
 @pytest.mark.parametrize("direction", [1.0, -1.0])
 def test_gyro_saturates_at_full_scale(preset: str, saturates: bool, direction: float) -> None:
