@@ -319,9 +319,10 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   in [0.5, 2] (frictionloss [0, 3]), `|com_x_offset_m| ≤ 0.02`, `0 ≤ actuator_delay_s ≤ 0.010`,
   `|imu_pitch_offset_rad| ≤ 0.1`, `|gyro_bias| ≤ 0.1` rad/s per axis. With the env's
   `EpisodeClock` (`timestep`, `frame_skip`, `max_steps`: `BalanceEnv.clock`) every push must also
-  fit the episode: `start_step < max_steps`; `n_substeps ≤ max_steps · frame_skip`; impulse
-  `magnitude_n · n_substeps · timestep ≤ 5` N·s (the force cap held for a standard 0.1 s pulse);
-  and each push ends before the next begins
+  start inside the episode (`start_step < max_steps`), last no longer than it
+  (`n_substeps ≤ max_steps · frame_skip`; a push still running when the episode ends is cut off
+  there), deliver at most 5 N·s (`magnitude_n · n_substeps · timestep`, the force cap held for a
+  standard 0.1 s pulse), and end before the next push begins
   (`start_step · frame_skip + n_substeps ≤ next.start_step · frame_skip`). Every preset draws
   well inside these bounds; `reset(options={"scenario": dict})` goes through this check with the
   env's clock. In-process `Scenario` objects and the `pushes`/`init_pitch_rad`/`init_pitch_rate`

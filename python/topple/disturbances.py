@@ -42,8 +42,9 @@ class EpisodeClock:
 
     Pushes start at a control step and last a number of physics substeps, so only with the
     physics ``timestep``, the substeps per control step (``frame_skip``) and the episode length
-    can a push be checked against the episode: inside it, never overlapping another push, and
-    within ``MAX_PUSH_IMPULSE_NS``. ``BalanceEnv.clock`` is the env's own.
+    can a push be checked against the episode: starting inside it, lasting no longer than it,
+    never overlapping another push, and within ``MAX_PUSH_IMPULSE_NS``. ``BalanceEnv.clock`` is
+    the env's own.
     """
 
     timestep: float
@@ -166,8 +167,8 @@ class Scenario:
         Checks key sets (string keys only), types, that every number fits a float (integers
         exactly) and is finite, and the bounds above; pushes must be sorted by ``start_step``
         with no two at the same step. With the env's ``clock`` (``BalanceEnv.reset`` passes
-        it), every push must also start inside the episode and never outlast it, deliver at most
-        ``MAX_PUSH_IMPULSE_NS``, and end before the next one starts.
+        it), every push must also start inside the episode, last no longer than it, deliver at
+        most ``MAX_PUSH_IMPULSE_NS`` and end before the next one starts.
         """
         try:
             scenario = _parse_scenario(data)
