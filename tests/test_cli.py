@@ -859,6 +859,39 @@ def test_a_submission_name_that_is_not_utf8_exits_2_before_running(
     assert not (out / "results.json").exists()
 
 
+@pytest.mark.parametrize("kind", ["file", "directory"])
+@pytest.mark.parametrize("command", ["run", "eval"])
+def test_an_unreadable_part_of_a_submission_exits_2(
+    tmp_path: Path, command: str, kind: str
+) -> None:
+    """Contract §8: a submission that cannot be read is a load error (exit 2 with one line), as
+    it already was for `verify --submission`; never a PermissionError traceback with exit 1."""
+    import os
+
+    root = tmp_path / "bot"
+    (root / "data").mkdir(parents=True)
+    (root / "controller.py").write_text(PID_SUBMISSION)
+    locked = root / "asset.bin" if kind == "file" else root / "data"
+    if kind == "file":
+        locked.write_text("x")
+    locked.chmod(0)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("file permissions are not enforced for this user")
+        out = tmp_path / "out"
+        result = runner.invoke(
+            app,
+            [command, str(root), "-p", "balance-v1/clean", "--out", str(out)]
+            + (["--no-video"] if command == "run" else ["--videos", "none"]),
+        )
+    finally:
+        locked.chmod(0o755)
+    assert result.exit_code == 2, result.output
+    assert f"cannot read 'bot/{locked.name}': Permission denied" in result.output
+    assert "Traceback" not in result.output
+    assert not (out / "results.json").exists()
+
+
 def test_a_bad_submission_fails_before_any_verdict_is_printed(tmp_path: Path) -> None:
     """File mode resolves --submission first, as directory mode does: exit 2 never follows an
     `OK` line, with or without --out."""

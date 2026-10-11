@@ -3,6 +3,10 @@
 In-process loading runs the submission's code inside this interpreter, so it is for trusted code
 only (your own controllers, the shipped examples). Untrusted submissions go through the
 subprocess/container runner (Phase 3).
+
+The entry file is read once: those bytes are hashed and those bytes are compiled and run, so the
+submission sha256 always covers the code that runs (no bytecode cache is consulted and no second
+read can see a swapped file).
 """
 
 from __future__ import annotations
@@ -23,6 +27,8 @@ from topple.contract import Controller, TaskSpec, class_name, describe_exception
 ENTRY_FILE = "controller.py"
 FACTORY = "make_controller"
 MAX_FILES = 50
+MAX_DIRECTORIES = 50
+"""Most subdirectories a submission directory may hold (any depth; itself not counted)."""
 MAX_BYTES = 20 * 1024 * 1024
 SHA_TAG = b"topple.submission/1\n"
 CONTROLLER_METHODS = ("reset", "act")  # the members of the Controller protocol (contract §8)
@@ -45,40 +51,68 @@ def _rel(path: Path, root: Path) -> str:
 
 
 def _check_entry(entry: os.DirEntry[str], rel: str) -> bool:
-    """True for a directory to descend into, False for a regular file; else ``LoadError``."""
+    """True for a directory to descend into, False for a regular file; else ``LoadError``.
+
+    Names are quoted with ``repr``: they are untrusted and can hold terminal escapes.
+    """
     if entry.is_symlink():
-        raise LoadError(f"symlinks are not allowed in a submission: {rel}")
+        raise LoadError(f"symlinks are not allowed in a submission: {rel!r}")
     if entry.is_dir(follow_symlinks=False):
         if entry.name == "__pycache__":
-            raise LoadError(f"remove compiled Python from the submission: {rel}")
+            raise LoadError(f"remove compiled Python from the submission: {rel!r}")
         return True
     if not entry.is_file(follow_symlinks=False):
-        raise LoadError(f"{rel} is not a regular file")
+        raise LoadError(f"{rel!r} is not a regular file")
     if entry.name.endswith(".pyc"):
-        raise LoadError(f"remove compiled Python (.pyc) from the submission: {rel}")
+        raise LoadError(f"remove compiled Python (.pyc) from the submission: {rel!r}")
     return False
 
 
 def _files(path: Path) -> list[Path]:
-    """Every file of a submission in POSIX-path order, refusing anything that is not plain data."""
+    """Every file of a submission in POSIX-path order, refusing anything that is not plain data.
+
+    The walk stops as soon as it passes ``MAX_FILES`` files or ``MAX_DIRECTORIES`` directories,
+    and a file or directory that cannot be read is a ``LoadError``.
+    """
     if path.is_symlink():
-        raise LoadError(f"{path.name} is a symlink; submit the file itself")
+        raise LoadError(f"{path.name!r} is a symlink; submit the file itself")
     if path.is_file():
         return [path]
+    try:
+        files = _walk(path)
+    except OSError as exc:
+        raise _unreadable(exc, path) from exc
+    return sorted(files, key=lambda f: _rel(f, path))
+
+
+def _walk(root: Path) -> list[Path]:
     files: list[Path] = []
-    pending = [path]
+    directories = 0
+    pending = [root]
     while pending:
-        directory = pending.pop()
-        with os.scandir(directory) as entries:
+        with os.scandir(pending.pop()) as entries:
             for entry in entries:
                 child = Path(entry.path)
-                if _check_entry(entry, _rel(child, path)):
-                    pending.append(child)
-                else:
+                if not _check_entry(entry, _rel(child, root)):
                     files.append(child)
-                if len(files) > MAX_FILES:
-                    raise LoadError(f"submission has more than {MAX_FILES} files")
-    return sorted(files, key=lambda f: _rel(f, path))
+                    if len(files) > MAX_FILES:
+                        raise LoadError(f"submission has more than {MAX_FILES} files")
+                    continue
+                directories += 1
+                if directories > MAX_DIRECTORIES:
+                    raise LoadError(f"submission has more than {MAX_DIRECTORIES} directories")
+                pending.append(child)
+    return files
+
+
+def _unreadable(exc: OSError, submission: Path) -> LoadError:
+    """A ``LoadError`` for an ``OSError`` met while reading ``submission``, naming the path that
+    failed relative to the submission's parent (``bot/asset.bin``), else the submission."""
+    failed = exc.filename
+    shown = submission.name
+    if isinstance(failed, (str, os.PathLike)) and Path(failed).is_relative_to(submission.parent):
+        shown = Path(failed).relative_to(submission.parent).as_posix()
+    return LoadError(f"cannot read {shown!r}: {exc.strerror or type(exc).__name__}")
 
 
 def _read_capped(path: Path, budget: int) -> bytes:
@@ -107,35 +141,55 @@ def _utf8_name(rel: str) -> bytes:
 def submission_sha256(path: Path) -> str:
     """sha256 over length-framed (POSIX relpath, size, bytes) records of every file.
 
-    Refuses symlinks, special files, ``__pycache__``, ``.pyc`` and file names that are not valid
-    UTF-8; enforces ``MAX_FILES`` and ``MAX_BYTES`` (the latter while reading).
+    Refuses symlinks, special files, ``__pycache__``, ``.pyc``, file names that are not valid
+    UTF-8 and files or directories that cannot be read; enforces ``MAX_FILES``,
+    ``MAX_DIRECTORIES`` and ``MAX_BYTES`` (the latter while reading).
     """
+    return _digest(path)[0]
+
+
+def _digest(path: Path, entry: Path | None = None) -> tuple[str, bytes | None]:
+    """The submission sha256 of ``path`` and the exact bytes of ``entry`` that went into it
+    (``None`` if ``entry`` is not one of its files)."""
     digest = hashlib.sha256(SHA_TAG)
     root = path if path.is_dir() and not path.is_symlink() else path.parent
     remaining = MAX_BYTES
+    source: bytes | None = None
     for f in _files(path):
         name = _utf8_name(_rel(f, root))
-        data = _read_capped(f, remaining)
+        try:
+            data = _read_capped(f, remaining)
+        except OSError as exc:
+            raise _unreadable(exc, path) from exc
         remaining -= len(data)
         digest.update(_framed(name))
         digest.update(_framed(data))
-    return digest.hexdigest()
+        if f == entry:
+            source = data
+    return digest.hexdigest(), source
 
 
 def _module_name(sha: str) -> str:
     return f"topple_submission_{sha[:16]}"
 
 
-def _import(entry: Path, sha: str) -> ModuleType:
+def _import(entry: Path, sha: str, source: bytes) -> ModuleType:
+    """Run ``source``, the entry's hashed bytes, as a new module named after ``sha``.
+
+    The code is compiled from exactly those bytes, as Python's source loader would compile them
+    (``dont_inherit``: none of this module's ``__future__`` flags), but nothing is read again
+    and no bytecode cache is consulted: a planted ``__pycache__`` (an unchecked-hash .pyc runs
+    without being compared to its source) or a file swapped after it was hashed changes nothing.
+    """
     name = _module_name(sha)
     spec = importlib.util.spec_from_file_location(name, entry)
-    if spec is None or spec.loader is None:
+    if spec is None:
         raise LoadError(f"cannot import {entry}")
-    module = importlib.util.module_from_spec(spec)
+    module = importlib.util.module_from_spec(spec)  # __file__, __spec__, ... as for an import
     sys.modules[name] = module
     stop_writing_bytecode()
     try:
-        spec.loader.exec_module(module)
+        exec(compile(source, str(entry), "exec", dont_inherit=True), module.__dict__)
     except KeyboardInterrupt:
         sys.modules.pop(name, None)
         raise
@@ -224,14 +278,19 @@ def load_submission(path: Path) -> Submission:
     _utf8_name(path.name)  # the name becomes the controller id
     if path.is_symlink():
         raise LoadError(f"{path} is a symlink; submit the file or directory itself")
-    path = path.resolve()
+    try:
+        path = path.resolve()
+    except (OSError, RuntimeError) as exc:  # RuntimeError: a symlink loop on the way
+        raise LoadError(f"cannot resolve {path}: {exc}") from exc
     if not path.exists():
         raise LoadError(f"{path} does not exist")
     entry = path / ENTRY_FILE if path.is_dir() else path
     if entry.suffix != ".py" or not entry.is_file():
         raise LoadError(f"expected a .py file or a directory containing {ENTRY_FILE}")
-    sha = submission_sha256(path)
-    module = _import(entry, sha)
+    sha, source = _digest(path, entry)
+    if source is None:  # cannot happen: the entry is always one of the hashed files
+        raise LoadError(f"{entry.name} was not hashed")
+    module = _import(entry, sha, source)
     try:
         factory = _factory(module, entry)
     except LoadError:

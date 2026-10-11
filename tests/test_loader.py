@@ -3,6 +3,7 @@ import os
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -656,3 +657,253 @@ def test_submission_id_names_the_resolved_file_or_directory(
     assert submission_id(bot) == "mybot"
     assert submission_id(Path("solo.py")) == "solo"
     assert submission_id(Path("inner/../solo.py")) == "solo"
+
+
+# ------------------------------------------------------------------ what runs is what was hashed
+
+
+PLANTED = """
+import pathlib
+
+pathlib.Path({marker!r}).write_text("the planted bytecode ran")
+
+
+class C:
+    def reset(self, rng_seed):
+        pass
+
+    def act(self, obs):
+        return (0.5, 0.5)
+
+
+def make_controller(spec):
+    return C()
+"""
+
+
+def sha_of(files: dict[str, bytes]) -> str:
+    """The submission sha256 of ``files`` (relpath -> bytes), written out independently."""
+    digest = hashlib.sha256(b"topple.submission/1\n")
+    for rel in sorted(files):
+        name = rel.encode("utf-8")
+        digest.update(len(name).to_bytes(8, "big") + name)
+        digest.update(len(files[rel]).to_bytes(8, "big") + files[rel])
+    return digest.hexdigest()
+
+
+def test_a_planted_pyc_next_to_a_single_file_never_runs(tmp_path: Path) -> None:
+    """Contract §8: the sha256 covers what runs. An unchecked-hash .pyc in the sibling
+    ``__pycache__`` is code the hash does not cover, which Python's own source loader would run
+    without comparing it to the source."""
+    import importlib.util
+    import py_compile
+
+    sub = tmp_path / "sub"
+    entry = write(sub, "bot.py", GOOD)
+    marker = tmp_path / "marker"
+    planted = write(tmp_path / "elsewhere", "planted.py", PLANTED.format(marker=str(marker)))
+    py_compile.compile(
+        str(planted),
+        cfile=importlib.util.cache_from_source(str(entry)),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    loaded = load_submission(entry)
+    assert loaded.sha256 == sha_of({"bot.py": GOOD.encode()})
+    assert loaded.factory(SPEC).act(None) == (0.0, 0.0)  # type: ignore[arg-type]
+    assert not marker.exists()
+
+
+def test_the_entry_is_read_once_so_a_swap_after_hashing_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No second read of the entry: what was hashed is what runs (no hash-then-swap race)."""
+    entry = write(tmp_path, "bot.py", GOOD)
+    real_read = loader_module._read_capped
+
+    def read_then_swap(path: Path, budget: int) -> bytes:
+        data = real_read(path, budget)
+        entry.write_text(GOOD.replace("(0.0, 0.0)", "(0.9, 0.9)"))
+        return data
+
+    monkeypatch.setattr(loader_module, "_read_capped", read_then_swap)
+    loaded = load_submission(entry)
+    assert loaded.sha256 == sha_of({"bot.py": GOOD.encode()})
+    assert loaded.factory(SPEC).act(None) == (0.0, 0.0)  # type: ignore[arg-type]
+
+
+def test_a_directory_runs_the_hashed_bytes_of_its_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bot"
+    entry = write(root, "controller.py", GOOD)
+    write(root, "gains.txt", "0.5")
+    real_read = loader_module._read_capped
+
+    def read_then_swap(path: Path, budget: int) -> bytes:
+        data = real_read(path, budget)
+        if path == entry:
+            entry.write_text(GOOD.replace("(0.0, 0.0)", "(0.9, 0.9)"))
+        return data
+
+    monkeypatch.setattr(loader_module, "_read_capped", read_then_swap)
+    loaded = load_submission(root)
+    assert loaded.sha256 == sha_of({"controller.py": GOOD.encode(), "gains.txt": b"0.5"})
+    assert loaded.factory(SPEC).act(None) == (0.0, 0.0)  # type: ignore[arg-type]
+
+
+MODULE_FACTS = """
+import sys
+from dataclasses import dataclass
+
+
+@dataclass
+class Gains:
+    kp: "float"
+
+
+FACTS = {"file": __file__, "name": __name__, "registered": sys.modules[__name__].Gains is Gains}
+
+
+def make_controller(spec):
+    return None
+"""
+
+
+def test_the_submission_runs_as_a_proper_module(tmp_path: Path) -> None:
+    """``__file__`` (for assets), ``__name__`` and ``sys.modules`` behave as for an import."""
+    entry = write(tmp_path, "facts.py", MODULE_FACTS)
+    loaded = load_submission(entry)
+    module = sys.modules[f"topple_submission_{loaded.sha256[:16]}"]
+    facts = module.FACTS
+    assert facts == {"file": str(entry), "name": module.__name__, "registered": True}
+
+
+def test_the_loader_does_not_lend_its_future_imports(tmp_path: Path) -> None:
+    """The submission compiles as Python would compile it: ``topple.loader``'s own
+    ``from __future__ import annotations`` must not postpone the submission's annotations."""
+    text = "def helper(x: NotDefinedAnywhere) -> None:\n    pass\n\n" + ZERO_ARG
+    assert load_error_message(write(tmp_path, "eager.py", text)).endswith(
+        "NameError: name 'NotDefinedAnywhere' is not defined"
+    )
+
+
+def test_a_source_that_does_not_compile_is_a_load_error(tmp_path: Path) -> None:
+    entry = tmp_path / "nul.py"
+    entry.write_bytes(b"x = 1\x00\n")
+    assert load_error_message(entry).startswith("importing nul.py failed: SyntaxError: ")
+
+
+# ------------------------------------------------------------------ unreadable trees (§8)
+
+
+def unreadable(path: Path) -> Path:
+    """``path`` with every permission removed; skips where they are not enforced (root)."""
+    path.chmod(0)
+    if os.access(path, os.R_OK):
+        path.chmod(0o755)
+        pytest.skip("file permissions are not enforced for this user")
+    return path
+
+
+def test_an_unreadable_file_is_a_load_error(tmp_path: Path) -> None:
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    asset = unreadable(write(root, "asset.bin", "x"))
+    try:
+        with pytest.raises(LoadError, match=r"cannot read 'bot/asset\.bin': Permission denied"):
+            load_submission(root)
+        with pytest.raises(LoadError, match="cannot read"):
+            submission_sha256(root)
+    finally:
+        asset.chmod(0o644)
+
+
+def test_an_unreadable_directory_is_a_load_error(tmp_path: Path) -> None:
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    data = unreadable(write(root, "data/x.txt", "x").parent)
+    try:
+        with pytest.raises(LoadError, match=r"cannot read 'bot/data': Permission denied"):
+            load_submission(root)
+    finally:
+        data.chmod(0o755)
+
+
+def test_a_file_that_vanishes_before_it_is_read_is_a_load_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bot"
+    entry = write(root, "controller.py", GOOD)
+    monkeypatch.setattr(loader_module, "_files", lambda path: [entry, root / "gone.txt"])
+    with pytest.raises(LoadError, match=r"cannot read 'bot/gone\.txt': No such file"):
+        submission_sha256(root)
+
+
+def test_an_os_error_without_a_path_names_the_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+
+    def failing_walk(path: Path) -> list[Path]:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(loader_module, "_walk", failing_walk)
+    with pytest.raises(LoadError, match="cannot read 'bot': Input/output error"):
+        load_submission(root)
+
+
+def test_a_path_that_cannot_be_resolved_is_a_load_error(tmp_path: Path) -> None:
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    with pytest.raises(LoadError, match="cannot resolve"):
+        load_submission(loop / "bot.py")
+
+
+# ------------------------------------------------------------------ bounded walks (§8)
+
+
+def test_too_many_directories(tmp_path: Path) -> None:
+    root = tmp_path / "dirs"
+    write(root, "controller.py", GOOD)
+    cap = loader_module.MAX_DIRECTORIES
+    for i in range(cap):
+        (root / f"d{i}").mkdir()
+    assert len(load_submission(root).sha256) == 64
+    (root / "one_more").mkdir()
+    with pytest.raises(LoadError, match=f"more than {cap} directories"):
+        load_submission(root)
+
+
+def test_the_walk_stops_at_the_directory_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tree of thousands of empty directories is refused as soon as the cap is passed."""
+    root = tmp_path / "wide"
+    write(root, "controller.py", GOOD)
+    for i in range(500):
+        (root / f"d{i}" / "inner").mkdir(parents=True)
+    listed: list[str] = []
+    real_scandir = os.scandir
+
+    def scandir(path: Any) -> Any:
+        listed.append(str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(loader_module.os, "scandir", scandir)
+    with pytest.raises(LoadError, match="directories"):
+        submission_sha256(root)
+    assert len(listed) == 1  # refused while listing the top directory
+
+
+def test_untrusted_names_are_quoted_in_load_errors(tmp_path: Path) -> None:
+    """A name can carry terminal escapes (or a newline and ``::error::`` for a CI log): load
+    errors show it escaped."""
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    write(root, "\x1b]0;pwned\x07\n::error::x.pyc", "")
+    message = load_error_message(root)
+    assert "\x1b" not in message
+    assert "\n" not in message
+    assert "\\x1b]0;pwned\\x07\\n::error::x.pyc" in message

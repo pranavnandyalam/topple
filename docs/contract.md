@@ -239,12 +239,23 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   that fails leaves no submission module behind in `sys.modules`.
 - Submission kinds: a `.py` file, or a directory with `controller.py` plus assets located via
   `Path(__file__).parent` (ONNX policies arrive in Phase 2). A directory may hold at most 50
-  regular files and 20 MiB in total (enforced while reading); symlinks, special files,
+  regular files in at most 50 subdirectories (at any depth) and 20 MiB in total, enforced while
+  it is walked and read, so a huge tree is refused at once; symlinks, special files,
   `__pycache__`, `.pyc` files and names (the submission's own or any file's) that are not valid
-  UTF-8 are refused. Loading a submission turns bytecode writing off for the rest of the process
-  (`sys.dont_write_bytecode`), so neither its import nor a later import of a sibling module (in
-  `make_controller`, `reset` or `act`) writes bytecode next to it. The submission sha256 covers
-  every file as length-framed `(POSIX relpath, size, bytes)` records in POSIX-path string order.
+  UTF-8 are refused, and so is a file or directory that cannot be read (a `LoadError` naming it,
+  never an `OSError`). Untrusted names in load errors are quoted with `repr`, so they cannot
+  carry terminal escapes or line breaks. Loading a submission turns bytecode writing off for the
+  rest of the process (`sys.dont_write_bytecode`), so neither its import nor a later import of a
+  sibling module (in `make_controller`, `reset` or `act`) writes bytecode next to it. The
+  submission sha256 covers every file as length-framed `(POSIX relpath, size, bytes)` records in
+  POSIX-path string order.
+- **The sha256 covers the code that runs.** The entry file (the `.py` file, or `controller.py`)
+  is read once: those bytes are hashed, and those bytes are compiled (as Python compiles a
+  module, inheriting no `__future__` flags from the loader) and run as the submission's module.
+  No bytecode cache is consulted, so a `.pyc` planted in a `__pycache__` next to a single-file
+  submission (an unchecked-hash `.pyc` would run without being compared to its source) never
+  runs, and the file cannot change between being hashed and being run. Modules the submission
+  imports itself are ordinary imports: in a directory submission they are hashed files.
 
 ## 9. Randomness, seeds and scenarios
 
