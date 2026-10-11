@@ -1078,18 +1078,18 @@ def test_a_trajectory_path_that_cannot_be_examined_exits_2(
 ) -> None:
     """Exit 1 means "verification failed" (§16): a path that cannot even be examined is a
     usage error, exit 2 with one line."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
     if where == "name too long":
-        path, reason = tmp_path / f"{TOO_LONG}.npz", "File name too long"
+        path, reason = locked / f"{TOO_LONG}.npz", "File name too long"
     else:
-        locked = tmp_path / "locked"
-        locked.mkdir()
         path, reason = locked / "traj_000.npz", "Permission denied"
         path.write_bytes(b"")
         _locked(locked, 0, path)
     try:
         result = runner.invoke(app, [command, str(path)])
     finally:
-        path.parent.chmod(0o755)
+        locked.chmod(0o755)
     assert result.exit_code == 2, result.output
     assert result.output.startswith("error: cannot read ")
     assert result.output.rstrip().endswith(f": {reason}")
