@@ -432,7 +432,10 @@ from different env algorithms are never compared; once a challenge is published 
 needs its new major version. Known-answer tests (`tests/test_golden.py`) pin controller seeds,
 scenarios (seeds 0, 1000 and 2**53−1 on every preset), the bundle and protocol hashes and the
 PID/LQR baseline scores on public seeds 1000–1002 of `standard` (per platform, to 1e-9), so such
-a change cannot land unnoticed.
+a change cannot land unnoticed. CI (`linux-x86_64`, the platform ranked scores come from)
+enforces that platform's scores on every push; the `darwin-arm64` scores are enforced only by
+test runs on Apple Silicon, and any other platform skips them and prints what it measured. A
+deliberate re-pin updates every platform's scores in one change.
 
 - `bundle_hash()` = sha256 of the tag `topple.bundle/1\n`, then, for each bundle file in POSIX-path
   order, `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths, path relative to the bundle

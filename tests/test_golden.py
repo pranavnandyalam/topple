@@ -13,6 +13,14 @@ bits and sha256 are portable, and scenario draws apply their affine maps in Pyth
 Episode scores come from MuJoCo physics, which is only deterministic per platform (PLAN.md, trust
 model), so they are pinned per platform tag; a platform without pins skips and prints what it
 measured.
+
+Who enforces which pins: CI (GitHub Actions ubuntu-24.04, ``linux-x86_64``, the platform ranked
+scores come from) checks the linux-x86_64 scores on every push. The ``darwin-arm64`` scores, the
+development platform's, are checked only when the suite runs on an Apple Silicon Mac; no CI job
+runs there. So a deliberate re-pin (after a reviewed physics change, or a dependency bump that
+moves scores) updates every platform in ``EPISODES`` in the same change: the darwin-arm64 values
+from a local run of this file, the linux-x86_64 values from the CI failure message. Both print
+every measured value. Re-pinning only the platform that failed would leave the other stale.
 """
 
 from __future__ import annotations
@@ -206,6 +214,14 @@ def _measure(name: str) -> dict[int, EpisodeKey]:
     return measured
 
 
+def test_every_platform_pins_the_same_episodes() -> None:
+    """A re-pin cannot drop a controller or a seed on one platform."""
+    assert set(EPISODES) == {"darwin-arm64", "linux-x86_64"}
+    for table in EPISODES.values():
+        assert set(table) == set(FACTORIES)
+        assert all(set(scores) == set(EPISODE_SEEDS) for scores in table.values())
+
+
 @pytest.mark.parametrize("name", sorted(FACTORIES))
 def test_baseline_episode_scores_known_answers(name: str) -> None:
     tag = platform_tag()
@@ -216,7 +232,10 @@ def test_baseline_episode_scores_known_answers(name: str) -> None:
     assert set(measured) == set(expected) == set(EPISODE_SEEDS)
     for seed, (score, success, upright) in expected.items():
         got = measured[seed]
-        context = f"{tag} {name} seed {seed}: measured {measured!r}"
+        context = (
+            f"{tag} {name} seed {seed}: measured {measured!r}. A deliberate re-pin updates "
+            "every platform in EPISODES (module docstring)"
+        )
         assert got[0] == pytest.approx(score, abs=SCORE_TOL, rel=0), context
         assert got[1] is success, context
         assert got[2] == upright, context

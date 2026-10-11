@@ -37,6 +37,7 @@ def test_env_checker_passes_for_every_preset() -> None:
         check_env(BalanceEnv(preset), skip_render_check=True)
 
 
+@pytest.mark.slow
 def test_pid_balances_over_90_percent_without_pushes() -> None:
     protocol = replace(EvalProtocol.from_id("balance-v1/clean"), seeds=tuple(range(500, 550)))
     results = evaluate(protocol, pid, INFO)

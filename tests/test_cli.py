@@ -1005,6 +1005,7 @@ def test_an_unreadable_part_of_a_submission_exits_2(
     assert not (out / "results.json").exists()
 
 
+@pytest.mark.slow
 def test_a_private_directory_rescore_fails_on_a_forged_episode(
     eval_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
