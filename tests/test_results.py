@@ -199,7 +199,7 @@ def test_sanitize_detail_property(raw: str) -> None:
 
 def test_hostile_detail_survives_write_and_read(tmp_path: Path) -> None:
     data = results_dict(episodes=[episode(0), episode(1, seed=5, error="exception")])
-    data["episodes"][1]["error"]["detail"] = "\ud83d boom \x00 ‮"
+    data["episodes"][1]["error"]["detail"] = "\ud83d boom \x00 \u202e"
     data["aggregate"].update(score=45.0, success_rate=0.5, errors=1)
     results = EvalResults.model_validate(data)
     path = tmp_path / "results.json"
