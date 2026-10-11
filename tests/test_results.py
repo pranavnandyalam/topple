@@ -526,6 +526,75 @@ def test_read_results_reads_at_most_the_cap(
     assert read_results(path).controller.id == "pid"
 
 
+UNSAFE_TEXT = "\x1b]0;pwn\x07\u202e\n::error::x"  # a terminal escape, a bidi override, a CI command
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("platform",),
+        ("versions", "topple"),
+        ("versions", "mujoco"),
+        ("versions", "numpy"),
+        ("versions", "obs_schema"),
+        ("versions", "action_spec"),
+    ],
+)
+@pytest.mark.parametrize("text", [UNSAFE_TEXT, "\t", "\u2028", "\u200b", "\x00"])
+def test_platform_and_versions_hold_printable_text_only(path: tuple[str, ...], text: str) -> None:
+    """§15: every string of an uploaded file is attacker-chosen; besides the sanitized
+    ``controller.id`` and ``detail``, the free-text fields refuse what a terminal, a CI log or a
+    page would act on (control, format and separator characters but the space)."""
+    data = results_dict()
+    setter = data
+    for key in path[:-1]:
+        setter = setter[key]
+    setter[path[-1]] = text
+    with pytest.raises(ValidationError, match="printable"):
+        EvalResults.model_validate_json(json.dumps(data))
+
+
+@pytest.mark.parametrize("where", ["name", "value"])
+@pytest.mark.parametrize("text", [UNSAFE_TEXT, "a\tb", "\u202e", "\x00"])
+def test_metric_names_and_string_values_hold_printable_text_only(where: str, text: str) -> None:
+    metrics: dict[str, Any] = {"time_upright_s": 10.0, "termination": "timeout"}
+    if where == "name":
+        metrics[text] = 1.0
+    else:
+        metrics["termination"] = text
+    with pytest.raises(ValidationError, match="printable"):
+        EpisodeResult.model_validate_json(json.dumps({**episode(0), "metrics": metrics}))
+
+
+def test_printable_text_is_kept() -> None:
+    data = results_dict(platform="linux-x86_64 (é ok)")
+    data["episodes"][0]["metrics"] = {"time_upright_s": 10.0, "termination": "fell", "ünï": 1}
+    results = EvalResults.model_validate_json(json.dumps(data))
+    assert results.platform == "linux-x86_64 (é ok)"
+    assert results.episodes is not None
+    assert results.episodes[0].metrics == {"time_upright_s": 10.0, "termination": "fell", "ünï": 1}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("challenge", UNSAFE_TEXT),
+        ("challenge", "Balance-v1"),
+        ("challenge", "balance"),
+        ("challenge", "balance-v1\n"),
+        ("protocol", UNSAFE_TEXT),
+        ("protocol", "balance-v1"),
+        ("protocol", "balance-v1/Standard"),
+        ("protocol", "balance-v1/standard/x"),
+        ("protocol", "eval_v1"),
+    ],
+)
+def test_challenge_and_protocol_follow_the_section_1_grammar(field: str, value: str) -> None:
+    """Results name a challenge and a protocol by their canonical ids (§1), never an alias."""
+    with pytest.raises(ValidationError, match=f"invalid {field} id"):
+        EvalResults.model_validate_json(json.dumps(results_dict(**{field: value})))
+
+
 def test_the_controller_id_is_untrusted_text() -> None:
     """The id is a submission's file name: control, format and line-separator characters (a
     bidi override, a line break before ``@maintainers``) become U+FFFD, one for one."""

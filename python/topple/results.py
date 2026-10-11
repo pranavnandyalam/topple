@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Annotated, Literal, get_args
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -20,6 +21,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from topple.ids import parse_protocol, validate_challenge_id
 
 FORMAT: Literal["topple.results/1"] = "topple.results/1"
 MAX_DETAIL_CHARS = 300
@@ -62,11 +65,31 @@ RUN_ERROR_CODES: frozenset[str] = frozenset(get_args(RunErrorCode))
 VERIFY_ERROR_CODES: frozenset[str] = frozenset(get_args(VerifyErrorCode))
 Isolation = Literal["inprocess", "subprocess", "container"]
 
+
+def _printable(value: str) -> str:
+    """Refuse what a terminal, a CI log or a page would act on: control, format (bidi overrides,
+    zero-width characters) and separator characters but the space (``str.isprintable``)."""
+    if not value.isprintable():
+        raise ValueError(f"must hold printable characters only, got {value!r}")
+    return value
+
+
+def _protocol_id(value: str) -> str:
+    parse_protocol(value)
+    return value
+
+
+Printable = AfterValidator(_printable)
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 Identifier = Annotated[str, StringConstraints(min_length=1, max_length=MAX_ID_CHARS)]
-VersionStr = Annotated[str, StringConstraints(max_length=MAX_VERSION_CHARS)]
-MetricName = Annotated[str, StringConstraints(min_length=1, max_length=MAX_METRIC_CHARS)]
-MetricValue = float | int | bool | Annotated[str, StringConstraints(max_length=MAX_METRIC_CHARS)]
+ChallengeId = Annotated[Identifier, AfterValidator(validate_challenge_id)]
+ProtocolId = Annotated[Identifier, AfterValidator(_protocol_id)]
+PlatformStr = Annotated[str, StringConstraints(max_length=MAX_PLATFORM_CHARS), Printable]
+VersionStr = Annotated[str, StringConstraints(max_length=MAX_VERSION_CHARS), Printable]
+MetricName = Annotated[str, StringConstraints(min_length=1, max_length=MAX_METRIC_CHARS), Printable]
+MetricValue = (
+    float | int | bool | Annotated[str, StringConstraints(max_length=MAX_METRIC_CHARS), Printable]
+)
 Metrics = Annotated[dict[MetricName, MetricValue], Field(max_length=MAX_METRICS)]
 
 
@@ -155,12 +178,12 @@ class EvalResults(_Strict):
     run rankable (Phase 3 decides that from which trusted job produced the file)."""
 
     format: Literal["topple.results/1"] = FORMAT
-    challenge: Identifier
-    protocol: Identifier
+    challenge: ChallengeId
+    protocol: ProtocolId
     protocol_hash: Sha256
     seed_set: Literal["public", "private"]
     versions: Versions
-    platform: Annotated[str, StringConstraints(max_length=MAX_PLATFORM_CHARS)]
+    platform: PlatformStr
     robot_hash: Sha256
     controller: ControllerInfo
     isolation: Isolation

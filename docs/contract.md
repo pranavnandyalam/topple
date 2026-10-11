@@ -551,12 +551,17 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
 - **Bounds.** `controller.id`, `challenge` and `protocol`: 1–200 characters; `platform` and each
   version string ≤ 64; `controller.sha256`, `protocol_hash` and `robot_hash`: 64 lowercase hex
   digits; at most 10,000 episodes; at most 32 metrics per episode, each name 1–64 characters and
-  each string value ≤ 64. An error `detail` is untrusted text: it keeps at most 300 characters,
-  and lone surrogates and control characters other than `\n` and `\t` become U+FFFD (one for
-  one, so re-validating a stored detail changes nothing). `controller.id` is untrusted text too
-  (a submission's name): control, format (bidi overrides, zero-width characters) and
-  line-separator characters and lone surrogates become U+FFFD, one for one. Escape both before
-  rendering.
+  each string value ≤ 64.
+- **Untrusted text.** Every string in an uploaded file is chosen by whoever wrote it.
+  `challenge` and `protocol` follow §1's grammar (canonical ids such as `balance-v1/standard`,
+  never an alias). `platform`, each version string, each metric name and each string metric
+  value hold printable characters only (Python's `str.isprintable`: no control, format or
+  separator character but the space), or the file is refused. An error `detail` keeps at most
+  300 characters, and lone surrogates and control characters other than `\n` and `\t` become
+  U+FFFD (one for one, so re-validating a stored detail changes nothing). `controller.id` (a
+  submission's name): control, format (bidi overrides, zero-width characters) and
+  line-separator characters and lone surrogates become U+FFFD, one for one. Printable is not
+  harmless (Markdown, HTML): escape every string for wherever it is rendered.
 - **Cross-field checks.** An episode with an error has score 0 and is not a success. Public
   results list their episodes with strictly increasing `index` and a `seed` each,
   `aggregate.episodes == len(episodes)` and `aggregate.errors` equal to the number of episodes
