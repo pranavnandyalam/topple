@@ -28,6 +28,7 @@ RESULTS_FILE_MODE = 0o644
 REPLACEMENT_CHAR = "�"
 _KEPT_CONTROLS = frozenset("\n\t")
 _NO_DIRECTORY_FSYNC = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP})
+_NO_DIRECTORY_OPEN = frozenset({errno.EACCES, errno.EPERM})  # e.g. a write-only drop directory
 
 RunErrorCode = Literal[
     "exception",
@@ -158,13 +159,13 @@ def _check_public_episodes(episodes: list[EpisodeResult], aggregate: Aggregate) 
 
 def write_results(results: EvalResults, path: Path) -> None:
     """Atomic, durable write: readers never see a half-written file, and once this returns the
-    file is on disk (the file is fsynced before the rename, its directory after), mode 0644
-    whatever the umask."""
+    file is on disk (the file is fsynced before the rename, its directory after, where the
+    directory can be opened and synced), mode 0644 whatever the umask."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            os.fchmod(fh.fileno(), RESULTS_FILE_MODE)
+            _set_mode(fh.fileno(), tmp)
             fh.write(results.model_dump_json(indent=2))
             fh.write("\n")
             fh.flush()
@@ -176,12 +177,27 @@ def write_results(results: EvalResults, path: Path) -> None:
     _fsync_directory(path.parent)
 
 
+def _set_mode(fd: int, path: str) -> None:
+    """``RESULTS_FILE_MODE`` on the open temporary file, whatever the umask. Through the path
+    where ``os.fchmod`` does not exist (Windows before Python 3.13)."""
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, RESULTS_FILE_MODE)
+    else:
+        os.chmod(path, RESULTS_FILE_MODE)
+
+
 def _fsync_directory(directory: Path) -> None:
-    """Make a rename in ``directory`` durable. Skipped where directories cannot be opened
-    (Windows) or the file system does not support syncing them; any other failure raises."""
+    """Make a rename in ``directory`` durable. Skipped where the directory cannot be opened
+    (Windows; no read permission, as in a write-only drop directory) or its file system does not
+    support syncing it; any other failure raises, after the rename has already happened."""
     if os.name == "nt":
         return
-    fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError as exc:
+        if exc.errno in _NO_DIRECTORY_OPEN:
+            return
+        raise
     try:
         os.fsync(fd)
     except OSError as exc:

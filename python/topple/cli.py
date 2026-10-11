@@ -67,10 +67,14 @@ BindProtocolOpt = Annotated[
 
 
 def _fail(message: str) -> NoReturn:
-    """Usage, load or internal error: a clean one-line message and exit code 2."""
+    """Usage, load or internal error: a clean one-line message and exit code 2.
+
+    Lone surrogates (how a file name that is not valid UTF-8 decodes) are printed escaped.
+    """
     if len(message) > MAX_MESSAGE_CHARS:
         message = message[: MAX_MESSAGE_CHARS - 3] + "..."
-    typer.echo(f"error: {message}", err=True)
+    printable = message.encode("utf-8", "backslashreplace").decode("utf-8")
+    typer.echo(f"error: {printable}", err=True)
     raise typer.Exit(code=2)
 
 
@@ -159,9 +163,8 @@ def _evaluate(
 ) -> EvalResults:
     """Run, save the trajectories and ``results.json``; ``complete=False`` marks a partial run."""
     from topple.evaluate import evaluate
-    from topple.results import MAX_ID_CHARS, ControllerInfo
 
-    info = ControllerInfo(id=sub.id[:MAX_ID_CHARS], sha256=sub.sha256)
+    info = _controller(sub.id, sub.sha256)
     try:
         results = evaluate(protocol, sub.factory, info, traj_dir=out)
     except OSError as exc:
@@ -319,19 +322,29 @@ def _verify_file(
         _fail(f"verification crashed: {describe_exception(exc)}")
 
 
+def _controller(name: str, sha256: str) -> ControllerInfo:
+    """The recorded identity of a submission; exit 2 if its name cannot be a controller id."""
+    from topple.results import MAX_ID_CHARS, ControllerInfo
+
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:  # a file name that is not valid UTF-8 decodes to lone surrogates
+        _fail(f"the submission name {name!r} is not valid UTF-8; rename it")
+    return ControllerInfo(id=(name or UNKNOWN_CONTROLLER_ID)[:MAX_ID_CHARS], sha256=sha256)
+
+
 def _controller_info(submission: Path | None) -> ControllerInfo:
     """The submission's hash (computed, never imported), or the ``unknown`` placeholder."""
     from topple.loader import LoadError, submission_sha256
-    from topple.results import MAX_ID_CHARS, ControllerInfo
+    from topple.results import ControllerInfo
 
     if submission is None:
         return ControllerInfo(id=UNKNOWN_CONTROLLER_ID, sha256=UNKNOWN_SHA256)
     try:
         sha = submission_sha256(submission)
-    except (LoadError, OSError) as exc:
+    except (LoadError, OSError, ValueError) as exc:
         _fail(f"cannot hash {submission}: {exc}")
-    name = submission.stem if submission.is_file() else submission.name
-    return ControllerInfo(id=(name or UNKNOWN_CONTROLLER_ID)[:MAX_ID_CHARS], sha256=sha)
+    return _controller(submission.stem if submission.is_file() else submission.name, sha)
 
 
 def _traj_files(directory: Path) -> dict[int, Path]:
@@ -440,10 +453,11 @@ def verify(
         results = _verify_directory(path, protocol, _controller_info(submission), iso)
         ok = _report_directory(results)
     elif path.is_file():
+        controller = _controller_info(submission)  # a bad --submission fails before any verdict
         binding, verdict = _verify_file(path, protocol, index, seed)
         _report_file(binding, verdict)
         ok = verdict.ok
-        results = _single_results(binding, verdict, _controller_info(submission), iso)
+        results = _single_results(binding, verdict, controller, iso)
     else:
         _fail(_not_a_file(path))
     if out is not None:
@@ -476,7 +490,7 @@ def score(
         "bound": binding.bound,
         "protocol": binding.protocol.id,
         "index": verdict.index,
-        "seed": binding.seed,
+        "seed": result.seed,  # null for a private protocol: its seeds are secret
         "score": result.score,
         "success": result.success,
         "error": result.error.model_dump() if result.error else None,

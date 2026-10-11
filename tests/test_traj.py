@@ -3,6 +3,8 @@ import json
 import os
 import re
 import tempfile
+import threading
+import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -384,7 +386,9 @@ def test_read_meta_rejects_numbers_that_overflow_to_infinity(tmp_path: Path, tex
     path = tmp_path / "meta.npz"
     meta = b'{"format": "topple.traj/1", "x": ' + text.encode() + b"}"
     write_members(path, honest_members(meta=meta))
-    with pytest.raises(ValueError, match="non-finite"):
+    # The whole message: the dedicated error must not be rewrapped as "not valid UTF-8 JSON".
+    exact = rf"^meta\.npz: meta_json: non-finite number {re.escape(text)}$"
+    with pytest.raises(ValueError, match=exact):
         read_meta(path)
 
 
@@ -416,6 +420,56 @@ def test_a_fifo_is_refused_without_blocking(
         load_npz(path, max_steps=1000)
     with pytest.raises(ValueError, match=r"traj_000\.npz: not a regular file"):
         read_meta(path)
+
+
+def _release_blocked_readers(path: Path) -> None:
+    """Open ``path`` for writing once, which lets a reader stuck opening the FIFO go on."""
+    for _ in range(100):
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:  # ENXIO: no reader has the FIFO open yet
+            time.sleep(0.01)
+        else:
+            return
+
+
+@pytest.mark.parametrize(
+    "read",
+    [lambda path: load_npz(path, max_steps=1000), read_meta],
+    ids=["load_npz", "read_meta"],
+)
+def test_a_fifo_with_no_writer_is_refused_at_once(
+    tmp_path: Path, read: Callable[[Path], object]
+) -> None:
+    """No writer ever appears, so a blocking open would hang forever: the loader must refuse the
+    FIFO without waiting (§14). Unlike ``make_fifo``, nothing here releases a blocked reader
+    until the verdict is in; the release afterwards only keeps a regressed loader from leaking a
+    stuck thread."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("named pipes need a POSIX system")
+    path = tmp_path / "traj_000.npz"
+    os.mkfifo(path)
+    outcome: list[BaseException | None] = []
+
+    def attempt() -> None:
+        try:
+            read(path)
+        except BaseException as exc:  # recorded and checked below
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    thread = threading.Thread(target=attempt, daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+    blocked = thread.is_alive()
+    if blocked:
+        _release_blocked_readers(path)
+        thread.join(timeout=5.0)
+    assert not blocked, "opening a FIFO that has no writer blocked"
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], ValueError)
+    assert "traj_000.npz: not a regular file" in str(outcome[0])
 
 
 def test_a_device_is_refused(tmp_path: Path) -> None:

@@ -79,8 +79,9 @@ class EpisodeVerdict:
     ok: bool  # bound to (protocol, index) and reproduced bit-exactly
     code: VerifyCode | None
     reason: str  # human-readable; the first failing check
-    replay: Trajectory | None  # trusted replay (None if the upload failed before replaying);
-    # its ``action`` is the upload's checked raw output, which a replay cannot re-derive
+    replay: Trajectory | None  # trusted replay, as far as it ran (None if the upload failed
+    # before replaying); its ``action`` is the upload's checked raw output, which a replay cannot
+    # re-derive
     result: EpisodeResult  # scored only from ``replay`` and the env's own metadata
 
 
@@ -106,10 +107,11 @@ class _Replayed:
 
 
 class _RejectedError(Exception):
-    def __init__(self, code: VerifyCode, reason: str) -> None:
+    def __init__(self, code: VerifyCode, reason: str, replay: Trajectory | None = None) -> None:
         super().__init__(reason)
         self.code: VerifyCode = code
         self.reason = reason
+        self.replay = replay  # the replay as far as it ran, when it ran before the rejection
 
 
 def _not_reproducible(reason: str) -> _RejectedError:
@@ -205,7 +207,8 @@ def _verify(env: BalanceEnv, upload: Trajectory, target: _Target) -> EpisodeVerd
             raise _RejectedError("incomplete", replayed.error.detail)
         _check_integrity(upload, replay)
     except _RejectedError as rejection:
-        return _rejected(env, target, upload.steps, rejection, replay)
+        ran = rejection.replay if rejection.replay is not None else replay
+        return _rejected(env, target, upload.steps, rejection, ran)
     return _accepted(env, target, replayed)
 
 
@@ -282,7 +285,7 @@ def _replay(
     done = False
     for k in range(steps):
         if done:
-            raise _not_reproducible(f"the replay ended after {k} steps, the trajectory has {steps}")
+            raise _ended_early(env, upload, k, index)
         _, _, terminated, truncated, _ = env.step(upload.ctrl[k])
         done = terminated or truncated
     reason = env.termination_reason
@@ -293,6 +296,17 @@ def _replay(
     # The env records the commands it was stepped with as ``action``; the raw controller output
     # cannot be re-derived open loop, so the replay keeps the upload's (checked in step 3).
     return _Replayed(replace(env.trajectory(meta), action=upload.action), error)
+
+
+def _ended_early(env: BalanceEnv, upload: Trajectory, k: int, index: int) -> _RejectedError:
+    """The env terminated or truncated after ``k`` of the upload's rows: the upload does not
+    reproduce, but the replay ran, so the rejection carries it (its first ``k`` steps, no error
+    and no epilogue) for the verdict's metrics."""
+    replay = replace(
+        env.trajectory({"episode_index": index, "error": None}), action=upload.action[:k]
+    )
+    reason = f"the replay ended after {k} steps, the trajectory has {upload.steps}"
+    return _RejectedError("not_reproducible", reason, replay)
 
 
 def _replay_error(

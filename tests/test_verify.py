@@ -108,6 +108,30 @@ def test_the_replay_keeps_the_raw_actions(honest_runs: dict[str, Honest]) -> Non
         assert (np.abs(verdict.replay.action) > 1.0).any()
 
 
+@pytest.mark.parametrize("saturated", [1e300, 1.0], ids=["huge", "unit"])
+def test_rewriting_saturated_actions_changes_no_score(
+    honest_runs: dict[str, Honest], saturated: float
+) -> None:
+    """Only ``clip(action) == ctrl`` ties a saturated row's raw action down, so an upload may put
+    any finite value of the right sign there. ``replay.action`` is that value, and nothing may be
+    scored from it (§16): every result and the aggregate stay exactly the honest ones."""
+    run = honest_runs["random"]
+    assert run.results.episodes is not None
+    forged: dict[int, Trajectory] = {}
+    for index, upload in run.uploads.items():
+        rows = np.abs(upload.ctrl) == 1.0
+        action = np.where(rows, np.sign(upload.ctrl) * saturated, upload.action)
+        assert not np.array_equal(action, upload.action)
+        forged[index] = replace(upload, action=action)
+        verdict = verify_episode(forged[index], run.protocol, index)
+        assert_reproduces(verdict, run.results.episodes[index])
+        assert verdict.replay is not None
+        np.testing.assert_array_equal(verdict.replay.action, action)
+    again = rescore(run.protocol, forged, INFO, "inprocess")
+    assert again.episodes == run.results.episodes
+    assert again.aggregate == run.results.aggregate
+
+
 def test_a_verdict_carries_the_trusted_replay(honest_runs: dict[str, Honest]) -> None:
     run = honest_runs["pid"]
     verdict = verify_episode(run.uploads[0], run.protocol, 0)

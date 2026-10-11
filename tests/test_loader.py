@@ -418,6 +418,47 @@ def test_sha_frames_names_and_contents(tmp_path: Path) -> None:
     assert submission_sha256(one) != submission_sha256(two)
 
 
+def _non_utf8_file(directory: Path) -> Path:
+    """A file named by the bytes ``x\\xff.txt`` (not UTF-8), as Linux allows; skipped where the
+    file system refuses such names (APFS)."""
+    raw = os.fsencode(directory) + b"/x\xff.txt"
+    try:
+        fd = os.open(raw, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except OSError as exc:
+        pytest.skip(f"this file system refuses non-UTF-8 names: {exc}")
+    os.close(fd)
+    return Path(os.fsdecode(raw))  # the name holds the lone surrogate "\\udcff"
+
+
+def test_a_file_name_that_is_not_utf8_is_a_load_error(tmp_path: Path) -> None:
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    _non_utf8_file(root)
+    with pytest.raises(LoadError, match="not valid UTF-8"):
+        submission_sha256(root)
+    with pytest.raises(LoadError, match="not valid UTF-8"):
+        load_submission(root)
+
+
+def test_a_submission_whose_own_name_is_not_utf8_is_refused(tmp_path: Path) -> None:
+    """Its name becomes the controller id, which must be text (``results.json`` is UTF-8)."""
+    with pytest.raises(LoadError, match="not valid UTF-8"):
+        load_submission(tmp_path / "ctl\udcff.py")
+
+
+def test_a_name_that_is_not_utf8_is_refused_before_the_file_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Linux decodes the name ``b"x\\xff.txt"`` to ``"x\\udcff.txt"``, which has no UTF-8 form:
+    the hash refuses it with a ``LoadError`` (the CLI's clean exit 2), never ``UnicodeError``."""
+    root = tmp_path / "bot"
+    entry = write(root, "controller.py", GOOD)
+    odd = root / "x\udcff.txt"
+    monkeypatch.setattr(loader_module, "_files", lambda path: [entry, odd])
+    with pytest.raises(LoadError, match=r"x\\udcff\.txt.* not valid UTF-8"):
+        submission_sha256(root)
+
+
 @pytest.mark.parametrize("junk", ["__pycache__/controller.cpython-312.pyc", "old.pyc", "lib/x.pyc"])
 def test_compiled_python_is_refused(tmp_path: Path, junk: str) -> None:
     root = tmp_path / "bot"

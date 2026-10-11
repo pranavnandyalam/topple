@@ -253,7 +253,11 @@ def test_the_directory_is_fsynced_after_the_rename(
     assert events == ["fsync file", "replace", "fsync dir"]
 
 
-@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOTSUP])
+@pytest.mark.parametrize(
+    # ENOTSUP and EOPNOTSUPP are one number on Linux but two on macOS and the BSDs.
+    "code",
+    sorted({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}),
+)
 def test_a_directory_fsync_the_filesystem_does_not_support_is_skipped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
 ) -> None:
@@ -268,6 +272,69 @@ def test_a_directory_fsync_the_filesystem_does_not_support_is_skipped(
     path = tmp_path / "results.json"
     write_results(EvalResults.model_validate(results_dict()), path)
     assert read_results(path).challenge == results_dict()["challenge"]
+
+
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EPERM])
+def test_a_directory_that_cannot_be_opened_is_not_synced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """The rename has happened by then: a directory we may not open cannot be synced, like one
+    whose file system does not support it, and the write succeeds."""
+    real_open = os.open
+
+    def open_(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if os.path.isdir(path):
+            raise OSError(code, os.strerror(code))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(results_module.os, "open", open_)
+    path = tmp_path / "results.json"
+    write_results(EvalResults.model_validate(results_dict()), path)
+    assert read_results(path).challenge == results_dict()["challenge"]
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX permissions that apply to this user",
+)
+def test_results_can_be_written_into_a_write_only_drop_directory(tmp_path: Path) -> None:
+    drop = tmp_path / "drop"
+    drop.mkdir()
+    drop.chmod(0o300)  # write and search, but not read: the directory cannot be opened
+    try:
+        write_results(EvalResults.model_validate(results_dict()), drop / "results.json")
+    finally:
+        drop.chmod(0o700)
+    assert read_results(drop / "results.json").challenge == results_dict()["challenge"]
+
+
+def test_any_other_failure_to_open_the_directory_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only "cannot open" is skipped; any other failure to open the directory still raises."""
+    real_open = os.open
+
+    def open_(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if os.path.isdir(path):
+            raise OSError(errno.EIO, "I/O error")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(results_module.os, "open", open_)
+    with pytest.raises(OSError, match="I/O error"):
+        write_results(EvalResults.model_validate(results_dict()), tmp_path / "results.json")
+
+
+def test_results_are_written_where_os_has_no_fchmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Python 3.12 has no ``os.fchmod`` on Windows: the mode is set through the path instead."""
+    monkeypatch.delattr(results_module.os, "fchmod")
+    old = os.umask(0o077)
+    try:
+        write_results(EvalResults.model_validate(results_dict()), tmp_path / "results.json")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((tmp_path / "results.json").stat().st_mode) == 0o644
 
 
 def test_a_failing_directory_fsync_is_reported(

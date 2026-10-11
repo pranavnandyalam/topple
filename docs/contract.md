@@ -240,11 +240,11 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
 - Submission kinds: a `.py` file, or a directory with `controller.py` plus assets located via
   `Path(__file__).parent` (ONNX policies arrive in Phase 2). A directory may hold at most 50
   regular files and 20 MiB in total (enforced while reading); symlinks, special files,
-  `__pycache__` and `.pyc` files are refused. Loading a submission turns bytecode writing off for
-  the rest of the process (`sys.dont_write_bytecode`), so neither its import nor a later import
-  of a sibling module (in `make_controller`, `reset` or `act`) writes bytecode next to it. The
-  submission sha256 covers every file as length-framed `(POSIX relpath, size, bytes)` records in
-  POSIX-path string order.
+  `__pycache__`, `.pyc` files and names (the submission's own or any file's) that are not valid
+  UTF-8 are refused. Loading a submission turns bytecode writing off for the rest of the process
+  (`sys.dont_write_bytecode`), so neither its import nor a later import of a sibling module (in
+  `make_controller`, `reset` or `act`) writes bytecode next to it. The submission sha256 covers
+  every file as length-framed `(POSIX relpath, size, bytes)` records in POSIX-path string order.
 
 ## 9. Randomness, seeds and scenarios
 
@@ -450,8 +450,10 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
   aggregate only.
 - **Writing** is atomic and durable: a temporary file in the target directory, mode 0644
   whatever the umask, flushed and `fsync`ed, then renamed over the target, then the directory
-  `fsync`ed so the rename survives a power loss (skipped on Windows and on file systems that
-  do not support syncing a directory).
+  `fsync`ed so the rename survives a power loss. The directory sync is skipped on Windows, when
+  the directory cannot be opened for reading (`EACCES`/`EPERM`, as in a write-only drop
+  directory), and on file systems that do not support syncing a directory; any other failure to
+  sync it is an error, raised after the rename (the complete file is already in place).
 
 ## 16. Trusted verification and re-scoring
 
@@ -476,7 +478,7 @@ class EpisodeVerdict:
     ok: bool                       # bound to (protocol, index) and reproduced bit-exactly
     code: VerifyCode | None
     reason: str                    # human-readable; the first failing check
-    replay: Trajectory | None      # trusted replay (None if the upload failed before replaying)
+    replay: Trajectory | None      # trusted replay as far as it ran (None if not replayed)
     result: EpisodeResult          # scored only from `replay` and the env's own metadata
 
 def verify_episode(upload, protocol, index) -> EpisodeVerdict
@@ -513,7 +515,8 @@ and `index` only labels the verdict.
 3. **Commands.** `T ≤ max_steps`; every `ctrl` value finite and in [−1, 1]; every `action` value
    finite; `clip(action, −1, 1) == ctrl` row by row.
 4. **Replay.** The uploaded `ctrl` rows are stepped in order. If the env terminates or truncates
-   before the rows run out, the upload does not reproduce. Then the episode's trusted error is
+   before the rows run out, the upload does not reproduce; the verdict's replay is then the
+   replay up to that step (no error, no epilogue). Then the episode's trusted error is
    decided: a `sim_unstable` termination in the replay gives error `sim_unstable` at step T
    (whatever the upload claims); otherwise the upload's own well-formed error report is kept;
    otherwise, if the replay neither terminated nor truncated at step T (so T < max_steps), the
@@ -564,8 +567,11 @@ traceback.
   - `--out` writes the trusted results (§15): for a directory the `rescore` results, for a file
     a one-episode result with `complete: false`. The controller is recorded as
     `{id: <SUB's name>, sha256: <SUB's submission sha256>}`, computed without importing SUB, or
-    `{id: "unknown", sha256: <64 zeros>}` without `--submission`.
+    `{id: "unknown", sha256: <64 zeros>}` without `--submission`. `--submission` is resolved
+    before anything is verified: one that cannot be hashed, or whose name is not valid UTF-8,
+    exits 2 before any verdict is printed.
 - `topple score FILE [--protocol P] [--index I | --seed S]` verifies first, then prints JSON:
   `ok, code, reason, bound, protocol, index, seed, score, success, error, metrics`, all from the
-  verdict. Exit 1 if not ok (the score is then 0); an errored episode prints score 0.
+  verdict (so `seed` is null for a private protocol). Exit 1 if not ok (the score is then 0); an
+  errored episode prints score 0.
 - `--seed` (here and in `topple run`) must be an integer in `[0, 2**53)`; `--index` ≥ 0.

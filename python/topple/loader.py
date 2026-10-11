@@ -95,19 +95,29 @@ def _framed(data: bytes) -> bytes:
     return len(data).to_bytes(8, "big") + data
 
 
+def _utf8_name(rel: str) -> bytes:
+    """``rel`` as UTF-8. A name that is not valid UTF-8 on disk decodes to lone surrogates
+    (``os.fsdecode``), which have no UTF-8 form: such a submission is refused."""
+    try:
+        return rel.encode("utf-8")
+    except UnicodeEncodeError:
+        raise LoadError(f"file name {rel!r} is not valid UTF-8") from None
+
+
 def submission_sha256(path: Path) -> str:
     """sha256 over length-framed (POSIX relpath, size, bytes) records of every file.
 
-    Refuses symlinks, special files, ``__pycache__`` and ``.pyc``; enforces ``MAX_FILES`` and
-    ``MAX_BYTES`` (the latter while reading).
+    Refuses symlinks, special files, ``__pycache__``, ``.pyc`` and file names that are not valid
+    UTF-8; enforces ``MAX_FILES`` and ``MAX_BYTES`` (the latter while reading).
     """
     digest = hashlib.sha256(SHA_TAG)
     root = path if path.is_dir() and not path.is_symlink() else path.parent
     remaining = MAX_BYTES
     for f in _files(path):
+        name = _utf8_name(_rel(f, root))
         data = _read_capped(f, remaining)
         remaining -= len(data)
-        digest.update(_framed(_rel(f, root).encode("utf-8")))
+        digest.update(_framed(name))
         digest.update(_framed(data))
     return digest.hexdigest()
 
@@ -204,6 +214,7 @@ def _factory_of(module: ModuleType, entry: Path) -> object:
 
 
 def load_submission(path: Path) -> Submission:
+    _utf8_name(path.name)  # the name becomes the controller id
     if path.is_symlink():
         raise LoadError(f"{path} is a symlink; submit the file or directory itself")
     path = path.resolve()

@@ -378,7 +378,15 @@ def test_i_rows_beyond_the_end_of_the_replay(falls: Honest) -> None:
         accel=np.vstack([upload.accel, upload.accel[-1:]]),
         push_force=np.vstack([upload.push_force, upload.push_force[-1:]]),
     )
-    rejected(verify_episode(longer, falls.protocol, 0), mentions="replay ended")
+    verdict = verify_episode(longer, falls.protocol, 0)
+    rejected(verdict, mentions=f"the replay ended after {upload.steps} steps")
+    # The replay did run: the failed verdict carries it and its metrics (§16, step 6).
+    assert verdict.replay is not None
+    assert verdict.replay.steps == upload.steps
+    np.testing.assert_array_equal(verdict.replay.qpos, upload.qpos)
+    np.testing.assert_array_equal(verdict.replay.action, upload.action)
+    assert falls.results.episodes is not None
+    assert verdict.result.metrics == falls.results.episodes[0].metrics
 
 
 # ------------------------------------------------------------------ J: robot hash

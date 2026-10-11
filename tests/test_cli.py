@@ -639,3 +639,97 @@ def test_a_fifo_given_as_the_path_exits_2(
     result = runner.invoke(app, [command, str(path)])
     assert result.exit_code == 2
     assert "not a regular file" in result.output
+
+
+SURROGATE_NAME = "ctl\udcff.py"  # how Linux decodes the file name b"ctl\xff.py" (not UTF-8)
+
+
+@pytest.mark.parametrize("target", ["directory", "file"])
+def test_verify_with_a_submission_name_that_is_not_utf8_exits_2(
+    eval_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """The name cannot be a controller id: a clean usage error before any verdict, never a
+    traceback and never exit 1 (which means "verification failed")."""
+    import topple.loader
+
+    monkeypatch.setattr(topple.loader, "submission_sha256", lambda path: "a" * 64)
+    path = eval_dir if target == "directory" else eval_dir / "traj_000.npz"
+    out = tmp_path / "trusted.json"
+    result = runner.invoke(
+        app,
+        ["verify", str(path), "--submission", str(tmp_path / SURROGATE_NAME), "--out", str(out)],
+    )
+    assert result.exit_code == 2, result.output
+    assert "not valid UTF-8" in result.output
+    assert "Traceback" not in result.output
+    assert "OK" not in result.output
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("command", ["run", "eval"])
+def test_a_submission_name_that_is_not_utf8_exits_2_before_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    """A submission directory named by non-UTF-8 bytes hashes fine (names inside it are relative)
+    but its name cannot be the controller id."""
+    from dataclasses import replace
+
+    import topple.loader
+    from topple.loader import Submission
+
+    real = topple.loader.load_submission
+
+    def load(path: Path) -> Submission:
+        return replace(real(path), id=SURROGATE_NAME.removesuffix(".py"))
+
+    monkeypatch.setattr(topple.loader, "load_submission", load)
+    out = tmp_path / "out"
+    result = runner.invoke(
+        app,
+        [command, str(_submission(tmp_path)), "-p", "balance-v1/clean", "--out", str(out)]
+        + (["--no-video"] if command == "run" else ["--videos", "none"]),
+    )
+    assert result.exit_code == 2, result.output
+    assert "not valid UTF-8" in result.output
+    assert "Traceback" not in result.output
+    assert not (out / "results.json").exists()
+
+
+def test_a_bad_submission_fails_before_any_verdict_is_printed(tmp_path: Path) -> None:
+    """File mode resolves --submission first, as directory mode does: exit 2 never follows an
+    `OK` line, with or without --out."""
+    out = _run(tmp_path, "-p", "balance-v1/clean")
+    for extra in ([], ["--out", str(tmp_path / "trusted.json")]):
+        result = runner.invoke(
+            app,
+            [
+                "verify",
+                str(out / "traj_000.npz"),
+                "--submission",
+                str(tmp_path / "missing.py"),
+                *extra,
+            ],
+        )
+        assert result.exit_code == 2, result.output
+        assert "cannot hash" in result.output
+        assert "OK" not in result.output
+    assert not (tmp_path / "trusted.json").exists()
+
+
+def test_score_never_prints_a_private_seed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A private protocol's seeds are secret (§8, §15): `score` reports the seed as null."""
+    from dataclasses import replace
+
+    import topple.cli as cli
+
+    out = _run(tmp_path, "-p", "balance-v1/clean")
+    public_protocol = cli._protocol
+
+    def private(protocol_id: str) -> object:
+        return replace(public_protocol(protocol_id), seed_set="private", salt=99)
+
+    monkeypatch.setattr(cli, "_protocol", private)
+    result = runner.invoke(app, ["score", str(out / "traj_000.npz"), "--index", "0"])
+    payload = json.loads(result.stdout)
+    assert payload["bound"] is True
+    assert payload["seed"] is None
