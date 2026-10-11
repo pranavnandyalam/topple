@@ -13,7 +13,7 @@ exactly this. Anything that could change a fixed controller's score on a fixed s
 | Challenge | `[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*-v[1-9][0-9]*` | `balance-v1`, `waypoint-v1`, `sumo-v1` |
 | Protocol | `<challenge>/<preset>` | `balance-v1/standard`, `balance-v1/clean` |
 | Gymnasium id | `topple/<Pascal>-v<N>` (1:1 with challenge) | `topple/Balance-v1` |
-| Schema | `<family>.<obs\|action\|robot>.v<N>` | `balancer.obs.v1`, `diffdrive.effort.v1`, `balancer.robot.v1` |
+| Schema | `<family>.<obs\|robot\|effort>.v<N>` | `balancer.obs.v1`, `diffdrive.effort.v1`, `balancer.robot.v1` |
 | Artifact format | `topple.<kind>/<N>` | `topple.traj/1`, `topple.results/1` |
 
 Permanent aliases: `eval_v1` → `balance-v1/standard`, `eval_v1_clean` → `balance-v1/clean`,
@@ -23,6 +23,13 @@ Every grammar is matched against the whole string (a trailing newline is not a m
 segment of a challenge name starts with a letter, so the Gymnasium id (segments capitalized and
 joined) maps back to exactly one challenge id: `foo-1bar` would collide with `foo1bar`, so it is
 not a valid name. Presets match `[a-z][a-z0-9_]*`.
+
+A schema's family is built like a challenge name without its version (`[a-z][a-z0-9]*` segments
+joined by `-`, e.g. `balancer-target`). Its kind says what it describes: `obs` an observation
+(§6), `robot` a robot interface (§3), and an action schema is named by its control mode, `effort`
+(normalized motor voltages, §7); a new kind or control mode is a contract change.
+`topple.contract.validate_schema_id` checks this grammar, and a challenge's `obs_schema` and
+`action_spec` must match it.
 
 ## 2. Frames, signs, units
 

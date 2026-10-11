@@ -177,6 +177,18 @@ def test_protocol_hash_rejects_unknown_presets_and_bad_seeds() -> None:
         c.protocol_hash("standard", salt=-1)
 
 
+@pytest.mark.parametrize(
+    ("key", "value"), [("obs_schema", "balancer.obs"), ("action_spec", "diffdrive.action.v1")]
+)
+def test_challenge_schema_ids_follow_the_grammar(bundle: Path, key: str, value: str) -> None:
+    yaml_path = bundle / "challenge.yaml"
+    text = yaml_path.read_text()
+    shipped = load_challenge_dir(bundle).config
+    yaml_path.write_text(text.replace(f"{key}: {getattr(shipped, key)}", f"{key}: {value}"))
+    with pytest.raises(ValueError, match="schema id"):
+        load_challenge_dir(bundle)
+
+
 def test_env_algo_version_starts_at_one() -> None:
     assert ENV_ALGO_VERSION == 1
 

@@ -37,6 +37,7 @@ from topple.estimation import (
 from topple.rendering import make_renderer
 from topple.rng import MAX_SEED, Stream, stream_rng
 from topple.robot import (
+    ROBOT_INTERFACE_ID,
     TRACK_CAMERA,
     RobotParams,
     bind_robot,
@@ -146,7 +147,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self.model = build_model(self.robot_xml, self.challenge.scene_xml, self.params)
         problems = validate_robot(self.model)
         if problems:
-            raise ValueError("robot does not satisfy balancer.robot.v1: " + "; ".join(problems))
+            raise ValueError(f"robot does not satisfy {ROBOT_INTERFACE_ID}: " + "; ".join(problems))
         self.data = mujoco.MjData(self.model)
         self.binding = bind_robot(self.model)
         self.task_spec = self.challenge.task_spec(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 import math
 import numbers
+import re
 import struct
 import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
@@ -21,6 +22,13 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
+# Schema ids (docs/contract.md §1): ``<family>.<kind>.v<N>``. The family is a lowercase name like a
+# challenge's (segments joined by "-", each starting with a letter); the kind is what the schema
+# describes: an observation, a robot interface, or an action, named by its control mode.
+SCHEMA_KINDS = ("obs", "robot", "effort")
+_SCHEMA_RE = re.compile(
+    rf"[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*\.(?:{'|'.join(SCHEMA_KINDS)})\.v[1-9][0-9]*"
+)
 OBS_SCHEMA_ID = "balancer.obs.v1"
 FEATURES: tuple[str, ...] = (
     "pitch",
@@ -36,6 +44,17 @@ FEATURES: tuple[str, ...] = (
 )
 _WIRE = struct.Struct("<11d")  # t + FEATURES, little-endian float64
 SATURATION_THRESHOLD = 0.99
+
+
+def validate_schema_id(schema_id: object) -> str:
+    """``schema_id`` if the whole string matches the §1 schema grammar, else ``ValueError``."""
+    if not isinstance(schema_id, str) or not _SCHEMA_RE.fullmatch(schema_id):
+        kinds = "|".join(SCHEMA_KINDS)
+        raise ValueError(
+            f"invalid schema id {schema_id!r}: expected '<family>.<{kinds}>.v<N>', "
+            "e.g. 'balancer.obs.v1'"
+        )
+    return schema_id
 
 
 def _as_float(name: str, value: object) -> float:

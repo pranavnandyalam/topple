@@ -23,6 +23,7 @@ import numpy.typing as npt
 import yaml
 from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt
 
+ROBOT_INTERFACE_ID = "balancer.robot.v1"  # the schema id of this interface (contract §1, §3)
 CHASSIS = "chassis"
 ROOT_JOINT = "root"
 WHEEL_JOINTS = ("left_wheel", "right_wheel")

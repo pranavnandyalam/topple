@@ -18,6 +18,7 @@ from topple.contract import (
     OBS_SCHEMA_ID,
     RobotGeometry,
     TaskSpec,
+    validate_schema_id,
 )
 from topple.disturbances import PRESETS
 from topple.ids import validate_challenge_id
@@ -76,6 +77,11 @@ class ChallengeConfig(_Frozen):
     @classmethod
     def _id(cls, value: str) -> str:
         return validate_challenge_id(value)
+
+    @field_validator("obs_schema", "action_spec")
+    @classmethod
+    def _schema(cls, value: str) -> str:
+        return validate_schema_id(value)
 
     @field_validator("presets")
     @classmethod

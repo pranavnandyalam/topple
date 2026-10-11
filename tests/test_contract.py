@@ -31,7 +31,9 @@ from topple.contract import (
     clip_action,
     controller_obs,
     validate_action,
+    validate_schema_id,
 )
+from topple.robot import ROBOT_INTERFACE_ID
 
 
 def make_obs(**overrides: object) -> BalancerObs:
@@ -747,6 +749,46 @@ def test_task_spec_rejects_non_integer_steps() -> None:
 def test_action_spec() -> None:
     assert ActionSpec(id="diffdrive.effort.v1", names=("left", "right")) == BALANCE_V1_ACTION
     assert BALANCE_V1_ACTION.dim == 2
+
+
+@pytest.mark.parametrize(
+    "schema_id",
+    [
+        OBS_SCHEMA_ID,
+        BALANCE_V1_ACTION.id,
+        ROBOT_INTERFACE_ID,
+        "balancer-target.obs.v1",  # §6: later tasks append fields under a new id
+        "diffdrive.effort.v12",
+    ],
+)
+def test_every_shipped_schema_id_matches_the_contract_grammar(schema_id: str) -> None:
+    """§1: ``<family>.<kind>.v<N>`` with kind ``obs``, ``robot`` or an action's control mode
+    (``effort``). The grammar once listed ``action`` instead, which refused the action spec id
+    that every results.json and challenge.yaml carries."""
+    assert validate_schema_id(schema_id) == schema_id
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "balancer.obs",
+        "balancer.obs.v0",
+        "balancer.obs.v01",
+        "Balancer.obs.v1",
+        "balancer.action.v1",
+        "balancer.obs.v1\n",
+        "1balancer.obs.v1",
+        "foo-1bar.obs.v1",
+        "balancer..obs.v1",
+        "balancer.obs.v1.v2",
+        "",
+        1,
+        None,
+    ],
+)
+def test_schema_ids_outside_the_grammar_are_refused(bad: object) -> None:
+    with pytest.raises(ValueError, match="schema id"):
+        validate_schema_id(bad)
 
 
 def test_controller_protocol_runtime_check() -> None:
