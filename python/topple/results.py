@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import errno
 import itertools
+import math
 import os
 import tempfile
 import unicodedata
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Literal, get_args
 
@@ -24,9 +26,18 @@ MAX_DETAIL_CHARS = 300
 MAX_ID_CHARS = 200
 MAX_PLATFORM_CHARS = 64
 MAX_VERSION_CHARS = 64
+MAX_EPISODES = 10_000
+"""Most episodes one results file lists (a protocol has 20 public seeds)."""
+MAX_METRICS = 32
+"""Most metrics per episode (balance-v1 reports 11)."""
+MAX_METRIC_CHARS = 64
+"""Longest metric name and string value."""
+MAX_RESULTS_BYTES = 16 * 1024 * 1024
+"""Most bytes ``read_results`` reads."""
 RESULTS_FILE_MODE = 0o644
 REPLACEMENT_CHAR = "�"
 _KEPT_CONTROLS = frozenset("\n\t")
+_UNSAFE_IN_IDS = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 _NO_DIRECTORY_FSYNC = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP})
 _NO_DIRECTORY_OPEN = frozenset({errno.EACCES, errno.EPERM})  # e.g. a write-only drop directory
 
@@ -51,6 +62,9 @@ Isolation = Literal["inprocess", "subprocess", "container"]
 Sha256 = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 Identifier = Annotated[str, StringConstraints(min_length=1, max_length=MAX_ID_CHARS)]
 VersionStr = Annotated[str, StringConstraints(max_length=MAX_VERSION_CHARS)]
+MetricName = Annotated[str, StringConstraints(min_length=1, max_length=MAX_METRIC_CHARS)]
+MetricValue = float | int | bool | Annotated[str, StringConstraints(max_length=MAX_METRIC_CHARS)]
+Metrics = Annotated[dict[MetricName, MetricValue], Field(max_length=MAX_METRICS)]
 
 
 def sanitize_detail(text: str) -> str:
@@ -64,6 +78,15 @@ def sanitize_detail(text: str) -> str:
         if ch in _KEPT_CONTROLS or unicodedata.category(ch) not in ("Cc", "Cs")
         else REPLACEMENT_CHAR
         for ch in text[:MAX_DETAIL_CHARS]
+    )
+
+
+def sanitize_id(text: str) -> str:
+    """Make an untrusted identifier (a submission's file name) safe to store and show on one
+    line: control, format (bidi overrides, zero-width characters) and line-separator characters
+    and lone surrogates become U+FFFD, one for one, so the result is idempotent."""
+    return "".join(
+        REPLACEMENT_CHAR if unicodedata.category(ch) in _UNSAFE_IN_IDS else ch for ch in text
     )
 
 
@@ -87,8 +110,14 @@ class EpisodeResult(_Strict):
     seed: int | None  # None for private seed sets
     success: bool
     score: float = Field(ge=0.0, le=100.0)
-    metrics: dict[str, float | int | bool | str] | None
+    metrics: Metrics | None
     error: ErrorInfo | None = None
+
+    @model_validator(mode="after")
+    def _errors_score_zero(self) -> EpisodeResult:
+        if self.error is not None and (self.score != 0.0 or self.success):
+            raise ValueError("an episode with an error scores 0 and is not a success")
+        return self
 
 
 class Aggregate(_Strict):
@@ -108,8 +137,14 @@ class Versions(_Strict):
 
 
 class ControllerInfo(_Strict):
-    id: Identifier
+    id: Identifier  # untrusted: a submission's name; sanitized, escape before rendering
     sha256: Sha256
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _sanitize(cls, value: object) -> object:
+        """Before the type check, so a lone surrogate is replaced rather than refused."""
+        return sanitize_id(value) if isinstance(value, str) else value
 
 
 class EvalResults(_Strict):
@@ -127,7 +162,7 @@ class EvalResults(_Strict):
     controller: ControllerInfo
     isolation: Isolation
     complete: bool
-    episodes: list[EpisodeResult] | None
+    episodes: Annotated[list[EpisodeResult], Field(max_length=MAX_EPISODES)] | None
     aggregate: Aggregate
 
     @model_validator(mode="after")
@@ -139,6 +174,8 @@ class EvalResults(_Strict):
         if self.episodes is None:
             raise ValueError("public results must list their episodes")
         _check_public_episodes(self.episodes, self.aggregate)
+        if self.complete:
+            _check_complete(self.episodes, self.aggregate)
         return self
 
 
@@ -155,6 +192,47 @@ def _check_public_episodes(episodes: list[EpisodeResult], aggregate: Aggregate) 
     errors = sum(e.error is not None for e in episodes)
     if aggregate.errors != errors:
         raise ValueError(f"aggregate.errors is {aggregate.errors} but {errors} episodes errored")
+
+
+def _check_complete(episodes: list[EpisodeResult], aggregate: Aggregate) -> None:
+    """A complete run lists all N of its episodes, none missing, so §12's aggregate of them is
+    known exactly and must be the one recorded."""
+    if any(e.error is not None and e.error.code == "missing" for e in episodes):
+        raise ValueError("a complete run has no missing episode")
+    for e in episodes:
+        if e.metrics is not None and not _is_real(e.metrics.get("time_upright_s")):
+            raise ValueError(f"episode {e.index}: metrics.time_upright_s must be a finite number")
+    if summarize(episodes, len(episodes)) != aggregate:
+        raise ValueError("aggregate does not match the episodes (contract §12)")
+
+
+def _is_real(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int too large for a float
+        return False
+
+
+def summarize(episodes: Sequence[EpisodeResult], expected: int) -> Aggregate:
+    """Aggregate over the ``expected`` episodes of a protocol (contract §12, §15).
+
+    ``score`` is the exact sum of episode scores divided by ``expected`` and ``success_rate`` is
+    successes over ``expected``: a missing or errored episode counts as 0. ``mean_time_upright_s``
+    is the mean over the episodes that are present (it describes the runs that happened).
+    """
+    if len(episodes) > expected:
+        raise ValueError(f"{len(episodes)} episodes, but only {expected} expected")
+    times = [float(e.metrics["time_upright_s"]) for e in episodes if e.metrics is not None]
+    score = math.fsum(e.score for e in episodes) / expected if expected else 0.0
+    return Aggregate(
+        score=min(max(score, 0.0), 100.0),
+        success_rate=(sum(e.success for e in episodes) / expected) if expected else 0.0,
+        mean_time_upright_s=math.fsum(times) / len(times) if times else 0.0,
+        episodes=len(episodes),
+        errors=sum(e.error is not None for e in episodes),
+    )
 
 
 def write_results(results: EvalResults, path: Path) -> None:
@@ -208,4 +286,13 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def read_results(path: Path) -> EvalResults:
-    return EvalResults.model_validate_json(path.read_text(encoding="utf-8"))
+    """Read and validate ``path``, at most ``MAX_RESULTS_BYTES`` of it.
+
+    Validation proves a file well formed, never its numbers true: whoever publishes a score takes
+    it from trusted verification (``topple.verify``, contract §16), never from an uploaded file.
+    """
+    with path.open("rb") as fh:
+        data = fh.read(MAX_RESULTS_BYTES + 1)
+    if len(data) > MAX_RESULTS_BYTES:
+        raise ValueError(f"{path.name} has more than {MAX_RESULTS_BYTES} bytes")
+    return EvalResults.model_validate_json(data)

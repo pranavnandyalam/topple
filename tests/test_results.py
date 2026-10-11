@@ -1,6 +1,7 @@
 """``topple.results/1``: schema bounds, cross-field checks, error details, atomic writes (§15)."""
 
 import errno
+import math
 import os
 import stat
 import unicodedata
@@ -15,12 +16,16 @@ from pydantic import ValidationError
 import topple.results as results_module
 from topple.results import (
     MAX_DETAIL_CHARS,
+    MAX_EPISODES,
+    MAX_METRIC_CHARS,
+    MAX_METRICS,
     ControllerInfo,
     EpisodeResult,
     ErrorInfo,
     EvalResults,
     read_results,
     sanitize_detail,
+    sanitize_id,
     write_results,
 )
 
@@ -153,7 +158,7 @@ def test_private_results_carry_no_episodes() -> None:
 
 
 def test_errors_count_matches_errored_episodes() -> None:
-    data = results_dict(episodes=[episode(0), episode(2, seed=9, error="missing")])
+    data = results_dict(episodes=[episode(0), episode(2, seed=9, error="missing")], complete=False)
     data["aggregate"]["errors"] = 1
     results = EvalResults.model_validate(data)
     assert results.aggregate.errors == 1
@@ -193,7 +198,7 @@ def test_sanitize_detail_property(raw: str) -> None:
 def test_hostile_detail_survives_write_and_read(tmp_path: Path) -> None:
     data = results_dict(episodes=[episode(0), episode(1, seed=5, error="exception")])
     data["episodes"][1]["error"]["detail"] = "\ud83d boom \x00 ‮"
-    data["aggregate"]["errors"] = 1
+    data["aggregate"].update(score=45.0, success_rate=0.5, errors=1)
     results = EvalResults.model_validate(data)
     path = tmp_path / "results.json"
     write_results(results, path)
@@ -370,3 +375,129 @@ def test_failed_write_leaves_nothing_behind(
 def test_episode_result_score_bounds() -> None:
     with pytest.raises(ValidationError):
         EpisodeResult.model_validate({**episode(0), "score": 100.5})
+
+
+# ------------------------------------------------------------------ forged content (§15)
+
+
+@pytest.mark.parametrize("changes", [{"score": 100.0}, {"success": True}])
+def test_an_episode_with_an_error_scores_0_and_is_no_success(changes: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError, match="an episode with an error scores 0"):
+        EpisodeResult.model_validate({**episode(0, error="exception"), **changes})
+
+
+def test_a_complete_run_has_no_missing_episode() -> None:
+    data = results_dict(episodes=[episode(0), episode(1, seed=5, error="missing")])
+    data["aggregate"].update(score=45.0, success_rate=0.5, errors=1)
+    with pytest.raises(ValidationError, match="missing"):
+        EvalResults.model_validate(data)
+    data["complete"] = False
+    assert not EvalResults.model_validate(data).complete
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("score", 100.0),
+        ("score", 90.00000000000001),
+        ("success_rate", 0.5),
+        ("mean_time_upright_s", 9.0),
+    ],
+)
+def test_a_complete_aggregate_is_the_aggregate_of_its_episodes(field: str, value: float) -> None:
+    """§12: score and success rate over N = the episodes listed, mean time upright over those
+    with metrics. A complete run's N is in the file, so its aggregate can be checked; an
+    incomplete one's N is the protocol's, which the file does not hold."""
+    data = results_dict()
+    data["aggregate"][field] = value
+    with pytest.raises(ValidationError, match="aggregate does not match"):
+        EvalResults.model_validate(data)
+    data["complete"] = False
+    assert EvalResults.model_validate(data).aggregate.model_dump()[field] == value
+
+
+def test_the_aggregate_is_checked_exactly_as_section_12_sums_it() -> None:
+    """``fsum`` over N, as ``summarize`` computes it; Python 3.12's ``sum`` is compensated, so
+    it takes an awkward case to tell the two apart (the same case as ``test_evaluate``)."""
+    scores = [1.0, 1.0, 5e-324, 2.0**-52]
+    assert math.fsum(scores) / 5 != sum(scores) / 5
+    episodes = [{**episode(i, seed=i), "score": s} for i, s in enumerate(scores)]
+    errored = {**episode(4, seed=4, error="exception"), "metrics": {"time_upright_s": 0.25}}
+    data = results_dict(episodes=[*episodes, errored])
+    data["aggregate"].update(
+        score=sum(scores) / 5,
+        success_rate=4 / 5,
+        mean_time_upright_s=math.fsum([10.0] * 4 + [0.25]) / 5,
+        episodes=5,
+        errors=1,
+    )
+    with pytest.raises(ValidationError, match="aggregate does not match"):
+        EvalResults.model_validate(data)
+    data["aggregate"]["score"] = math.fsum(scores) / 5
+    assert EvalResults.model_validate(data).aggregate.score == math.fsum(scores) / 5
+
+
+@pytest.mark.parametrize(
+    "metrics",
+    [
+        {"drift_m": 0.1},
+        {"time_upright_s": True},
+        {"time_upright_s": "10"},
+        {"time_upright_s": 10**400},
+    ],
+    ids=["absent", "bool", "str", "huge int"],
+)
+def test_a_complete_aggregate_needs_every_time_upright(metrics: dict[str, Any]) -> None:
+    data = results_dict()
+    data["episodes"][1]["metrics"] = metrics
+    with pytest.raises(ValidationError, match="time_upright_s"):
+        EvalResults.model_validate(data)
+
+
+def test_metrics_are_bounded() -> None:
+    def with_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+        return {**episode(0), "metrics": metrics}
+
+    many = {f"m{i}": 1.0 for i in range(MAX_METRICS)}
+    assert EpisodeResult.model_validate(with_metrics(many)).metrics == many
+    for bad in (
+        {**many, "one_more": 1.0},
+        {"k" * (MAX_METRIC_CHARS + 1): 1.0},
+        {"": 1.0},
+        {"termination": "x" * (MAX_METRIC_CHARS + 1)},
+    ):
+        with pytest.raises(ValidationError):
+            EpisodeResult.model_validate(with_metrics(bad))
+
+
+def test_the_episode_list_is_bounded() -> None:
+    data = results_dict(episodes=[episode(i, seed=i) for i in range(MAX_EPISODES + 1)])
+    with pytest.raises(ValidationError, match="at most"):
+        EvalResults.model_validate(data)
+
+
+def test_read_results_reads_at_most_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "results.json"
+    write_results(EvalResults.model_validate(results_dict()), path)
+    size = path.stat().st_size
+    monkeypatch.setattr(results_module, "MAX_RESULTS_BYTES", size - 1)
+    with pytest.raises(ValueError, match=rf"results\.json has more than {size - 1} bytes"):
+        read_results(path)
+    monkeypatch.setattr(results_module, "MAX_RESULTS_BYTES", size)
+    assert read_results(path).controller.id == "pid"
+
+
+def test_the_controller_id_is_untrusted_text() -> None:
+    """The id is a submission's file name: control, format and line-separator characters (a
+    bidi override, a line break before ``@maintainers``) become U+FFFD, one for one."""
+    raw = "[click](https://evil.example)\n@maintainers\u202e\x1b[2J\u2028\udcff ok é"
+    clean = ControllerInfo(id=raw, sha256=HEX).id
+    expected = "[click](https://evil.example)\ufffd@maintainers\ufffd\ufffd[2J\ufffd\ufffd ok é"
+    assert clean == expected
+    assert sanitize_id(clean) == clean
+    assert (
+        ControllerInfo.model_validate_json(ControllerInfo(id=raw, sha256=HEX).model_dump_json()).id
+        == clean
+    )

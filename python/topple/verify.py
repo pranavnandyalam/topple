@@ -217,10 +217,8 @@ def verify_run(
             episodes.append(
                 _missing(target) if upload is None else _verify(env, upload, target).result
             )
-    complete = not any(e.error is not None and e.error.code == "missing" for e in episodes)
     failed = sum(e.error is not None and e.error.code in VERIFY_ERROR_CODES for e in episodes)
-    results = build_results(protocol, episodes, controller, isolation)
-    return RunVerdict(results.model_copy(update={"complete": complete}), failed)
+    return RunVerdict(build_results(protocol, episodes, controller, isolation), failed)
 
 
 # ------------------------------------------------------------------ the checks, in order

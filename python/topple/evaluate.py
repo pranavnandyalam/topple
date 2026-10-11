@@ -10,7 +10,6 @@ hostile controller could tamper with the scorer; ranked runs isolate it (Phase 3
 
 from __future__ import annotations
 
-import math
 import platform
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -36,7 +35,6 @@ from topple.contract import (
 from topple.envs.balance import BalanceEnv
 from topple.ids import parse_protocol, resolve_protocol
 from topple.results import (
-    Aggregate,
     ControllerInfo,
     EpisodeResult,
     ErrorInfo,
@@ -44,6 +42,7 @@ from topple.results import (
     Isolation,
     Versions,
 )
+from topple.results import summarize as summarize  # re-exported: §12's aggregate
 from topple.rng import controller_seed
 from topple.robot import robot_hash
 from topple.scoring import episode_metrics, episode_score, episode_success
@@ -291,26 +290,6 @@ def iter_episodes(protocol: EvalProtocol, factory: ControllerFactory) -> Iterato
         env.close()
 
 
-def summarize(episodes: list[EpisodeResult], expected: int) -> Aggregate:
-    """Aggregate over the ``expected`` episodes of a protocol (contract §12, §15).
-
-    ``score`` is the exact sum of episode scores divided by ``expected`` and ``success_rate`` is
-    successes over ``expected``: a missing or errored episode counts as 0. ``mean_time_upright_s``
-    is the mean over the episodes that are present (it describes the runs that happened).
-    """
-    if len(episodes) > expected:
-        raise ValueError(f"{len(episodes)} episodes, but only {expected} expected")
-    times = [float(e.metrics["time_upright_s"]) for e in episodes if e.metrics is not None]
-    score = math.fsum(e.score for e in episodes) / expected if expected else 0.0
-    return Aggregate(
-        score=min(max(score, 0.0), 100.0),
-        success_rate=(sum(e.success for e in episodes) / expected) if expected else 0.0,
-        mean_time_upright_s=math.fsum(times) / len(times) if times else 0.0,
-        episodes=len(episodes),
-        errors=sum(e.error is not None for e in episodes),
-    )
-
-
 def platform_tag() -> str:
     return f"{platform.system().lower()}-{platform.machine().lower()}"
 
@@ -321,7 +300,10 @@ def build_results(
     controller: ControllerInfo,
     isolation: Isolation,
 ) -> EvalResults:
+    """``topple.results/1`` for ``episodes`` of ``protocol``; ``complete`` when all of its N
+    episodes are listed and none is ``missing`` (contract §15)."""
     private = protocol.seed_set == "private"
+    missing = any(e.error is not None and e.error.code == "missing" for e in episodes)
     return EvalResults(
         challenge=protocol.challenge.id,
         protocol=protocol.id,
@@ -338,7 +320,7 @@ def build_results(
         robot_hash=robot_hash(protocol.challenge.robot_xml, protocol.challenge.params),
         controller=controller,
         isolation=isolation,
-        complete=len(episodes) == len(protocol.seeds),
+        complete=len(episodes) == len(protocol.seeds) and not missing,
         episodes=None if private else episodes,
         aggregate=summarize(episodes, len(protocol.seeds)),
     )

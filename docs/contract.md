@@ -494,13 +494,24 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
   not make a run rankable: Phase 3 ranks only results produced by its trusted CI jobs.
 - **Bounds.** `controller.id`, `challenge` and `protocol`: 1–200 characters; `platform` and each
   version string ≤ 64; `controller.sha256`, `protocol_hash` and `robot_hash`: 64 lowercase hex
-  digits. An error `detail` is untrusted text: it keeps at most 300 characters, and lone
-  surrogates and control characters other than `\n` and `\t` become U+FFFD (one for one, so
-  re-validating a stored detail changes nothing). Escape it before rendering.
-- **Cross-field checks.** Public results list their episodes with strictly increasing `index`
-  and a `seed` each, `aggregate.episodes == len(episodes)` and `aggregate.errors` equal to the
-  number of episodes with an error. Private-seed results are redacted: `episodes` is null,
-  aggregate only.
+  digits; at most 10,000 episodes; at most 32 metrics per episode, each name 1–64 characters and
+  each string value ≤ 64. An error `detail` is untrusted text: it keeps at most 300 characters,
+  and lone surrogates and control characters other than `\n` and `\t` become U+FFFD (one for
+  one, so re-validating a stored detail changes nothing). `controller.id` is untrusted text too
+  (a submission's name): control, format (bidi overrides, zero-width characters) and
+  line-separator characters and lone surrogates become U+FFFD, one for one. Escape both before
+  rendering.
+- **Cross-field checks.** An episode with an error has score 0 and is not a success. Public
+  results list their episodes with strictly increasing `index` and a `seed` each,
+  `aggregate.episodes == len(episodes)` and `aggregate.errors` equal to the number of episodes
+  with an error. A `complete` result has no `missing` episode, and its aggregate is exactly §12's
+  aggregate of the listed episodes (N = their number; every episode with metrics reports a
+  finite `time_upright_s`). Private-seed results are redacted: `episodes` is null, aggregate
+  only.
+- **Reading** (`read_results`) reads at most 16 MiB and validates all of the above. Validation
+  proves a file well formed, never its numbers true: whoever publishes a score (Phase 3's
+  publish step, the leaderboard) takes every number from trusted verification (§16), never from
+  an uploaded `results.json`.
 - **Writing** is atomic and durable: a temporary file in the target directory, mode 0644
   whatever the umask, flushed and `fsync`ed, then renamed over the target, then the directory
   `fsync`ed so the rename survives a power loss. The directory sync is skipped on Windows, when
