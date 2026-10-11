@@ -54,7 +54,7 @@ the competitor, growth, frontier-tech and feasibility sweeps.
 | Policy format | **ONNX everywhere** (pickle-free `onnx.helper` build, IR 8 / opset 17, VecNormalize and clip baked in, canonical bytes) | Eval/CI/browser never need torch: `onnxruntime` ~15 MB vs. torch 555 MB+ |
 | CLI | `typer` | `topple run / eval / train / export / fuzz / coach / autotune / sumo` |
 | Rendering | `mujoco.Renderer`; `MUJOCO_GL=cgl` (Mac), `osmesa` (Linux CI) | CI renders one short episode at 320×240 → GIF |
-| CI | GitHub Actions, `pull_request` → `workflow_run` split | Fork PRs get no secrets; privileged stage only reads validated artifacts |
+| CI | GitHub Actions, `pull_request` → `workflow_run` split | Fork PRs get no secrets; untrusted policy bytes are parsed only in a token-less, secret-less `rescore` job; the privileged `publish` job only reads its validated output |
 | Web | Vite + TypeScript + three.js, `@mujoco/mujoco` (single-thread build), `onnxruntime-web`, Pyodide in a Web Worker | Start from mjswan rather than from scratch |
 | Hosting | Cloudflare Pages (site), R2 (GIFs, `traj.npz`), D1 (leaderboard) | Est. $0–5/mo at 1k users; Claude API is the real cost, so add quotas |
 | AI | Claude: user's own `ANTHROPIC_API_KEY` or their Claude Code login (`claude-sonnet-5-5` default, `claude-opus-5-5` for hard cases) | Bring-your-own key; images, not video: sample 6–10 key frames |
@@ -158,7 +158,9 @@ assume part-time work alongside school.
 ### Phase 2: Learn (1–2 weeks). Spec: `docs/design/phase-2.md`
 - **2a, balance.**
   - Training: PPO with 8 SubprocVecEnv workers on `balance-v1/standard` from step 0. There is no
-    curriculum (measured worse). Each seed trains for 5M steps, and 3 seeds are run.
+    curriculum (measured worse). Each seed trains for 5M steps with a linearly decaying learning
+    rate (a constant rate collapsed 1 of 3 seeds late in training), and 3 seeds are run. Seeded
+    training is bit-deterministic per platform and tested.
   - Training-only action-excess penalty.
   - Checkpoints are selected on 200 selection seeds through the real harness. Logging uses
     TensorBoard.
@@ -179,6 +181,7 @@ assume part-time work alongside school.
   - its success rate ≥ PID's on both seed sets;
   - it beats LQR (paired CI lower bound of PPO − LQR > 0, success ≥ LQR's − 0.03);
   - median energy ≤ E_ref and saturation ≤ 0.10;
+  - the 0..199 gates above hold both on the developer Mac and on the ubuntu CI runtime;
   - ONNX matches SB3's own predict within 1e-5, open-loop at batch 1, re-checked torch-free in CI;
   - at least 2 of the 3 PPO training seeds independently pass the PID gates (the recipe, not one
     lucky seed);
@@ -191,10 +194,11 @@ assume part-time work alongside school.
 - **Done when (2b):**
   - the challenge is frozen (push strength calibrated first, by a fixed sweep), its two-sided
     calibration band holds, and its degenerate-strategy anchors pass;
-  - it is learnable, judged relative to the reference driver at the frozen push level: the best
-    learned policy docks on ≥ 60% of calibration seeds, is not clearly worse than the driver
+  - it is learnable, judged relative to the reference driver at the frozen push level on
+    calibration seeds 0..399: the shipped learned policy (the top eligible checkpoint across both
+    arms' 6 runs, with fallback to the next) docks on ≥ 60%, is not clearly worse than the driver
     (paired CI lower bound of PPO − driver > −5), beats the creeper anchor, and falls at most
-    20 points more often than the driver;
+    20 points more often than the driver; falls on the push-free preset are reported;
   - balance-v1 is unchanged;
   - verify and rescore work;
   - both arms are reported (3 seeds each);

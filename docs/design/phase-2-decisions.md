@@ -2,10 +2,10 @@
 
 Source: `docs/design/phase-2-critiques.json`. It holds 6 critiques with 68 issues in total. Every
 issue appears below exactly once. The re-critique of v2 (round 1, 54 issues) is decided in
-"Re-critique round 1", and the re-critique of v3 (round 2, 54 issues) in "Re-critique round 2" at
-the end. Later rounds supersede earlier rows where they conflict; each superseded row is named in
+"Re-critique round 1", and the re-critique of v3 (round 2, 54 issues) in "Re-critique round 2", and
+the re-critique of v4 (round 3, 52 issues) in "Re-critique round 3" at the end. Later rounds supersede earlier rows where they conflict; each superseded row is named in
 the later round's preamble. The round-1 and round-2 critique texts were supplied inline to the
-designer and are not yet committed as JSON (see round 2, consistency #15).
+designer and are not yet committed as JSON (see round 2, consistency #15, and round 3, consistency #16).
 
 Decision values:
 - **accepted:** adopted as recommended.
@@ -338,3 +338,136 @@ Superseded earlier decisions:
   (product #1, rl #4, product #5).
 - §8 risk table: "curriculum" replaced by "5M budget, 3 seeds, 200-seed selection, action-excess
   penalty" (rl #8c).
+
+## Re-critique round 3 (spec v4 → v5)
+
+52 issues (rl 10, deploy 9, security 8, product 8, consistency 17). Every issue has a row below.
+Several were raised by more than one lens; each row names the shared fix. All three HIGH issues
+(rl #1, security #1, product #1) are adopted. Only edits to `phase-2.md`, this log and
+`PLAN.md` were made; the round-1/round-2 critique JSON files still have to be committed by the
+orchestrator (consistency #16).
+
+Superseded earlier decisions:
+- round 2 rl #1 (`max_cpu_s` 12,000 / 15,000 from a 3,600 CPU-s estimate) → measured: balance
+  PPO 4,500, SAC 6,000, waypoint 7,500 until the pilot's `cpu_s` is measured, then 3× it; `cpu_s`
+  is a per-process ledger read before `venv.close()` (§1).
+- round 2 product #6 ("expected to pass 3/3 at no cost") → with the constant LR only 2 of 3
+  post-fix seeds passed G2b; the linear schedule measured 3/3 (§0, §2.2).
+- round 2 rl #4 and product #1 (waypoint eligibility without a fall term; "better arm") →
+  eligibility mirrors all four item-6 sub-gates; shipping across all 6 runs with fallback;
+  "better arm" is a reporting term (§8.8).
+- round 2 rl #7 (8M if the final beats the best at ≤ 4M by > 2 points) → paired bootstrap of
+  late vs mid evals, lower bound > 0 (§8.8).
+- round 2 product #5 (sweep {0.30..0.50} step 0.05) → 0.300:0.500:0.025 with an in-band
+  constraint, on seeds 0..399 (§8.7).
+- round 1 product #1 / round 2 product #1 (`fall_cause` window 1.0 s, `None`) → 1.5 s, string
+  `"none"` (§8.5).
+- round 2 deploy #8 (4) (IR/opset pairs (8, 17–18), (9, 19–20), (10, 21)) → `CANONICAL_IR` map;
+  load requires `ir == CANONICAL_IR[opset]`, pack sets it (§3.4).
+- round 2 deploy #6 (legacy `dynamo=False` as the documented recipe; `test_pack_torch_legacy`
+  gating) → dynamo is primary, legacy secondary, committed torch-free fixtures, the torch test is
+  advisory (§3.3, §6).
+- round 2 deploy #10 (`.bin` = u32 N, u32 D, f32 obs, f32 a_ref) → `.bin` layout v1 with magic,
+  version, A and the row-set byte (§3.3).
+- round 2 consistency #10 (SAC `log_std_init: -3.0`) → removed; forbidden for SAC (SB3 SAC
+  ignores it without SDE) (§2.1, §2.2).
+- round 2 consistency #8 (256×256 weight reused by 5 Gemms; boundary 2^18) → 2 reuses fail, 1
+  passes; boundary 2^17 under the weighted cost (§3.4, §6).
+- round 2 security #1 / round 1 (per-act kill provisional 5 ms) → CPU-time limit or wall ≥ 50 ms,
+  one retry, aggregate 60 s CPU budget (§10).
+- round 1 deploy #6 ("Build sets producer_version = \"\"") → `producer_version` is never set;
+  canonical form sets only `producer_name = "topple"`; test asserts `not HasField` (§3.2, §6).
+- round 1 consistency #2 ("rows collected in the main process") → superseded since v4 by round 2
+  deploy #4 (5 strided rows per selection episode from the workers); listed per consistency #16.
+- round 0 rl #1 ("runs must stay under 10 min") → 600 s soft target, reported only, plus the
+  runaway guard (§1); listed per consistency #16.
+- round 0 rl #8 ("reported as mean ± sd") → v4 had dropped it; v5 restores it as the "PPO recipe
+  (3 seeds)" row (round 3 rl #9).
+- Determinism "best-effort: recorded, not gated" (v4 §2.3) → required and tested (round 3 rl #3).
+
+### rl
+
+| # | Issue | Impact | Decision | Reason |
+|---|---|---|---|---|
+| 1 | Constant LR 3e-4 collapses 1 of 3 post-fix seeds late in training; linear decay fixes it | HIGH | accepted | `learning_rate: {schedule: linear, initial: 3.0e-4, final: 0.0}` with `lr(p) = 3e-4·max(p, 0)` (clamp because p reaches −0.0027); inherited by both waypoint arms, restarted for a fine-tune; §0 PPO row replaced by the 3-seed constant vs linear table (mean 85.07 sd 3.2 vs 86.14 sd 0.72); `late_regression` health flag (drop ≥ 0.10 below running best after 2M); `lr_fn` validated in `test_train_config`; PLAN 2a updated (§0, §2.1, §2.2, §2.5, §6). |
+| 2 | Shipping fallback covers only G1–G4, but G2b is the gate a degraded seed actually fails | MEDIUM | accepted | Shared with consistency #10: `SHIP_GATES = (G1, G2, G2b, G3, G4, G5, G6)`; G11 table and scoreboard get a reported, non-gating G2b column ("j of 3 at LQR level") (§2.5, §4, §5.2). |
+| 3 | Training is bit-deterministic, but the spec makes determinism best-effort | MEDIUM | accepted | §2.3 now requires determinism per (config, seed, platform, start_method); `start_method: forkserver` pinned in the configs; `mp_start_method` and `torch.get_num_threads()` in train_meta; `test_train_smoke` runs each smoke config twice and compares npz shas, `onnx_sha256` per label and `selection_history`; a `wall_clock_abort` retry must reproduce the aborted attempt's `onnx_sha256` at every shared label, else flag `nondeterministic` and not reportable (G10) (§1, §2.2, §2.3, §4, §6). |
+| 4 | cpu_s misses forkserver-reaped env workers; max_cpu_s is ~8× the measured cost | MEDIUM | accepted | Shared with consistency #1: monotone per-process ledger keyed by (pid, create_time), no rusage; final reading in `_on_training_end` before `venv.close()`; forkserver `test_resources` case; caps from measurement (balance 4,500 = 3 × 1,450; waypoint 7,500 until the pilot's `cpu_s` is known, then 3×); SAC 6,000 from an all-busy upper bound because its CPU was not measured; §0 estimate replaced by the measurement (§0, §1, §6). |
+| 5 | 2b: waypoint eligibility ignores the fall gate, 'better arm' is undefined, no shipping fallback | MEDIUM | modified | Shared with product #1. Adopted: docked ≥ 0.65 (margin), a fall term, shipping across all 6 runs by `rank_key` with fallback on items 6/9 and every attempt reported, "better arm" a reporting term (higher mean fresh score). Changed: the fall term is `fell ≤ driver_fell + 0.20` (product's value), not + 0.15: the pilot's measured gap is 16 pp, so + 0.15 would make a score-equal pilot policy ineligible and stop 2b; chance failures of (d) are handled by the 6-run fallback and the 0..399 calibration set (§8.8). |
+| 6 | Fine-tune arm: source run per seed unspecified; comparison metric hides where fine-tuning helps | MEDIUM | accepted | Fine-tune seed k starts from `runs/ppo_s{k}`'s eligible, abort-free best, else the next index (k+1, k+2 mod 3); `init_source {run, step, onnx_sha256}` in train_meta and phase2.json; headline = env steps to first eligible selection eval (median of 3, with and without the 5M pretraining); final fresh score and fell as mean ± sd. This overrides consistency #17's "shipped K" variant, which adds best-of-3 selection bias (§8.8). |
+| 7 | frac_mean_outside_1 is undefined; the obvious implementation reads a zeroed buffer | LOW | accepted | Defined on the selection eval's on-policy rows (deterministic, pre-clip mean via `vecnorm.normalize_obs`, fraction of 2·N entries with |mean| > 1), computed in the selection callback for both the ablation and `ppo_s1`; a separately named `topple/policy/frac_rollout_mean_outside_1` from `_on_rollout_end` (§2.5, §5.2). |
+| 8 | SAC log_std_init is a no-op, SAC std_mean undefined, TrainingSeeds yields np.int64 | LOW | accepted | (a) `log_std_init` removed from SAC and forbidden by the per-algo schema; (b) SAC `std_mean` = mean of `exp(clamp(actor.log_std(latent_pi(z)), −20, 2))` over the on-policy rows, PPO `exp(log_std).mean()`; (c) `int(rng.integers(2**52))` and an `isinstance(seed, int)` test (§2.1, §2.2, §2.5, §6). |
+| 9 | No recipe-level aggregate row; the shipped best-of-3 is shown as 'PPO' | LOW | accepted | "PPO recipe (3 seeds)" row with mean ± sd and min; shipped row labelled "PPO (shipped: best of 3 by selection seeds)"; README footnote with recipe mean and min (§5.2). |
+| 10 | 2b budget-extension rule can almost never trigger | LOW | accepted | `paired_bootstrap(mean of the evals nearest 5.5M and the final, mean of the evals nearest 3.5M and 4.0M)` on the stored per-seed scores (`selection_scores.npz`), extend to 8M if lo > 0, CI recorded (§2.3, §8.8). |
+
+### deploy
+
+| # | Issue | Impact | Decision | Reason |
+|---|---|---|---|---|
+| 1 | IR/opset table rejects dynamo's IR 10/opset 20; the documented legacy recipe is being removed | MEDIUM | accepted | `CANONICAL_IR = {17: 8, 18: 8, 19: 9, 20: 9, 21: 10}`; pack sets IR, load requires the map; committed torch-free fixtures `thirdparty_legacy.onnx` and `thirdparty_dynamo.onnx` packed in the default job; `test_pack_torch_legacy` advisory; dynamo recipe primary (§3.3, §3.4, §6). |
+| 2 | Structure match compares op types only, not shapes, attributes or Constant nodes | MEDIUM | accepted | Canonical form folds Constants into initializers and drops schema-default attributes; structure match = op types + attributes + exact initializer shapes + head bounds bitwise ∓1 + symmetric normalization clip; check 7 rank 0..2; first-party uses rank-0 Clip bounds; pack tests for the dynamo fixture with scalar vs `[D]` scale (§3.2, §3.4, §6). |
+| 3 | Parity cannot catch small constant errors; no saturated-row coverage; negative controls unnamed; head bounds unsourced | MEDIUM | accepted | Bitwise constant binding in export step 3 (head bounds from `challenge.task_spec`, never `model.action_space`); `n_saturated ≥ 32` (rows with max |a_ref| ≥ 0.999); seven named negative controls; edge set defined. The edge set uses consistency #17's 6·D + 4 form (64 rows for D = 10, 94 for D = 15) instead of 4·D + 4, a superset that adds ±1e6 per feature (§2.4, §3.3, §6). |
+| 4 | G2/G2b/G3/G4 evaluated only on macOS; Linux CI checks only the eval_v1 ordering | MEDIUM | accepted | CI `python` job runs the 0..199 compare and uploads it; `phase2_results.py --fetch-ci` copies it (bound to the shipped `policy_sha256` and current `protocol_hash`) into `docs/results/phase2/ci_ubuntu/`; `phase2_gate.py` evaluates G2–G4 on both; `phase2.md` shows both blocks; PLAN done-when updated (§4, §5.2, §7, PLAN). |
+| 5 | ORT-web version (1.20) stale; browser check deferred although the artifact is frozen | LOW | modified | Accepted: pin `onnxruntime-web@1.30.0`, WASM EP, optimizations disabled, 1 thread; rationale reworded ("IR ≤ 10 keeps ORT-web ≥ 1.20 compatible"). The Node parity test stays in Phase 5 because this branch has no `web/` toolchain, but it becomes Phase 5's first done-when line, run against the frozen `.bin` v1 fixtures (§3.4, §10). |
+| 6 | Non-finite observations give different results per runtime | LOW | accepted | Contract §17: non-finite observations are outside the policy domain; harness asserts finite obs (`test_harness_finite_obs`); §3.5 limits the NaN → `invalid_action` statement to NaN-propagating runtimes; Phase 8 firmware fails safe on non-finite obs/actions (§3.5, §6, §8.9 item 4, §10). |
+| 7 | The .bin parity fixture has no magic, version, action dim or row-set flags | LOW | accepted | Layout v1 (`TPAR`, version, N, D, A, obs, a_ref, set, padded), sidecar with `a`, `tolerance`, `n_unsaturated`, `n_saturated`, `policy_sha256`; readers check magic/version and D/A (§3.3, §6). |
+| 8 | 2b shipped policy has no named parity fixture and no CI re-verification | LOW | accepted | `--test-fixture ppo_waypoint`; `test_shipped_policy` parametrized over both policies; `phase2b_gate.py --fixture` checks the G5 binding; item 9 and item 10 (§8.8, §8.9, §6). |
+| 9 | The C path meets the Phase 8 bar; a cheap host-C parity check could be added now | LOW | accepted | Default-job `test_c_reference`: header from initializers by position, ~40-line reference MLP compiled with the system cc with and without `-ffp-contract=off`, `.bin` rows within 1e-5; CI sets `TOPPLE_REQUIRE_CC=1` (§6, §10). |
+
+### security
+
+| # | Issue | Impact | Decision | Reason |
+|---|---|---|---|---|
+| 1 | Phase 3 MUST runs untrusted ONNX inside the privileged workflow_run job | HIGH | accepted | §10 (i) rewritten: `rescore` job (`permissions: {}`, no secrets, `persist-credentials: false`, workspace not mounted, fetch by immutable `head_sha`, ≤ 64 KiB JSON + npz out) and a separate `publish` job holding the token that never parses ONNX; nightly salt only in a token-less host process, empty sandbox env, rotated per season; red-team item for `GITHUB_TOKEN`/salt visibility; PLAN CI row reworded. `phase-3.md` itself is not edited here (outside this change's files) (§10, PLAN). |
+| 2 | Static cost not weighted by op type: an accepted Softplus chain is 230× first-party | MEDIUM | accepted | `OP_WEIGHT` (1 / Tanh, Sigmoid 2 / Elu 4 / Softplus 48), `MAX_COST = 2^17` (first-party ≈ 5,200, 25× headroom; measured worst case ≤ 8.4 s per 400k acts); red-team `softplus_chain_w4096_x52`, `elu_chain_w4096_x52`; per-act bound as CPU time or ≥ 50 ms wall with one retry; `bench_policy_caps.py` ≤ 20 s on ubuntu x86 incl. subnormals; `set_denormal_as_zero` never in-process; Arena per-act budget and no R2 upload after `timeout` (§3.4, §6, §10). |
+| 3 | Check 2 is unimplementable on the pinned protobuf and its allow-list is incomplete | MEDIUM | accepted | Shared with consistency #2: `UnknownFieldSet(msg)` on every visited message; `TensorShapeProto {dim}` added; `TensorProto.name` absent inside `AttributeProto.t` and regex-checked everywhere; round-1 deploy #6 superseded; tests for unknown field 99 on three message types, `producer_version=""`, 1 KiB Constant name, exact build field set (§3.2, §3.4, §6). |
+| 4 | Validator crashes on invalid UTF-8 and protobuf decode errors | MEDIUM | accepted | Check 1 maps `DecodeError` → `onnx_parse_failed`; check 2 requires `str` values that encode as UTF-8 → `invalid_utf8`, before any regex; `validate_policy_bytes` / `read_manifest` / `load_policy_dir` map DecodeError, ValueError, TypeError, UnicodeError, RecursionError, MemoryError to fixed codes; npz headers parsed and size-checked before `np.load` in export and Phase 1 `load_npz`; tests for each case (§3.3, §3.4, §6). |
+| 5 | Phase 3 ownership keyed on GitHub handle: collisions, renames, copies | MEDIUM | modified | Accepted for Phase 3 (§10 (iv)): `submissions/community/<lowercased login>/`, rows keyed on numeric `user.id`, PRs limited to their own directory, exact-sha `duplicate`, reserved `/official\|topple/i` names shown as quoted self-reported text. Changed: first-party entries stay where they are (outside the community tree) instead of moving to `submissions/official/`, which avoids churning Phase 1/2 paths while still preventing shadowing (§10). |
+| 6 | Python regexes anchored with ^...$ accept a trailing newline | LOW | accepted | All Python-side checks use `re.fullmatch` with unanchored patterns; tests for trailing `\n` in a node name, metadata key and op_type (§3.4, §6). |
+| 7 | Extra topple.* metadata keys carry ~9 KiB of unrestricted text into identity bytes | LOW | accepted | Exactly the 7 required keys, each `json.dumps` of the manifest field, ASCII; pack drops all others; check 4 enforces it; tests for an extra `topple.note` and non-ASCII values (§3.2, §3.4, §6). |
+| 8 | read_regular_file can block on a FIFO swap; resume trusts shared pickles | LOW | accepted | `O_NONBLOCK \| O_NOCTTY \| O_CLOEXEC` added, `S_ISREG(fstat)` required; FIFO swap red-team with a 5 s timeout; `resume_from` refuses files not owned by `os.getuid()` and prints that resume executes pickles (§2.1, §3.4, §6). |
+
+### product
+
+| # | Issue | Impact | Decision | Reason |
+|---|---|---|---|---|
+| 1 | 2b learnability gate still ~50% per pilot-quality run; selection ignores (d); no fallback; 'better arm' undefined | HIGH | accepted | Shared with rl #5: eligibility adds `fell ≤ driver_fell + 0.20` with the driver's fall rate measured at train start; 6-run shipping rule with fallback and per-run item-6 table; "better arm" removed as a selection term; all 2b statistics on calibration seeds 0..399 (added to §0 and the Phase 3 disjointness rule); the pilot sentence is templated, the literal dropped; PLAN 2b done-when updated (§0, §8.2, §8.8, §8.9, PLAN). |
+| 2 | Reference driver is underspecified | MEDIUM | accepted | Full normative control law in §8.7 (direction/reverse rule, k_v 1.2 speed law, slew limit, x_ref clamp, LQR balance terms, turn law, output); anchors reuse it; `test_driver_golden` pins clean 0..4 scores to 1e-9 and standard 0..19 docked/fell; note that k_v 2.0 is about 1.2 points better (§6, §8.7). |
+| 3 | The learned policy's characteristic failure (falling at launch on clean) is invisible | MEDIUM | accepted | Item 6(e) reports clean-preset falls for PPO and driver; standard falls split by `fall_cause`; waypoint failure gallery; score parts as metrics and compare extras with an anchors-plus-PPO table; templated exchange-rate sentence. The optional soft gate on clean falls is rejected: it would add a gate on a metric not in the score (§5.3, §8.6, §8.9). |
+| 4 | Waypoint video: robot unreadable, MP4 undefined, trim ambiguous, dock shape wrong | MEDIUM | accepted | Fixed oblique camera; MP4 960×960 at 50 fps; GIF 480×480 at 10 fps (ladder); 0.08 m marker disc + heading arrow per robot; gates and dock as `gate_radius_m` discs; push arrows; trim rule with per-robot `e_i`, docked robots keep playing, fallen robots hold with a stamp after the 1.0 s epilogue (§8.9 item 8). |
+| 5 | impulse_hi sweep grid too coarse; lands one seed above the band floor | LOW | accepted | 0.300:0.500:0.025, in-band constraint (falls ∈ [3%, 10%], docked ≥ 88%), ties lower, owner decision if none qualifies, Wilson CIs; selects 0.375 on the pilot data (§8.7). |
+| 6 | fall_cause window misses late push falls; None is not a legal metrics value | LOW | accepted | Shared with consistency #11: 1.5 s window; `"push" \| "self" \| "none"`; added to the contract metrics vocabulary (§8.5, §8.9 item 4). |
+| 7 | Gates-only anchor 'never holds' is false under pushes | LOW | accepted | Reworded ("docks only incidentally"); anchors table records docked % and median `max_hold`; requirement unchanged (§8.7). |
+| 8 | GIF size ladders have no defined final rung | LOW | accepted | Hero, gallery and waypoint ladders spelled out to the last rung (three × 0.9 pane steps), rung recorded, fail only after the last (§5.2). |
+
+### consistency
+
+| # | Issue | Impact | Decision | Reason |
+|---|---|---|---|---|
+| 1 | cpu_s formula drops all SubprocVecEnv worker CPU once envs close | MEDIUM | accepted | Same fix as rl #4: ledger keyed by (pid, create_time), final read before close, monotonicity asserted in `test_resources`, forkserver case; start method pinned to `forkserver` in the configs (§1, §2.2, §6). |
+| 2 | Check 2 relies on UnknownFields(), which raises on protobuf 7.36 | MEDIUM | accepted | Same fix as security #3, plus `fd.is_repeated` (no `fd.label` in protobuf 7) and `DecodeError` → `onnx_parse_failed` at check 1 (§3.4, §6). |
+| 3 | Default CI job's strict mypy fails on train modules subclassing Any | MEDIUM | accepted | Option (a): mypy override `disallow_subclassing_any = false` for the five torch modules only; `.coveragerc-train` `include` = exactly those five files, so the two 80% scopes are disjoint (§7). |
+| 4 | Results MP4s are gitignored, so G8 passes on uncommitted files | MEDIUM | accepted | `!docs/results/**/*.mp4`; G8 requires `git ls-files --error-unmatch` and `git diff --quiet -- docs/results`; `test_repo_hygiene` asserts `git check-ignore` returns non-zero for both results MP4s (§4, §6, §7). |
+| 5 | G10 cannot be evaluated from the gate's inputs | MEDIUM | accepted | §5.1 lists the committed per-run summary exhaustively (incl. `num_timesteps`, `total_timesteps`, `selection_protocol_hash`, `env_algo_version`, `bundle_hash`, best `onnx_sha256`, `git_commit`, `git_dirty`); the gate recomputes the protocol hash and env version and checks every reported run; shipped run must have `git_dirty: false`; tests per missing field (§2.3, §4, §5.1, §6). |
+| 6 | Abort / re-run flow is undefined | MEDIUM | accepted | `topple train` exits 2 on a non-empty `--out`; `--retry` renames a `wall_clock_abort` attempt to `<out>.attempt<k>`; `phase2_results.py` globs attempts into `attempts[]`; candidates exclude abort flags; export without `--report-only` refuses them; tests (§1, §2.5, §3.3, §6). |
+| 7 | TrainConfig permits policy shapes the §3.2 builder cannot express | MEDIUM | accepted | `policy` is part of the per-algo union: PPO `tanh` with `pi`/`vf` of exactly 2 ints in 1..256; SAC `relu` with `pi`/`qf`; rejections tested. The parametric widening of §3.2 is not adopted (not needed for any shipped config) (§2.1, §6). |
+| 8 | 2b done-when not measurable from its script; nothing binds 2b runs to the frozen challenge | MEDIUM | accepted | `phase2b_done.sh` written in full: clean tree, `.venv-eval` + torch check, named pytest files for items 2/3/9, re-export `cmp`, `phase2_ci_check.py` for item 10, gate with `--submission --fixture --results-dir`; new item 11 binds every reported 2b run to the current protocol hash and waypoint env version; contract item checked by grep; item 7 read from `phase2.json` (§8.9). |
+| 9 | Waypoint versioning: scorer constants may be unhashed; ENV_ALGO_VERSION vs §13 bump unclear | MEDIUM | accepted | `WaypointScore` holds every scorer constant (golden-pinned dump); versioning rule before / at / after the freeze stated in §8.1 and listed for contract §13 (§8.1, §8.9 item 4). |
+| 10 | Shipping fallback set ('G1–G4') may exclude G2b | MEDIUM | accepted | Same fix as rl #2: named `SHIP_GATES` and `PASS_GATES` constants in `scripts/phase2_common.py`, used by both scripts and the gate test (§2.5, §4, §6). |
+| 11 | fall_cause = None and undocked t_finish_s do not fit the results schema; "MUST NOT change" too strong | LOW | accepted | `"none"` string; `t_finish_s = episode_seconds` for non-finishers; §8.1 reworded to protect `protocol_hash`, scores, success and existing metric values while allowing new keys; golden test pins existing keys (§8.1, §8.5, §8.6). |
+| 12 | Derived configs are still diffs with undefined merge semantics | LOW | accepted | "Every shipped YAML is a complete file; no inheritance"; `test_train_config` asserts each derived file differs from its base in exactly the listed key paths (§2.2, §8.8, §6). |
+| 13 | phase2_done.sh / G9 assume an open PR and do not require a clean tree | LOW | accepted | Both: `git status --porcelain` check first, and `ci.yml` also triggers on `push` to `phase-*`; `phase2_ci_check.py` gives distinct messages for no run / in progress / cancelled / failure (§4, §7). |
+| 14 | phase2_results.py is not idempotent | LOW | accepted | `--report-only` implies replace of `run_dir/report_policy/` only; test runs it twice (§3.3, §6). |
+| 15 | The CI-reference citation is circular, and artifacts expire | LOW | accepted | Citation bound to the policy: newest successful run whose `results.json` has the shipped `policy_sha256` (and current protocol hash), copied to `docs/results/phase2/ci_ubuntu/` in a follow-up commit; G8 checks existence and binding (merged with deploy #4) (§4, §5.2). |
+| 16 | Decision-log rows contradicting v4 not superseded; round-1/2 critiques not committed | LOW | modified | The four rows (and every round-3 supersession) are in the list above; `test_policy_build` asserts `not HasField("producer_version")` and the allow-listed field set. Committing `phase-2-critiques-r1.json` / `-r2.json` remains open: this change may edit only `phase-2.md`, this log and `PLAN.md`, so it is handed to the orchestrator. |
+| 17 | Remaining builder ambiguities in selection, parity rows and 2b init | LOW | modified | T = 0 → 0 rows, `n_onpolicy_seeds` counts T ≥ 1 (repeats allowed for short episodes); edge set 6·D + 4 (per feature {μ ± 10σ, μ ± 10.001σ, ±1e6}, the per-feature 0 dropped so D = 10 gives 64); `std_mean` defined per algorithm; `EvalProtocol.is_named`; `test_surgery` reworded to z = 0. Changed: the fine-tune source is per-seed (rl #6), not the shipped K (§2.4, §2.5, §5.3, §6, §8.8). |
+
+### PLAN.md changes (round 3)
+
+- Phase 2 / 2a: linear LR decay and tested bit-determinism (rl #1, rl #3); done-when gains "the
+  0..199 gates hold on both the developer Mac and the ubuntu CI runtime" (deploy #4).
+- Phase 2 / 2b done-when: calibration seeds 0..399; the shipped policy is the top eligible
+  checkpoint across both arms' 6 runs with fallback; clean-preset falls reported (product #1,
+  rl #5, product #3).
+- §4 stack table, CI row: untrusted bytes parsed only in a token-less, secret-less `rescore`
+  job; `publish` reads only its validated output (security #1).
