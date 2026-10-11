@@ -312,9 +312,13 @@ class CountsActs(PIDController):
 def test_the_control_loop_stops_at_the_challenges_episode_length() -> None:
     """An env that no longer ends its episodes (say a refactor moved the time limit into a
     wrapper) must not make evaluation record forever, about 1 KB per step on every worker:
-    the loop stops at the challenge's own episode length and fails loudly, as a harness bug."""
+    the loop stops at the challenge's own episode length and fails loudly, as a harness bug.
+
+    The env here ends its episode one step late, never later: a loop that lost its bound then
+    returns after 1001 steps and this test fails at once ("DID NOT RAISE"). With no end at all
+    (it once set 10**9) such a loop recorded about 1 KB per step until the job timed out."""
     env = BalanceEnv("ideal", record=True)
-    env.max_steps = 10**9  # the env no longer truncates at step 1000
+    env.max_steps = env.task_spec.max_steps + 1  # the env truncates one step after 1000
     CountsActs.acts = 0
     with pytest.raises(RuntimeError, match=r"did not end the episode within .*'s 1000 steps"):
         run_episode(env, lambda spec: CountsActs(), seed=0, index=0)
