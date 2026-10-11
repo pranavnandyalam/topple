@@ -3,8 +3,12 @@
 This document defines what a Topple controller sees, what it returns, how an episode runs and how it
 is scored. Python (`topple/`), the browser arena, the GitHub Action and robot firmware all implement
 exactly this. Anything that could change a fixed controller's score on a fixed seed is versioned
-(see §12). Values marked **[calibrated]** are frozen at the end of Phase 1 in
-`challenges/balance-v1/challenge.yaml` and never edited afterwards.
+(see §13). Values marked **[calibrated]** are frozen at the end of Phase 1 and never edited
+afterwards. `E_ref` (§12) lives in `challenges/balance-v1/challenge.yaml`, which `bundle_hash`
+covers. The push impulse band (§10) lives in the `standard` preset's push config
+(`topple.disturbances.PRESETS`, shared env code), which `protocol_hash` covers as part of the full
+preset definition. So an edit to `E_ref` moves every balance-v1 protocol hash, and an edit to the
+band moves `balance-v1/standard`'s (§13).
 
 ## 1. Identifiers
 
@@ -16,8 +20,12 @@ exactly this. Anything that could change a fixed controller's score on a fixed s
 | Schema | `<family>.<obs\|robot\|effort>.v<N>` | `balancer.obs.v1`, `diffdrive.effort.v1`, `balancer.robot.v1` |
 | Artifact format | `topple.<kind>/<N>` | `topple.traj/1`, `topple.results/1` |
 
-Permanent aliases: `eval_v1` → `balance-v1/standard`, `eval_v1_clean` → `balance-v1/clean`,
-`obs_v1` → `balancer.obs.v1`.
+Permanent protocol aliases: `eval_v1` → `balance-v1/standard` and `eval_v1_clean` →
+`balance-v1/clean`, accepted wherever a protocol is named (`--protocol`, `EvalProtocol.from_id`);
+files always store the canonical id (§15). Schema ids have no aliases: `obs_v1` is only an
+informal name for `balancer.obs.v1` (its Python class `BalancerObs` is also exported as
+`topple.contract.Observation`), and `validate_schema_id` and a challenge's `obs_schema` refuse
+it.
 
 Every grammar is matched against the whole string (a trailing newline is not a match). Each
 segment of a challenge name starts with a letter, so the Gymnasium id (segments capitalized and
@@ -107,9 +115,9 @@ world, and the geometry the env relies on:
   the chassis frame is its wheel body's `pos` plus the tire's `pos` rotated by the body's `quat`;
   each has x and z within 1e-6 m of 0, the left one lies at y > 0 and the right one at y < 0,
   and their y coordinates sum to 0 within 1e-6 m. A reset tilts the chassis about its origin by
-  the initial pitch and turns each wheel, relative to the chassis, at minus the initial pitch
-  rate (forward positive, §2; §9): only on this axle do the tires then spawn touching the floor
-  (§5) and start rolling without slip.
+  the initial pitch and turns each wheel, relative to the chassis and forward positive (§2), at
+  minus the initial pitch rate (§9): only on this axle do the tires then spawn touching the
+  floor (§5) and start rolling without slip.
 - the `imu` site is not rotated relative to the chassis: each of its axes lies along the same
   chassis axis, within 1e-6 in 1 − cos of the angle between them. MuJoCo's gyro and
   accelerometer read in the site's frame, which §5 takes as the chassis frame; the board's mount
@@ -405,7 +413,8 @@ in the world frame at onset: ± along the heading, lateral component ≤ 0.3 of 
 the application point (`push_point`'s position) and the Jacobian `mj_applyFT` uses come from
 MuJoCo's data of the previous substep, so like contacts and the IMU (§5, §11) they lag the state
 by one substep (2 ms);
-impulse magnitude **[calibrated]** U(0.25, 0.45) N·s (target: the reference LQR survives ≥ 80%
+impulse magnitude **[calibrated]** U(0.25, 0.45) N·s, the `standard` preset's
+`PushConfig.impulse_ns` (target: the reference LQR survives ≥ 80%
 and the shipped PID 40–90% of `standard` episodes; measured on seeds 0..199 (darwin-arm64):
 LQR 86.5%, PID 64.5%, both 100% on `clean`). Force is capped at 50 N.
 

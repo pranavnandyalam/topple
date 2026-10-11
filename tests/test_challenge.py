@@ -194,6 +194,28 @@ def test_protocol_hash_covers_the_score_config(bundle: Path) -> None:
     assert load_challenge_dir(bundle).protocol_hash("standard") != base
 
 
+def test_each_calibrated_value_is_bound_by_the_protocol_hashes(
+    bundle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Contract preamble: E_ref lives in challenge.yaml (``bundle_hash``) and the push impulse
+    band in the ``standard`` preset's push config (shared env code), which ``protocol_hash``
+    covers with the full preset definition. An edit to E_ref moves every protocol hash, an edit
+    to the band only the ``standard`` one."""
+    presets = ("ideal", "clean", "standard")
+    base = {name: load_challenge_dir(bundle).protocol_hash(name) for name in presets}
+    standard = PRESETS["standard"]
+    assert standard.pushes is not None
+    assert standard.pushes.impulse_ns == (0.25, 0.45)
+    wider = standard.pushes.model_copy(update={"impulse_ns": (0.25, 0.46)})
+    monkeypatch.setitem(PRESETS, "standard", standard.model_copy(update={"pushes": wider}))
+    moved = {name: load_challenge_dir(bundle).protocol_hash(name) for name in presets}
+    assert [name for name in presets if moved[name] != base[name]] == ["standard"]
+    monkeypatch.undo()
+    yaml_path = bundle / "challenge.yaml"
+    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.0", "e_ref_j: 13.1"))
+    assert all(load_challenge_dir(bundle).protocol_hash(name) != base[name] for name in presets)
+
+
 def test_protocol_hash_rejects_unknown_presets_and_bad_seeds() -> None:
     c = load_challenge("balance-v1")
     with pytest.raises(ValueError, match="preset"):
@@ -207,7 +229,12 @@ def test_protocol_hash_rejects_unknown_presets_and_bad_seeds() -> None:
 
 
 @pytest.mark.parametrize(
-    ("key", "value"), [("obs_schema", "balancer.obs"), ("action_spec", "diffdrive.action.v1")]
+    ("key", "value"),
+    [
+        ("obs_schema", "balancer.obs"),
+        ("action_spec", "diffdrive.action.v1"),
+        ("obs_schema", "obs_v1"),  # an informal name for balancer.obs.v1, not an alias (§1)
+    ],
 )
 def test_challenge_schema_ids_follow_the_grammar(bundle: Path, key: str, value: str) -> None:
     yaml_path = bundle / "challenge.yaml"

@@ -33,6 +33,7 @@ from topple.contract import (
     validate_action,
     validate_schema_id,
 )
+from topple.ids import PROTOCOL_ALIASES, resolve_protocol
 from topple.robot import ROBOT_INTERFACE_ID
 
 
@@ -54,6 +55,17 @@ def make_obs(**overrides: object) -> BalancerObs:
 def test_observation_alias() -> None:
     assert Observation is BalancerObs
     assert OBS_SCHEMA_ID == "balancer.obs.v1"
+
+
+def test_obs_v1_is_an_informal_name_not_a_schema_id() -> None:
+    """§1: schema ids have no aliases. ``obs_v1`` names balancer.obs.v1 informally (and
+    ``Observation`` is its Python class), but where a schema id belongs it is refused, so every
+    file and challenge carries the canonical id. Only protocols have permanent aliases."""
+    with pytest.raises(ValueError, match="schema id"):
+        validate_schema_id("obs_v1")
+    assert "obs_v1" not in PROTOCOL_ALIASES
+    with pytest.raises(ValueError, match="protocol id"):
+        resolve_protocol("obs_v1")
 
 
 def test_features_order_is_frozen() -> None:

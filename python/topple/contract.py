@@ -132,7 +132,9 @@ class BalancerObs:
         return cls(t, p, pr, y, yr, (wpl, wpr), (wvl, wvr), (lal, lar))
 
 
-Observation = BalancerObs  # permanent alias for obs_v1 submissions
+# A permanent Python name for balancer.obs.v1 (lesson-1 submissions use it). Schema ids have no
+# aliases: "obs_v1" is only an informal name, never an accepted id (contract §1).
+Observation = BalancerObs
 
 
 def controller_obs(obs_arr: Sequence[float] | npt.NDArray[Any], t: float) -> BalancerObs:
