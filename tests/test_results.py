@@ -1,5 +1,6 @@
 """``topple.results/1``: schema bounds, cross-field checks, error details, atomic writes (§15)."""
 
+import errno
 import os
 import stat
 import unicodedata
@@ -229,6 +230,59 @@ def test_results_are_fsynced_before_the_rename(
     monkeypatch.setattr(results_module.os, "replace", replace)
     write_results(EvalResults.model_validate(results_dict()), tmp_path / "results.json")
     assert events[:2] == ["fsync", "replace"]
+
+
+def test_the_directory_is_fsynced_after_the_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rename itself is only durable once the directory entry reaches the disk."""
+    events: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd: int) -> None:
+        events.append("fsync dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync file")
+        real_fsync(fd)
+
+    def replace(src: str, dst: Path) -> None:
+        events.append("replace")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(results_module.os, "fsync", fsync)
+    monkeypatch.setattr(results_module.os, "replace", replace)
+    write_results(EvalResults.model_validate(results_dict()), tmp_path / "results.json")
+    assert events == ["fsync file", "replace", "fsync dir"]
+
+
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOTSUP])
+def test_a_directory_fsync_the_filesystem_does_not_support_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    real_fsync = os.fsync
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(code, os.strerror(code))
+        real_fsync(fd)
+
+    monkeypatch.setattr(results_module.os, "fsync", fsync)
+    path = tmp_path / "results.json"
+    write_results(EvalResults.model_validate(results_dict()), path)
+    assert read_results(path).challenge == results_dict()["challenge"]
+
+
+def test_a_failing_directory_fsync_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_fsync = os.fsync
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "I/O error")
+        real_fsync(fd)
+
+    monkeypatch.setattr(results_module.os, "fsync", fsync)
+    with pytest.raises(OSError, match="I/O error"):
+        write_results(EvalResults.model_validate(results_dict()), tmp_path / "results.json")
 
 
 def test_failed_write_leaves_nothing_behind(

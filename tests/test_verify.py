@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ from topple.evaluate import EPILOGUE_S, EvalProtocol, evaluate, run_episode
 from topple.results import EpisodeResult
 from topple.traj import Trajectory
 from topple.verify import (
+    ENV_META_FIELDS,
     EpisodeVerdict,
     protocol_max_steps,
     rescore,
@@ -93,6 +95,19 @@ def test_the_random_controller_really_clips(honest_runs: dict[str, Honest]) -> N
     assert not np.array_equal(upload.action, upload.ctrl)
 
 
+def test_the_replay_keeps_the_raw_actions(honest_runs: dict[str, Honest]) -> None:
+    """``action`` is the controller's raw output (§14), which an open-loop replay cannot
+    re-derive: the replay carries the upload's checked actions, not a copy of ``ctrl``."""
+    run = honest_runs["random"]
+    for index, upload in run.uploads.items():
+        verdict = verify_episode(upload, run.protocol, index)
+        assert verdict.ok, verdict.reason
+        assert verdict.replay is not None
+        np.testing.assert_array_equal(verdict.replay.action, upload.action)
+        np.testing.assert_array_equal(verdict.replay.ctrl, upload.ctrl)
+        assert (np.abs(verdict.replay.action) > 1.0).any()
+
+
 def test_a_verdict_carries_the_trusted_replay(honest_runs: dict[str, Honest]) -> None:
     run = honest_runs["pid"]
     verdict = verify_episode(run.uploads[0], run.protocol, 0)
@@ -100,6 +115,19 @@ def test_a_verdict_carries_the_trusted_replay(honest_runs: dict[str, Honest]) ->
     assert verdict.replay is not None
     np.testing.assert_array_equal(verdict.replay.qpos, run.uploads[0].qpos)
     assert verdict.replay.meta["episode_index"] == 0
+
+
+@pytest.mark.parametrize("preset", ["ideal", "clean", "standard"])
+@pytest.mark.parametrize("factory", [pid, lqr], ids=["pid", "lqr"])
+def test_honest_runs_reproduce_on_every_preset(tmp_path: Path, preset: str, factory: Any) -> None:
+    """Each preset has its own sensor path (``ideal`` records noiseless IMU readings)."""
+    run = run_honest(public(preset, 2), factory, tmp_path)
+    assert run.results.episodes is not None
+    for index, upload in run.uploads.items():
+        assert_reproduces(verify_episode(upload, run.protocol, index), run.results.episodes[index])
+    again = rescore(run.protocol, run.uploads, INFO, "inprocess")
+    assert again.episodes == run.results.episodes
+    assert again.aggregate == run.results.aggregate
 
 
 @pytest.mark.slow
@@ -180,6 +208,12 @@ def test_sim_unstable_replays_as_sim_unstable(
     assert verdict.result.error is not None
     assert verdict.result.error.code == "sim_unstable"
     assert verdict.result.score == 0.0
+    # The replay's blow-up takes precedence over whatever error the upload claims (§16 step 4).
+    steps = run.uploads[0].steps
+    other = with_meta(run.uploads[0], error={"code": "exception", "step": steps, "detail": "x"})
+    verdict = verify_episode(other, run.protocol, 0)
+    assert verdict.ok, verdict.reason
+    assert verdict.result.error == expected.error
 
 
 def test_survivors_have_no_epilogue_and_falls_do(
@@ -196,14 +230,65 @@ def test_survivors_have_no_epilogue_and_falls_do(
     assert fell.replay.epilogue_qpos.shape[0] == round(EPILOGUE_S / 0.01)
 
 
-def test_an_honest_error_report_only_lowers_the_score(honest_runs: dict[str, Honest]) -> None:
-    """Claiming an error on a good episode can only cost its author: the episode scores 0."""
+def claim_error(run: Honest, index: int, code: str = "timeout") -> Trajectory:
+    """A well-formed error report added to an honest episode, with the epilogue the replay
+    then simulates (an error means a 1 s epilogue, §11), so the claim reaches the accepted path."""
+    upload = run.uploads[index]
+    claimed = with_meta(upload, error={"code": code, "step": upload.steps, "detail": "my bad"})
+    replay = verify_episode(claimed, run.protocol, index).replay
+    assert replay is not None
+    return replace(claimed, epilogue_qpos=replay.epilogue_qpos)
+
+
+def test_a_claimed_error_without_its_epilogue_does_not_reproduce(
+    honest_runs: dict[str, Honest],
+) -> None:
     run = honest_runs["lqr"]
     upload = run.uploads[0]
-    claimed = with_meta(upload, error={"code": "timeout", "step": upload.steps, "detail": "my bad"})
+    claimed = with_meta(upload, error={"code": "timeout", "step": upload.steps, "detail": "x"})
     verdict = verify_episode(claimed, run.protocol, 0)
+    assert not verdict.ok
+    assert verdict.code == "not_reproducible"
+    assert "epilogue_qpos" in verdict.reason
+    assert (verdict.result.score, verdict.result.success) == (0.0, False)
+
+
+def test_an_honest_error_report_only_lowers_the_score(honest_runs: dict[str, Honest]) -> None:
+    """Claiming an error on a good episode can only cost its author: it reproduces, keeps the
+    error, scores 0 and is not a success, although the replay's own metrics are a success."""
+    run = honest_runs["lqr"]
+    assert run.results.episodes is not None
+    honest = run.results.episodes[0]
+    assert honest.success
+    assert honest.score > 0
+    verdict = verify_episode(claim_error(run, 0), run.protocol, 0)
+    assert verdict.ok, verdict.reason
+    assert verdict.code is None
+    assert verdict.result.error is not None
+    assert (verdict.result.error.code, verdict.result.error.step) == ("timeout", 1000)
+    assert verdict.result.error.detail == "my bad"
     assert verdict.result.score == 0.0
-    assert not verdict.result.success
+    assert verdict.result.success is False
+    assert verdict.result.metrics == honest.metrics  # the replay is scored, then zeroed
+    assert "ended with timeout" in verdict.reason
+
+
+def test_rescore_counts_a_claimed_error_as_a_failure(honest_runs: dict[str, Honest]) -> None:
+    run = honest_runs["lqr"]
+    assert run.results.episodes is not None
+    uploads = {**run.uploads, 0: claim_error(run, 0, "exception")}
+    again = rescore(run.protocol, uploads, INFO, "inprocess")
+    assert again.complete
+    assert again.episodes is not None
+    assert again.episodes[0].error is not None
+    assert again.episodes[0].error.code == "exception"
+    assert again.episodes[1:] == run.results.episodes[1:]
+    successes = sum(e.success for e in run.results.episodes)
+    assert again.aggregate.success_rate == (successes - 1) / 3
+    assert again.aggregate.errors == run.results.aggregate.errors + 1
+    assert again.aggregate.score == pytest.approx(
+        (run.results.aggregate.score * 3 - run.results.episodes[0].score) / 3, abs=1e-12
+    )
 
 
 # ------------------------------------------------------------------ local runs (verify_with_seed)
@@ -299,6 +384,27 @@ def test_rescore_of_a_private_protocol_is_redacted(honest_runs: dict[str, Honest
     again = rescore(private, run.uploads, INFO, "container")
     assert again.episodes is None
     assert again.seed_set == "private"
+    # Redaction hides the episodes, never changes the aggregate.
+    public_again = rescore(run.protocol, run.uploads, INFO, "container")
+    assert again.aggregate == public_again.aggregate == run.results.aggregate
+    assert again.complete
+
+
+def test_a_private_rescore_counts_forged_and_missing_episodes(
+    honest_runs: dict[str, Honest],
+) -> None:
+    run = honest_runs["lqr"]
+    assert run.results.episodes is not None
+    private = replace(run.protocol, seed_set="private", salt=99)
+    upload = run.uploads[0]
+    forged = replace(upload, push_force=upload.push_force + 1.0)
+    again = rescore(private, {0: forged, 1: run.uploads[1]}, INFO, "container")
+    assert again.episodes is None
+    assert not again.complete
+    assert again.aggregate.errors == 2
+    assert again.aggregate.episodes == 3
+    assert again.aggregate.score == pytest.approx(run.results.episodes[1].score / 3, abs=1e-12)
+    assert again.aggregate.success_rate == run.results.episodes[1].success / 3
 
 
 # ------------------------------------------------------------------ robustness
@@ -311,6 +417,18 @@ JSON = st.recursive(
     ),
     max_leaves=8,
 )
+CONTRACT_ENV_META_FIELDS = (
+    "termination",
+    "max_steps",
+    "control_dt",
+    "timestep",
+    "frame_skip",
+    "joint_qpos",
+    "wheel_sign",
+    "obs_schema",
+    "obs_features",
+)
+"""Contract §16 step 5, in order: written out here so dropping one from the code fails a test."""
 META_KEYS = (
     "challenge",
     "preset",
@@ -318,7 +436,7 @@ META_KEYS = (
     "episode_index",
     "scenario",
     "error",
-    "termination",
+    *CONTRACT_ENV_META_FIELDS,
 )
 
 
@@ -349,6 +467,59 @@ def test_missing_meta_keys_fail_verification(honest_runs: dict[str, Honest], key
     else:
         assert not verdict.ok
         assert verdict.result.score == 0.0
+
+
+def other_reason(termination: dict[str, Any]) -> dict[str, Any]:
+    return {**termination, "reason": "fell" if termination["reason"] == "timeout" else "timeout"}
+
+
+PLAUSIBLE_LIES: dict[str, Any] = {
+    "termination": other_reason,
+    "max_steps": lambda v: v // 2,
+    "control_dt": lambda v: v * 2,
+    "timestep": lambda v: v / 2,
+    "frame_skip": lambda v: v + 2,
+    "joint_qpos": lambda v: {**v, "wheels": v["wheels"][::-1]},
+    "wheel_sign": lambda v: [v[0], -v[1]],
+    "obs_schema": lambda v: v + ".forged",
+    "obs_features": lambda v: v[::-1],
+}
+"""A wrong but plausible value for each env-produced meta field, from the honest one."""
+SAME_VALUE_OTHER_TYPE: dict[str, Any] = {
+    "termination": lambda v: {**v, "step": float(v["step"])},
+    "max_steps": float,
+    "control_dt": lambda v: [v],
+    "timestep": str,
+    "frame_skip": float,
+    "joint_qpos": lambda v: {**v, "root": float(v["root"])},
+    "wheel_sign": lambda v: [int(x) for x in v],
+    "obs_schema": lambda v: [v],
+    "obs_features": ",".join,
+}
+"""The honest value re-typed (``1000`` -> ``1000.0``, ``[1.0, 1.0]`` -> ``[1, 1]``, ...)."""
+
+
+def test_verify_checks_exactly_the_contract_env_meta_fields() -> None:
+    assert ENV_META_FIELDS == CONTRACT_ENV_META_FIELDS
+    assert set(PLAUSIBLE_LIES) == set(SAME_VALUE_OTHER_TYPE) == set(CONTRACT_ENV_META_FIELDS)
+
+
+@pytest.mark.parametrize("edit", ["lie", "retyped"])
+@pytest.mark.parametrize("field", CONTRACT_ENV_META_FIELDS)
+def test_every_env_meta_field_must_equal_the_replay(
+    honest_runs: dict[str, Honest], field: str, edit: str
+) -> None:
+    run = honest_runs["pid"]
+    upload = run.uploads[0]
+    honest = upload.meta[field]
+    forge = (PLAUSIBLE_LIES if edit == "lie" else SAME_VALUE_OTHER_TYPE)[field]
+    forged = forge(honest)
+    assert json.dumps(forged, sort_keys=True) != json.dumps(honest, sort_keys=True)
+    verdict = verify_episode(with_meta(upload, **{field: forged}), run.protocol, 0)
+    assert not verdict.ok
+    assert verdict.code == "not_reproducible"
+    assert verdict.reason == f"meta.{field} differs from the replay"
+    assert (verdict.result.score, verdict.result.success) == (0.0, False)
 
 
 def test_protocol_max_steps() -> None:

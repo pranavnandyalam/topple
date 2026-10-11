@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import itertools
 import os
 import tempfile
@@ -26,6 +27,7 @@ MAX_VERSION_CHARS = 64
 RESULTS_FILE_MODE = 0o644
 REPLACEMENT_CHAR = "�"
 _KEPT_CONTROLS = frozenset("\n\t")
+_NO_DIRECTORY_FSYNC = frozenset({errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP})
 
 RunErrorCode = Literal[
     "exception",
@@ -156,7 +158,8 @@ def _check_public_episodes(episodes: list[EpisodeResult], aggregate: Aggregate) 
 
 def write_results(results: EvalResults, path: Path) -> None:
     """Atomic, durable write: readers never see a half-written file, and once this returns the
-    file is on disk (fsync before the rename), mode 0644 whatever the umask."""
+    file is on disk (the file is fsynced before the rename, its directory after), mode 0644
+    whatever the umask."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
@@ -170,6 +173,22 @@ def write_results(results: EvalResults, path: Path) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a rename in ``directory`` durable. Skipped where directories cannot be opened
+    (Windows) or the file system does not support syncing them; any other failure raises."""
+    if os.name == "nt":
+        return
+    fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        if exc.errno not in _NO_DIRECTORY_FSYNC:
+            raise
+    finally:
+        os.close(fd)
 
 
 def read_results(path: Path) -> EvalResults:

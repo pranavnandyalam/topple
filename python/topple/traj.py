@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import stat
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import IO, Any, NoReturn
@@ -137,9 +140,29 @@ def _guarded[R](path: Path, read: Callable[[], R]) -> R:
         ) from exc
 
 
-def _open_members(path: Path) -> zipfile.ZipFile:
-    zf = zipfile.ZipFile(path)
+def _open_regular(path: Path) -> IO[bytes]:
+    """Open ``path`` for reading only if it is a regular file (after following symlinks).
+
+    The open itself never blocks: a FIFO would wait forever for a writer and a device can be
+    endless, so the type is checked on the opened descriptor (no race with a swapped path).
+    """
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | nonblock)
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("not a regular file")
+        if nonblock:
+            os.set_blocking(fd, True)
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextmanager
+def _open_members(path: Path) -> Iterator[zipfile.ZipFile]:
+    """The zip archive at ``path``, once its member list and member sizes are acceptable."""
+    with _open_regular(path) as fh, zipfile.ZipFile(fh) as zf:
         infos = zf.infolist()
         names = [info.filename for info in infos]
         if len(set(names)) != len(names):
@@ -149,10 +172,7 @@ def _open_members(path: Path) -> zipfile.ZipFile:
         for info in infos:
             if info.file_size > MAX_MEMBER_BYTES:
                 raise ValueError(f"{info.filename} is too large ({info.file_size} bytes)")
-    except BaseException:
-        zf.close()
-        raise
-    return zf
+        yield zf
 
 
 def _build(path: Path, max_steps: int) -> Trajectory:
@@ -205,17 +225,36 @@ def _read_header(fh: IO[bytes], name: str) -> tuple[tuple[int, ...], bool, np.dt
     return tuple(int(n) for n in shape), bool(fortran), dtype
 
 
+class _NonFiniteError(ValueError):
+    """``meta_json`` holds a number that is not finite (contract §14)."""
+
+
 def _reject_constant(token: str) -> NoReturn:
-    raise ValueError(f"meta_json: non-finite number {token}")
+    raise _NonFiniteError(f"meta_json: non-finite number {token}")
+
+
+def _finite_float(literal: str) -> float:
+    """A JSON number with a fraction or exponent; ``1e400`` would silently become inf."""
+    value = float(literal)
+    if not math.isfinite(value):
+        shown = literal if len(literal) <= 40 else literal[:37] + "..."
+        raise _NonFiniteError(f"meta_json: non-finite number {shown}")
+    return value
 
 
 def _parse_meta(raw: npt.NDArray[Any]) -> dict[str, Any]:
     if raw.ndim != 1:
         raise ValueError("meta_json must be a 1-D uint8 array")
     try:
-        meta = json.loads(raw.tobytes().decode("utf-8"), parse_constant=_reject_constant)
+        meta = json.loads(
+            raw.tobytes().decode("utf-8"),
+            parse_constant=_reject_constant,
+            parse_float=_finite_float,
+        )
     except RecursionError as exc:
         raise ValueError("meta_json is nested too deeply") from exc
+    except _NonFiniteError:
+        raise
     except ValueError as exc:
         raise ValueError(f"meta_json is not valid UTF-8 JSON: {exc}") from exc
     if not isinstance(meta, dict) or meta.get("format") != FORMAT:

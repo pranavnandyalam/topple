@@ -1,5 +1,6 @@
 import json
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
 
 import mujoco
@@ -128,7 +129,8 @@ def test_verify_and_score_commands(tmp_path: Path) -> None:
     traj = out / "traj_000.npz"
     verified = runner.invoke(app, ["verify", str(traj)])
     assert verified.exit_code == 0, verified.output
-    assert verified.output.startswith("OK")
+    assert verified.output.startswith("OK: reproduced bit-exactly")
+    assert "UNBOUND" not in verified.output
     scored = runner.invoke(app, ["score", str(traj)])
     assert scored.exit_code == 0, scored.output
     payload = json.loads(scored.stdout)
@@ -398,11 +400,17 @@ def test_verify_a_local_seed_is_unbound(tmp_path: Path) -> None:
     out = _run(tmp_path, "-p", "balance-v1/clean", "--seed", "7")
     result = runner.invoke(app, ["verify", str(out / "traj_000.npz")])
     assert result.exit_code == 0, result.output
-    assert result.output.startswith("OK")
+    # The first line alone tells a protocol-bound pass from an unbound one.
+    assert result.output.startswith("OK (UNBOUND): reproduced bit-exactly")
     assert "UNBOUND (seed taken from file)" in result.output
     explicit = runner.invoke(app, ["verify", str(out / "traj_000.npz"), "--seed", "7"])
     assert explicit.exit_code == 0, explicit.output
-    assert "UNBOUND" in explicit.output
+    assert explicit.output.startswith("OK (UNBOUND)")
+    assert "UNBOUND (seed from --seed)" in explicit.output
+    scored = runner.invoke(app, ["score", str(out / "traj_000.npz"), "--seed", "7"])
+    assert scored.exit_code == 0, scored.output
+    payload = json.loads(scored.stdout)
+    assert (payload["ok"], payload["bound"], payload["seed"]) == (True, False, 7)
     bound = runner.invoke(app, ["verify", str(out / "traj_000.npz"), "--index", "0"])
     assert bound.exit_code == 1
     assert "scenario" in bound.output
@@ -577,3 +585,57 @@ def test_verify_with_an_explicit_protocol(eval_dir: Path) -> None:
     result = runner.invoke(app, ["verify", str(eval_dir), "-p", "balance-v1/standard"])
     assert result.exit_code == 1
     assert "FAIL: 20 of 20 episodes failed verification" in result.output
+
+
+def _edited_file(out: Path, name: str, **changes: object) -> Path:
+    """``traj_000.npz`` of a run with meta keys replaced (or removed when the value is None)."""
+    from dataclasses import replace
+
+    from topple.traj import load_npz
+
+    traj = load_npz(out / "traj_000.npz", max_steps=1000)
+    meta = {k: v for k, v in {**traj.meta, **changes}.items() if v is not None}
+    replace(traj, meta=meta).save_npz(out / name)
+    return out / name
+
+
+def test_a_file_that_names_no_episode_exits_2(tmp_path: Path) -> None:
+    out = _run(tmp_path, "-p", "balance-v1/clean")
+    path = _edited_file(out, "anon.npz", episode_index=None, scenario=None)
+    result = runner.invoke(app, ["verify", str(path)])
+    assert result.exit_code == 2
+    assert "cannot tell which episode this is; pass --index or --seed" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_long_untrusted_text_in_an_error_is_cut(tmp_path: Path) -> None:
+    out = _run(tmp_path, "-p", "balance-v1/clean")
+    path = _edited_file(out, "long.npz", challenge="x" * 10_000)
+    result = runner.invoke(app, ["verify", str(path)])
+    assert result.exit_code == 2
+    line = result.output.strip()
+    assert line.startswith("error: ")
+    assert line.endswith("...")
+    assert len(line) == len("error: ") + 500
+
+
+def test_a_fifo_in_a_run_directory_exits_2_without_hanging(
+    tmp_path: Path, make_fifo: Callable[[Path], Path]
+) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    make_fifo(run / "traj_000.npz")
+    result = runner.invoke(app, ["verify", str(run)])
+    assert result.exit_code == 2
+    assert "traj_000.npz: not a regular file" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("command", ["verify", "score"])
+def test_a_fifo_given_as_the_path_exits_2(
+    tmp_path: Path, make_fifo: Callable[[Path], Path], command: str
+) -> None:
+    path = make_fifo(tmp_path / "traj_000.npz")
+    result = runner.invoke(app, [command, str(path)])
+    assert result.exit_code == 2
+    assert "not a regular file" in result.output

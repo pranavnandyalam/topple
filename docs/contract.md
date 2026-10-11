@@ -409,6 +409,8 @@ verifies and re-scores it by replay (§16).
 reads each member by hand and raises `ValueError`, naming the file, for anything else, including
 unreadable, truncated or missing files and corrupted members:
 
+- a regular file (symlinks are followed); a FIFO, device or directory is refused without
+  blocking on it or reading from it;
 - exactly the 11 members above, no duplicates, each at most 16 MiB uncompressed;
 - each an `.npy` of format 1.0 or 2.0, C order, the exact dtype of the table (no object arrays),
   whose header shape needs exactly the bytes the member holds (a header can never make the
@@ -417,7 +419,8 @@ unreadable, truncated or missing files and corrupted members:
   `accel`, `push_force` 3), `qpos`/`qvel` with T+1 rows and at least one column, `epilogue_qpos`
   as wide as `qpos`;
 - `T ≤ max_steps`;
-- `meta_json` a UTF-8 JSON object with `"format": "topple.traj/1"` and no `NaN`/`Infinity`.
+- `meta_json` a UTF-8 JSON object with `"format": "topple.traj/1"` and only finite numbers: no
+  `NaN`/`Infinity` tokens and no literal that overflows to infinity, such as `1e400`.
 
 `read_meta(path)` applies the same member checks and returns only the metadata.
 
@@ -446,7 +449,9 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
   number of episodes with an error. Private-seed results are redacted: `episodes` is null,
   aggregate only.
 - **Writing** is atomic and durable: a temporary file in the target directory, mode 0644
-  whatever the umask, flushed and `fsync`ed, then renamed over the target.
+  whatever the umask, flushed and `fsync`ed, then renamed over the target, then the directory
+  `fsync`ed so the rename survives a power loss (skipped on Windows and on file systems that
+  do not support syncing a directory).
 
 ## 16. Trusted verification and re-scoring
 
@@ -483,6 +488,9 @@ def protocol_max_steps(protocol) -> int
 Verification never raises for anything in the upload. `verify_episode` raises `ValueError` only
 for an index outside the protocol, `verify_with_seed` for a seed outside `[0, 2**53)` or a
 negative index (caller bugs).
+`replay` is the trusted env's own record of the replay, with one exception: `action`, the raw
+controller output (§14), cannot be re-derived open loop, so `replay.action` is the upload's,
+checked in step 3 (finite, and `clip(action, −1, 1) == ctrl`). Nothing is scored from it.
 `verify_with_seed` is the local/debug binding for seeds outside the protocol list (`topple run
 --seed`): the scenario is still re-derived from the seed, `meta.episode_index` is not checked,
 and `index` only labels the verdict.
@@ -549,6 +557,10 @@ traceback.
     from `meta.scenario.seed`, the file is verified with `verify_with_seed` on the scenario's
     seed and the output says `UNBOUND (seed taken from file)`; the scenario is still re-derived
     from that seed. `--index I` binds explicitly; `--seed S` verifies unbound on S.
+  - The first output line is `OK: …` for a pass bound to the protocol and `OK (UNBOUND): …` for
+    an unbound one. Both exit 0, so the exit code of a default file binding never proves that
+    the file is a given episode of the protocol: a script that needs that passes `--index` (or
+    re-scores a run directory), as the trusted path does.
   - `--out` writes the trusted results (§15): for a directory the `rescore` results, for a file
     a one-episode result with `complete: false`. The controller is recorded as
     `{id: <SUB's name>, sha256: <SUB's submission sha256>}`, computed without importing SUB, or

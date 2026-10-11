@@ -1,8 +1,10 @@
 import io
 import json
+import os
 import re
 import tempfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -350,17 +352,47 @@ def test_duplicate_members_are_rejected(tmp_path: Path) -> None:
         b"[" * 100_000 + b"]" * 100_000,  # RecursionError inside json
         b'{"format": "topple.traj/1", "x": NaN}',
         b'{"format": "topple.traj/1", "x": Infinity}',
+        b'{"format": "topple.traj/1", "x": 1e400}',
+        b'{"format": "topple.traj/1", "x": [-1e400]}',
+        b'{"format": "topple.traj/1", "x": {"y": 1E999}}',
         b"\xff\xfe not utf-8",
         b'["topple.traj/1"]',
         b"",
     ],
-    ids=["deep nesting", "NaN", "Infinity", "bad utf-8", "not an object", "empty"],
+    ids=[
+        "deep nesting",
+        "NaN",
+        "Infinity",
+        "overflow",
+        "negative overflow",
+        "nested overflow",
+        "bad utf-8",
+        "not an object",
+        "empty",
+    ],
 )
 def test_bad_meta_is_a_value_error(tmp_path: Path, meta: bytes) -> None:
     path = tmp_path / "meta.npz"
     write_members(path, honest_members(meta=meta))
     with pytest.raises(ValueError, match="meta"):
         load_npz(path, max_steps=1000)
+
+
+@pytest.mark.parametrize("text", ["1e400", "-1e400", "1E999", "2e308", "-1.8e308"])
+def test_read_meta_rejects_numbers_that_overflow_to_infinity(tmp_path: Path, text: str) -> None:
+    """``1e400`` is valid JSON syntax but parses to inf: the loader must refuse it (§14)."""
+    path = tmp_path / "meta.npz"
+    meta = b'{"format": "topple.traj/1", "x": ' + text.encode() + b"}"
+    write_members(path, honest_members(meta=meta))
+    with pytest.raises(ValueError, match="non-finite"):
+        read_meta(path)
+
+
+def test_large_finite_numbers_in_meta_still_load(tmp_path: Path) -> None:
+    path = tmp_path / "meta.npz"
+    meta = b'{"format": "topple.traj/1", "x": 1.7976931348623157e308, "y": -5e-324, "z": 1e-400}'
+    write_members(path, honest_members(meta=meta))
+    assert read_meta(path) == {"x": 1.7976931348623157e308, "y": -5e-324, "z": 0.0}
 
 
 @pytest.mark.parametrize(
@@ -373,6 +405,34 @@ def test_unreadable_files_are_value_errors(tmp_path: Path, content: bytes) -> No
     path.write_bytes(content)
     with pytest.raises(ValueError, match=r"junk\.npz"):
         load_npz(path, max_steps=1000)
+
+
+def test_a_fifo_is_refused_without_blocking(
+    tmp_path: Path, make_fifo: Callable[[Path], Path]
+) -> None:
+    """Opening a FIFO for reading blocks until a writer appears: never open one (§14)."""
+    path = make_fifo(tmp_path / "traj_000.npz")
+    with pytest.raises(ValueError, match=r"traj_000\.npz: not a regular file"):
+        load_npz(path, max_steps=1000)
+    with pytest.raises(ValueError, match=r"traj_000\.npz: not a regular file"):
+        read_meta(path)
+
+
+def test_a_device_is_refused(tmp_path: Path) -> None:
+    device = Path(os.devnull)
+    if not device.exists() or device.is_file():
+        pytest.skip("no character device to try")
+    with pytest.raises(ValueError, match="not a regular file"):
+        load_npz(device, max_steps=1000)
+
+
+def test_a_symlink_to_a_regular_file_loads(tmp_path: Path) -> None:
+    traj = make_traj()
+    real = tmp_path / "real.npz"
+    traj.save_npz(real)
+    link = tmp_path / "link.npz"
+    link.symlink_to(real)
+    assert load_npz(link, max_steps=5).meta == traj.meta
 
 
 def test_missing_file_and_directory_are_value_errors(tmp_path: Path) -> None:

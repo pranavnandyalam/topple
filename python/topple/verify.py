@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import numpy as np
@@ -79,7 +79,8 @@ class EpisodeVerdict:
     ok: bool  # bound to (protocol, index) and reproduced bit-exactly
     code: VerifyCode | None
     reason: str  # human-readable; the first failing check
-    replay: Trajectory | None  # trusted replay (None if the upload failed before replaying)
+    replay: Trajectory | None  # trusted replay (None if the upload failed before replaying);
+    # its ``action`` is the upload's checked raw output, which a replay cannot re-derive
     result: EpisodeResult  # scored only from ``replay`` and the env's own metadata
 
 
@@ -289,7 +290,9 @@ def _replay(
     if wants_epilogue(reason or SURVIVED, has_error=error is not None):
         env.simulate_epilogue(EPILOGUE_S)
     meta = {"episode_index": index, "error": error.model_dump() if error else None}
-    return _Replayed(env.trajectory(meta), error)
+    # The env records the commands it was stepped with as ``action``; the raw controller output
+    # cannot be re-derived open loop, so the replay keeps the upload's (checked in step 3).
+    return _Replayed(replace(env.trajectory(meta), action=upload.action), error)
 
 
 def _replay_error(

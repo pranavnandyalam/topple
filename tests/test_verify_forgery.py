@@ -130,7 +130,15 @@ def test_b_max_steps_shrunk_to_the_fall_with_a_timeout(standard: Honest) -> None
     upload = standard.uploads[i]
     steps = upload.steps
     forged = with_meta(upload, max_steps=steps, termination={"step": steps, "reason": "timeout"})
-    rejected(verify_episode(forged, standard.protocol, i), mentions="meta")
+    rejected(
+        verify_episode(forged, standard.protocol, i),
+        mentions="meta.termination differs from the replay",
+    )
+    alone = with_meta(upload, max_steps=steps)
+    rejected(
+        verify_episode(alone, standard.protocol, i),
+        mentions="meta.max_steps differs from the replay",
+    )
 
 
 def test_b_score_comes_from_the_replay_not_the_meta(standard: Honest) -> None:
@@ -198,10 +206,12 @@ def test_d_index_holds_another_index_trajectory(standard: Honest) -> None:
         rejected(verify_episode(swapped[i], standard.protocol, i), mentions="episode_index")
     again = rescore(standard.protocol, swapped, INFO, "inprocess")
     assert again.episodes is not None
+    assert standard.results.episodes is not None
     assert [e.error.code if e.error else None for e in again.episodes][:2] == [
         "not_reproducible",
         "not_reproducible",
     ]
+    assert again.episodes[2] == standard.results.episodes[2]
 
 
 def test_d_seed_swap_with_a_relabelled_index(standard: Honest) -> None:
@@ -292,6 +302,33 @@ def test_g_rescore_with_dropped_episodes(standard: Honest) -> None:
     assert again.aggregate.episodes == 3
 
 
+def zeroed_pushes(traj: Trajectory) -> Trajectory:
+    return replace(traj, push_force=np.zeros_like(traj.push_force))
+
+
+def cut_short(traj: Trajectory) -> Trajectory:
+    return truncated(traj, 500)
+
+
+@pytest.mark.parametrize(
+    ("forge", "code"),
+    [(zeroed_pushes, "not_reproducible"), (cut_short, "incomplete")],
+    ids=["integrity", "incomplete"],
+)
+def test_honest_episodes_after_a_rejected_replay_still_reproduce(
+    standard: Honest, forge: Any, code: str
+) -> None:
+    """``rescore`` reuses one env: a replay that ends in rejection must leave nothing behind."""
+    assert standard.results.episodes is not None
+    uploads = {**standard.uploads, 0: forge(standard.uploads[0])}
+    again = rescore(standard.protocol, uploads, INFO, "inprocess")
+    assert again.episodes is not None
+    assert again.episodes[0].error is not None
+    assert again.episodes[0].error.code == code
+    assert again.episodes[0].metrics is not None  # rejected after the replay ran
+    assert again.episodes[1:] == standard.results.episodes[1:]
+
+
 # ------------------------------------------------------------------ H: one episode everywhere
 
 
@@ -300,9 +337,10 @@ def test_h_one_good_episode_copied_to_every_index(standard: Honest) -> None:
     copies = {i: with_meta(standard.uploads[best], episode_index=i) for i in range(3)}
     again = rescore(standard.protocol, copies, INFO, "inprocess")
     assert again.episodes is not None
+    assert standard.results.episodes is not None
     for i, e in enumerate(again.episodes):
         if i == best:
-            assert e.error is None
+            assert e == standard.results.episodes[i]
         else:
             assert e.error is not None
             assert e.error.code == "not_reproducible"
@@ -359,7 +397,10 @@ def test_k_ctrl_outside_the_unit_range(clean: Honest) -> None:
     ctrl, action = upload.ctrl.copy(), upload.action.copy()
     ctrl[10] = action[10] = (1.5, 0.0)
     forged = replace(upload, ctrl=ctrl, action=action)
-    rejected(verify_episode(forged, clean.protocol, 0), mentions="ctrl row 10")
+    rejected(
+        verify_episode(forged, clean.protocol, 0),
+        mentions="ctrl row 10 is not a finite command in [-1, 1]",
+    )
 
 
 @pytest.mark.parametrize("value", [np.nan, np.inf])
@@ -404,7 +445,10 @@ def test_l_more_than_max_steps_is_rejected_at_load(tmp_path: Path, clean: Honest
     longer.save_npz(path)
     with pytest.raises(ValueError, match="more than 1000"):
         load_npz(path, max_steps=protocol_max_steps(clean.protocol))
-    rejected(verify_episode(longer, clean.protocol, 0), mentions="1001")
+    rejected(
+        verify_episode(longer, clean.protocol, 0),
+        mentions="the trajectory has 1001 steps, more than the protocol's 1000",
+    )
 
 
 # ------------------------------------------------------------------ M: one ulp

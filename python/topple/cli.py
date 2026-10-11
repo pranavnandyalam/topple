@@ -370,6 +370,11 @@ def _verify_directory(
         _fail(f"verification crashed: {describe_exception(exc)}")
 
 
+def _not_a_file(path: Path) -> str:
+    """Why ``path`` cannot be verified (a FIFO or device is never opened)."""
+    return f"{path}: not a regular file" if path.exists() else f"{path} does not exist"
+
+
 def _report_directory(results: EvalResults) -> bool:
     """Print the trusted results; True if every expected episode reproduced."""
     from topple.results import VERIFY_ERROR_CODES
@@ -386,7 +391,8 @@ def _report_directory(results: EvalResults) -> bool:
 
 
 def _report_file(binding: _Binding, verdict: EpisodeVerdict) -> None:
-    head = "OK" if verdict.ok else f"FAIL ({verdict.code})"
+    """The verdict; the first line alone tells a protocol-bound pass from an unbound one."""
+    head = ("OK" if binding.bound else "OK (UNBOUND)") if verdict.ok else f"FAIL ({verdict.code})"
     typer.echo(f"{head}: {verdict.reason}")
     if not binding.bound:
         typer.echo(
@@ -439,7 +445,7 @@ def verify(
         ok = verdict.ok
         results = _single_results(binding, verdict, _controller_info(submission), iso)
     else:
-        _fail(f"{path} does not exist")
+        _fail(_not_a_file(path))
     if out is not None:
         _write(results, out)
     if not ok:
@@ -460,7 +466,7 @@ def score(
     if trajectory.is_dir():
         _fail("topple score takes one trajectory file; use topple verify for a run directory")
     if not trajectory.is_file():
-        _fail(f"{trajectory} does not exist")
+        _fail(_not_a_file(trajectory))
     binding, verdict = _verify_file(trajectory, protocol, index, seed)
     result = verdict.result
     payload = {
