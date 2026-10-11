@@ -300,8 +300,9 @@ in the world frame at onset: ± along the heading, lateral component ≤ 0.3 of 
 the application point (`push_point`'s position) and the Jacobian `mj_applyFT` uses come from
 MuJoCo's data of the previous substep, so like contacts and the IMU (§5, §11) they lag the state
 by one substep (2 ms);
-impulse magnitude **[calibrated]** (target: reference LQR survives ≥ 80% and PID 40–90% of
-`standard` episodes; initial band U(0.25, 0.45) N·s). Force is capped at 50 N.
+impulse magnitude **[calibrated]** U(0.25, 0.45) N·s (target: the reference LQR survives ≥ 80%
+and the shipped PID 40–90% of `standard` episodes; measured on seeds 0..199: LQR 86.5%, PID
+65.0%, both 100% on `clean`). Force is capped at 50 N.
 
 ## 11. Termination, stability
 
@@ -335,13 +336,15 @@ controller acted on and row T is the final (possibly terminal) state:
   when T = 0). `max_tilt_rad` is the maximum over all rows 0..T
 - `drift_m` = planar (xy) distance of the root from row 0 at the final row T; `max_drift_m` = its
   maximum over all rows
-- `energy_j`, per control step k and wheel i:
-  `Σ_k Σ_i max(0, V_nom·i_stall·u_i[k]·(u_i[k] − ω_i[k]/ω_noload))·control_dt`, where `u_i[k]` is
-  the clipped command `ctrl` of step k (as issued, before the native actuator delay) and
-  `ω_i[k] = (θ_i[k+1] − θ_i[k]) / control_dt` is the mean wheel speed over the step, from the
-  recorded chassis-relative wheel angles (`qpos` wheel columns times `wheel_sign`, so forward is
-  positive). This is the battery energy of an ideal DC motor in slow decay, summed exactly
-  (`math.fsum`); the same formula applies to real logs (commands plus encoder angles). 0 when T = 0
+- `energy_j`, over control steps k and wheels i:
+  `fsum_{k,i}(max(0, V_nom·i_stall·u_i[k]·(u_i[k] − ω_i[k]/ω_noload))) · control_dt`, where
+  `u_i[k]` is the clipped command `ctrl` of step k (as issued, before the native actuator delay)
+  and `ω_i[k] = (θ_i[k+1] − θ_i[k]) / control_dt` is the mean wheel speed over the step, from the
+  recorded chassis-relative wheel angles `θ_i[k] = (qpos[k, wheel_i] − qpos[0, wheel_i]) ·
+  wheel_sign_i` (forward positive). This is the battery energy of an ideal DC motor in slow
+  decay; the per-step powers are summed exactly (`math.fsum`) and the sum is multiplied by
+  `control_dt` once. The same formula applies to real logs (commands plus encoder angles).
+  0 when T = 0
 - `saturation_fraction` = fraction of the T steps where any |u| ≥ 0.99 after clipping (0 when T = 0)
 
 Episode score (0–100):
@@ -349,7 +352,8 @@ Episode score (0–100):
 + 0.1·(1 − min(energy_j/E_ref, 1)))`. An episode with an error scores 0.
 
 `success = survived ∧ drift_m < 1 ∧ energy_j ≤ 5·E_ref`. `E_ref` **[calibrated]** = 2× the PID
-baseline's median energy on `balance-v1/standard`, rounded, frozen.
+baseline's median energy on `balance-v1/standard` (seeds 0..199, all episodes), rounded to 0.1 J,
+frozen: 2 × 6.64 J → `E_ref = 13.3` J.
 
 Protocol score = `fsum` of episode scores in seed order / N, and success rate = successes / N,
 where N is the number of episodes the protocol expects: a missing or errored episode counts as 0.
@@ -366,7 +370,10 @@ Env code is shared by all challenges. A code change that can change a fixed cont
 on a fixed seed (sensing, estimation, termination, pushes, model overrides) must bump
 `topple.challenge.ENV_ALGO_VERSION` (currently 1). It is part of every `protocol_hash`, so results
 from different env algorithms are never compared; once a challenge is published such a change also
-needs its new major version.
+needs its new major version. Known-answer tests (`tests/test_golden.py`) pin controller seeds,
+scenarios (seeds 0, 1000 and 2**53−1 on every preset), the bundle and protocol hashes and the
+PID/LQR baseline scores on public seeds 1000–1002 of `standard` (per platform, to 1e-9), so such
+a change cannot land unnoticed.
 
 - `bundle_hash()` = sha256 of the tag `topple.bundle/1\n`, then, for each bundle file in POSIX-path
   order, `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths, path relative to the bundle

@@ -79,7 +79,7 @@ topple/
 │   ├── envs/            balance.py (topple/Balance-v1), later waypoint.py, sumo.py
 │   ├── controllers/     pid.py, lqr.py, onnx_policy.py (P2)
 │   ├── design/          LQR design from the linearized model
-│   ├── traj.py, scoring.py, verify.py   topple.traj/1, metrics + score, open-loop re-simulation check
+│   ├── traj.py, scoring.py, verify.py   topple.traj/1, metrics + score, trusted replay + re-scoring
 │   ├── evaluate.py, results.py, loader.py   protocols, topple.results/1, submission loading
 │   ├── runner.py        (P3) runs untrusted controllers in a subprocess/container
 │   ├── crashtest/       (P4) fuzzer, RoA, STL, rating
@@ -123,7 +123,10 @@ changing `obs_v1`.
 - **Ranked scores come only from CI** (pinned Linux image = source of truth). Browser runs are unranked.
 - **The controller never shares a process with the scorer** (it could monkeypatch metrics). Subprocess + pipe; Docker `--network none --read-only` in CI.
 - **Hidden seeds:** public PR evals use public seeds. The top-k get re-evaluated nightly on private seeds in the privileged stage to stop overfitting.
-- **Replays play stored trajectories (`traj.npz`), never re-simulate.** Mac/Linux/WASM diverge after ~5k steps.
+- **The replay viewer plays stored trajectories (`traj.npz`), never re-simulates.** Mac/Linux/WASM diverge after ~5k steps.
+- **Scores never come from an upload.** The trusted path (`topple verify`/`score`, publish, nightly)
+  re-simulates an uploaded trajectory's commands on its own build from the protocol's own seed and
+  scores only that replay; any bit that differs fails verification (contract §16).
 - **Tournament opponents exchange ONNX weights (data), not code.**
 
 ---
