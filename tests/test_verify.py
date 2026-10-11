@@ -534,6 +534,30 @@ def test_verify_run_counts_failures_before_the_results_are_redacted(
     assert honest.results == rescore(private, run.uploads, INFO, "container")
 
 
+@pytest.mark.parametrize("seed_set", ["public", "private"])
+def test_verify_run_counts_an_incomplete_upload_as_a_failure(
+    honest_runs: dict[str, Honest], seed_set: str
+) -> None:
+    """§16: ``failed`` counts incomplete episodes too. An upload cut short with no error report
+    (forgeries C and I) fails the run, whether its results list the episodes or are redacted."""
+    run = honest_runs["lqr"]
+    protocol = (
+        run.protocol
+        if seed_set == "public"
+        else replace(run.protocol, seed_set="private", salt=PRIVATE_SALT)
+    )
+    cut = truncated(run.uploads[0], 500)
+    assert cut.meta["error"] is None
+    verdict = verify_run(protocol, {**run.uploads, 0: cut}, INFO, "inprocess")
+    assert (verdict.failed, verdict.ok) == (1, False)
+    assert verdict.results.aggregate.errors == 1
+    if seed_set == "public":
+        assert verdict.results.episodes is not None
+        error = verdict.results.episodes[0].error
+        assert error is not None
+        assert (error.code, error.step) == ("incomplete", 500)
+
+
 def test_errors_of_the_run_itself_are_not_verification_failures(tmp_path: Path) -> None:
     """An honest error report reproduces: the episode scores 0 but the run verified."""
     errored = run_honest(public("clean", 2), explodes(30, RuntimeError("bug")), tmp_path)

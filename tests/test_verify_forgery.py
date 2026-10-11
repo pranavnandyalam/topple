@@ -20,6 +20,7 @@ from topple.contract import controller_obs
 from topple.disturbances import Scenario
 from topple.envs.balance import BalanceEnv
 from topple.evaluate import EPILOGUE_S, ControllerFactory, EvalProtocol, wants_epilogue
+from topple.results import sanitize_detail
 from topple.traj import Trajectory, load_npz
 from topple.verify import (
     EpisodeVerdict,
@@ -91,7 +92,8 @@ def rejected(
     assert result.error is not None
     assert result.error.code == code
     assert result.error.step == steps
-    assert result.error.detail == verdict.reason[: len(result.error.detail)]
+    assert result.error.detail  # the stored error says why
+    assert result.error.detail == sanitize_detail(verdict.reason)
 
 
 def rejects(

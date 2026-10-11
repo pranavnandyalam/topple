@@ -530,6 +530,42 @@ def test_verify_a_directory_with_a_forged_episode(eval_dir: Path, tmp_path: Path
     assert "FAIL: 1 of 20 episodes failed verification" in result.output
 
 
+def test_verify_a_directory_with_an_incomplete_episode(eval_dir: Path, tmp_path: Path) -> None:
+    """A file cut short with no error report is incomplete (§16, forgeries C and I): the run
+    did not verify (exit 1), and the trusted results say why."""
+    from topple.traj import load_npz
+    from verify_support import truncated
+
+    run = _copy_run(eval_dir, tmp_path / "copy")
+    traj = load_npz(run / "traj_003.npz", max_steps=1000)
+    assert traj.meta["error"] is None
+    truncated(traj, 500).save_npz(run / "traj_003.npz")
+    out = tmp_path / "trusted.json"
+    result = runner.invoke(app, ["verify", str(run), "--out", str(out)])
+    assert result.exit_code == 1, result.output
+    assert "FAIL: 1 of 20 episodes failed verification" in result.output
+    error = json.loads(out.read_text())["episodes"][3]["error"]
+    assert (error["code"], error["step"]) == ("incomplete", 500)
+
+
+@pytest.mark.parametrize("target", ["directory", "file"])
+def test_verify_out_that_cannot_be_written_exits_2(
+    eval_dir: Path, tmp_path: Path, target: str
+) -> None:
+    """Exit 1 means verification failed (§16). A run that reproduced but whose --out cannot be
+    written is a usage error: exit 2, one error line, no traceback."""
+    blocker = tmp_path / "file"
+    blocker.write_text("not a directory")
+    path = eval_dir if target == "directory" else eval_dir / "traj_000.npz"
+    result = runner.invoke(app, ["verify", str(path), "--out", str(blocker / "results.json")])
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
+    errors = [line for line in result.output.splitlines() if line.startswith("error:")]
+    assert len(errors) == 1
+    assert errors[0].startswith(f"error: cannot write {blocker / 'results.json'}: ")
+    assert result.output.splitlines()[-1] == errors[0]
+
+
 def test_verify_a_directory_holds_one_upload_at_a_time(
     eval_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
