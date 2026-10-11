@@ -61,16 +61,28 @@ A collision geom is one with `contype` or `conaffinity` nonzero. Wheel bodies ma
 visual geoms (`contype = conaffinity = 0`). Only the tires may touch the floor (§11).
 
 The env **builds** the simulated robot from the MJCF plus a `RobotParams` file (`params.yaml`) with
-`mujoco.MjSpec`: it removes any actuators/sensors in the file and injects its own:
+`mujoco.MjSpec`: it removes any actuators and sensors in the file, injects its own and sets the
+wheels' dynamics:
 
 - Motors `left_motor`, `right_motor`: `general` actuator, `gainprm=[tau_stall]`,
   `biastype=affine`, `biasprm=[0, 0, -tau_stall/omega_noload]`, `ctrlrange=[-1,1]`,
   `forcerange=[-torque_limit, torque_limit]`, history buffer `nsample=8` (native delay, up to
   10 ms).
   This is an ideal DC motor without inductance: torque = tau_stall·u − (tau_stall/omega_noload)·ω.
-- Wheel joints: `frictionloss = frictionloss_nm` (gearbox Coulomb friction), `armature`,
-  `damping = 0` (back-EMF lives in the actuator).
+- Wheel joints: `frictionloss = frictionloss_nm` (gearbox Coulomb friction, its constraint
+  solved with MuJoCo's defaults `solreffriction = (0.02, 1)` and `solimpfriction = (0.9, 0.95,
+  0.001, 0.5, 2)`) and `armature`, and nothing else: `damping = 0` (back-EMF lives in the
+  actuator) and `stiffness = 0`, polynomial terms included, with no `springdamper`; no
+  `actuatorfrcrange` (the motor's `forcerange` is the torque limit). Whatever the MJCF gives
+  them, a wheel's dynamics come from `params.yaml` alone.
+- Tires: every geom of each wheel body gets `friction[0] = contact.wheel_friction` (its
+  torsional and rolling coefficients stay the MJCF's) and `priority = 1`, so a tire–floor
+  contact takes all its parameters (friction, `condim`, `solref`, `solimp`) from the tire
+  alone. With equal priorities MuJoCo would take the larger of the two sliding frictions, and
+  the per-episode friction scale (§10) could not make a tire more slippery than the floor.
 - Sensors `imu_gyro`, `imu_accel` on site `imu`.
+- A camera `track` on `chassis` (`mode="trackcom"`), the one replay videos are drawn from. The
+  name is reserved: `build_model` refuses a robot that has a camera of that name.
 
 `validate_robot(model) -> list[str]` reports every violation of the composed model; robot-ci, CAD
 export (Phase 8), evolved bodies (Phase 10) and generated robots (Phase 12) all go through it.

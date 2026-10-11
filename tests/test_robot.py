@@ -12,6 +12,8 @@ import pytest
 
 from topple.envs.balance import BalanceEnv
 from topple.robot import (
+    FRICTIONLOSS_SOLIMP,
+    FRICTIONLOSS_SOLREF,
     RobotParams,
     bind_robot,
     build_model,
@@ -572,6 +574,92 @@ def test_bind_robot_refuses_ambiguous_tires(params: RobotParams, tmp_path: Path)
     m = model_from(params, tmp_path, (LEFT_JOINT, LEFT_JOINT + '<geom type="sphere" size="0.02"/>'))
     with pytest.raises(ValueError, match="exactly one collision geom"):
         bind_robot(m)
+
+
+# ----------------------------------------------------------------------- what build_model injects
+
+
+def test_tires_take_the_params_sliding_friction_and_govern_their_contacts(
+    params: RobotParams, tmp_path: Path
+) -> None:
+    """§3: every wheel-body geom gets the params' sliding friction and priority 1, so a
+    tire-floor contact takes its parameters from the tire alone: the params' sliding friction
+    (whatever the MJCF says), and the tire's own condim and torsional and rolling friction, even
+    below the floor's. With equal priorities MuJoCo would mix them, the frictions by maximum."""
+    tire = LEFT_TIRE_ALONG_Y
+    m = model_from(params, tmp_path, (tire, tire + ' friction="0.4 0.001 0.0002" condim="4"'))
+    left, floor = m.geom("left_tire").id, m.geom("floor").id
+    assert m.geom_friction[left].tolist() == [params.contact.wheel_friction, 0.001, 0.0002]
+    assert (m.geom_priority[left], m.geom_priority[floor]) == (1, 0)
+    assert m.geom_friction[floor][1] > 0.001  # the floor's own torsional friction is larger
+    d = mujoco.MjData(m)
+    for _ in range(3):  # the tires spawn exactly touching the floor: let them settle into it
+        mujoco.mj_step(m, d)
+    contacts = [
+        d.contact[i] for i in range(d.ncon) if left in (d.contact[i].geom1, d.contact[i].geom2)
+    ]
+    assert contacts
+    for contact in contacts:
+        assert contact.dim == 4
+        assert (
+            contact.friction.tolist()
+            == [params.contact.wheel_friction] * 2 + [0.001] + [0.0002] * 2
+        )
+
+
+def test_the_replay_camera_name_is_reserved(params: RobotParams, tmp_path: Path) -> None:
+    """§3: build_model adds the replay camera ``track`` to the chassis, so a robot may not bring
+    a camera of that name. It once failed with MuJoCo's bare "repeated name 'track' in camera"."""
+    own = '<camera name="track" pos="0 -1 0.2"/>'
+    with pytest.raises(ValueError, match=r"balancer\.robot\.v1: camera 'track' is reserved"):
+        model_from(params, tmp_path, (IMU_SITE, own + IMU_SITE))
+    with pytest.raises(ValueError, match=r"balancer\.robot\.v1: camera 'track' is reserved"):
+        BalanceEnv("clean", robot_xml=tmp_path / "variant.xml")  # what model_from just wrote
+    m = model_from(params, tmp_path, (IMU_SITE, own.replace("track", "side") + IMU_SITE))
+    assert validate_robot(m) == []
+    assert sorted(m.camera(i).name for i in range(m.ncam)) == ["side", "track"]
+    assert m.cam_bodyid[m.camera("track").id] == m.body("chassis").id
+
+
+def array_fields(m: mujoco.MjModel) -> list[str]:
+    """Every array a compiled model holds: its numbers, names and structure."""
+    return [name for name in dir(m) if isinstance(getattr(m, name, None), np.ndarray)]
+
+
+RIGHT_JOINT = '<joint name="right_wheel" type="hinge" axis="0 1 0"/>'
+WHEEL_JOINT_EXTRAS = {
+    "spring": 'stiffness="0.05"',
+    "polynomial spring": 'stiffness="0 0.5"',
+    "spring-damper": 'springdamper="0.1 1"',
+    "damping": 'damping="0.02"',
+    "polynomial damping": 'damping="0 0.5"',
+    "joint torque cap": 'actuatorfrcrange="-0.01 0.01"',
+    "friction-loss solver": 'solreffriction="0.5 1" solimpfriction="0.5 0.6 0.01"',
+}
+
+
+@pytest.mark.parametrize("attrs", WHEEL_JOINT_EXTRAS.values(), ids=WHEEL_JOINT_EXTRAS.keys())
+def test_a_wheel_joints_own_dynamics_never_reach_the_simulated_wheel(
+    params: RobotParams, model: mujoco.MjModel, tmp_path: Path, attrs: str
+) -> None:
+    """§3: a wheel's dynamics come from params.yaml alone. A robot file's wheel spring, damping,
+    joint torque cap or friction-loss solver settings are replaced, so the composed robot is the
+    stock one, bit for bit. A 0.05 N·m/rad spring or a 0.01 N·m cap once passed validate_robot,
+    and the shipped PID then survived none of the clean seeds it was tried on."""
+    edits = [(joint, joint.replace("/>", f" {attrs}/>")) for joint in (LEFT_JOINT, RIGHT_JOINT)]
+    m = model_from(params, tmp_path, *edits)
+    assert validate_robot(m) == []
+    for field in array_fields(model):
+        got, want = getattr(m, field), getattr(model, field)
+        assert (got.dtype, got.shape, got.tobytes()) == (want.dtype, want.shape, want.tobytes()), (
+            field
+        )
+
+
+def test_the_friction_loss_solver_settings_are_mujocos_defaults() -> None:
+    joint = mujoco.MjSpec().worldbody.add_body().add_joint()
+    assert tuple(joint.solref_friction) == FRICTIONLOSS_SOLREF
+    assert tuple(joint.solimp_friction) == FRICTIONLOSS_SOLIMP
 
 
 # ------------------------------------------------------------------------------- robot_hash

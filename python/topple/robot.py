@@ -1,9 +1,9 @@
 """Robot interface ``balancer.robot.v1``: parameters, model building, binding, validation.
 
 The robot MJCF holds geometry and inertia only. ``build_model`` composes it into the challenge
-scene with ``mujoco.MjSpec`` and injects motors, IMU sensors and joint friction from
-``params.yaml``, so a placeholder, a CAD export or an evolved body all become the same simulated
-robot (docs/contract.md §3).
+scene with ``mujoco.MjSpec``, injects motors and IMU sensors and sets the wheels' dynamics (joint
+friction and armature, tire friction) from ``params.yaml``, so a placeholder, a CAD export or an
+evolved body all become the same simulated robot (docs/contract.md §3).
 """
 
 from __future__ import annotations
@@ -32,8 +32,11 @@ IMU_SITE = "imu"
 PUSH_SITE = "push_point"
 GYRO_SENSOR = "imu_gyro"
 ACCEL_SENSOR = "imu_accel"
-TRACK_CAMERA = "track"
+TRACK_CAMERA = "track"  # the replay camera build_model adds to the chassis: a reserved name
 DELAY_HISTORY = 8  # native actuator delay buffer: enough for 10 ms at 2 ms per sample
+# MuJoCo's default solver settings, which the wheels' friction-loss constraints always use.
+FRICTIONLOSS_SOLREF = (0.02, 1.0)
+FRICTIONLOSS_SOLIMP = (0.9, 0.95, 0.001, 0.5, 2.0)
 SCENE_GEOMS = frozenset({"floor"})  # the only world-body geoms a balance scene may have
 TIRE_TYPES = frozenset(
     int(t)
@@ -234,7 +237,9 @@ def _require(spec: mujoco.MjSpec) -> None:
 def build_model(
     robot_xml: Path, scene_xml: Path, params: RobotParams, *, delay_buffer: bool = True
 ) -> mujoco.MjModel:
-    """Compose robot + scene and inject motors, sensors and joint properties from ``params``.
+    """Compose robot + scene, inject motors, sensors and the replay camera, and set the wheels'
+    dynamics from ``params`` alone (contract §3). A robot camera named ``track`` is refused: the
+    replay camera reserves that name.
 
     ``delay_buffer=False`` omits the native actuator history buffer; use it for linearization
     (``mjd_transitionFD`` does not support delays), never for evaluation.
@@ -242,6 +247,11 @@ def build_model(
     scene = mujoco.MjSpec.from_file(str(scene_xml))
     robot = mujoco.MjSpec.from_file(str(robot_xml))
     _require(robot)
+    if any(camera.name == TRACK_CAMERA for camera in robot.cameras):
+        raise ValueError(
+            f"robot does not satisfy {ROBOT_INTERFACE_ID}: camera '{TRACK_CAMERA}' is reserved "
+            f"for the replay camera the env adds to '{CHASSIS}'; rename the robot's own"
+        )
     for actuator in list(robot.actuators):
         robot.delete(actuator)
     for sensor in list(robot.sensors):
@@ -251,8 +261,15 @@ def build_model(
     m = params.motor
     for joint_name, motor_name in zip(WHEEL_JOINTS, MOTORS, strict=True):
         joint = scene.joint(joint_name)
+        # A wheel's dynamics come from the params alone, whatever the robot file says (§3).
         joint.damping = [0.0, 0.0, 0.0]  # back-EMF lives in the actuator bias
+        joint.stiffness = [0.0, 0.0, 0.0]  # a wheel has no spring (polynomial terms included)
+        joint.springdamper = [0.0, 0.0]  # which the compiler would turn into stiffness/damping
+        joint.actfrclimited = mujoco.mjtLimited.mjLIMITED_FALSE  # the motor's forcerange caps it
+        joint.actfrcrange = [0.0, 0.0]
         joint.frictionloss = m.frictionloss_nm
+        joint.solref_friction = list(FRICTIONLOSS_SOLREF)
+        joint.solimp_friction = list(FRICTIONLOSS_SOLIMP)
         joint.armature = m.armature
         for geom in scene.body(joint.parent.name).geoms:
             geom.friction[0] = params.contact.wheel_friction
