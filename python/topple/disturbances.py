@@ -7,8 +7,11 @@ It is drawn from named RNG streams, embedded in every trajectory, and can be rep
 
 from __future__ import annotations
 
+import itertools
 import math
-from dataclasses import dataclass
+import numbers
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, fields
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -16,6 +19,18 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from topple.rng import Stream, stream_rng, validate_seed
 
 _MAX_PUSHES = 3  # the PUSHES stream always draws this many candidates (fixed consumption)
+MAX_PUSH_FORCE_N = 50.0  # contract §10: no push is ever stronger than this
+MAX_ACTUATOR_DELAY_S = 0.010  # what the native delay buffer (robot.DELAY_HISTORY) is sized for
+
+# Sane bounds for a scenario read from JSON (contract §9). Scales multiply the robot's params.
+# Every preset's randomization ranges lie well inside them; they only keep a hand-edited or
+# corrupted scenario from building a nonsensical model.
+SCALE_BOUNDS = (0.5, 2.0)  # chassis mass, wheel friction, each motor gain
+FRICTIONLOSS_SCALE_BOUNDS = (0.0, 3.0)
+MAX_COM_X_OFFSET_M = 0.02
+MAX_IMU_PITCH_OFFSET_RAD = 0.1
+MAX_GYRO_BIAS_RADS = 0.1
+MAX_LATERAL_RATIO = 1.0
 
 
 class _Frozen(BaseModel):
@@ -30,7 +45,7 @@ class PushConfig(_Frozen):
     latest_s: float = 8.5
     min_spacing_s: float = 1.5
     lateral_fraction_max: float = 0.3
-    max_force_n: float = 50.0
+    max_force_n: float = MAX_PUSH_FORCE_N
 
     @model_validator(mode="after")
     def _check(self) -> PushConfig:
@@ -119,26 +134,170 @@ class Scenario:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Scenario:
-        if data["preset"] not in PRESETS:
-            raise ValueError(f"unknown preset {data['preset']!r}")
-        model = data["model"]
-        sensors = data["sensors"]
-        gyro_bias = sensors["gyro_bias_rads"]
-        return cls(
-            seed=validate_seed(data["seed"]),
-            preset=data["preset"],
-            init_pitch_rad=float(data["init_pitch_rad"]),
-            init_pitch_rate_rads=float(data.get("init_pitch_rate_rads", 0.0)),
-            pushes=tuple(Push(**p) for p in data["pushes"]),
-            model=ModelOverrides(
-                **{**model, "motor_gain": (model["motor_gain"][0], model["motor_gain"][1])}
-            ),
-            sensors=SensorOffsets(
-                imu_pitch_offset_rad=sensors["imu_pitch_offset_rad"],
-                gyro_bias_rads=(gyro_bias[0], gyro_bias[1], gyro_bias[2]),
-            ),
+    def from_dict(cls, data: Any, *, max_steps: int | None = None) -> Scenario:
+        """Parse and validate a scenario from JSON data; any problem raises ``ValueError``.
+
+        Checks key sets, types, finiteness and the bounds above; pushes must be sorted by
+        ``start_step`` with no two at the same step. With ``max_steps``, every push must also start
+        inside the episode (``0 <= start_step < max_steps``).
+        """
+        try:
+            scenario = _parse_scenario(data)
+            validate_scenario(scenario, max_steps=max_steps)
+        except ValueError as exc:
+            message = str(exc)
+            if not message.startswith(_INVALID):
+                message = f"{_INVALID}{message}"
+            raise ValueError(message) from exc
+        return scenario
+
+
+_INVALID = "invalid scenario: "
+_SCENARIO_KEYS = frozenset(
+    {"seed", "preset", "init_pitch_rad", "init_pitch_rate_rads", "pushes", "model", "sensors"}
+)
+_PUSH_KEYS = frozenset(f.name for f in fields(Push))
+_MODEL_KEYS = frozenset(f.name for f in fields(ModelOverrides))
+_SENSOR_KEYS = frozenset(f.name for f in fields(SensorOffsets))
+
+
+def _mapping(name: str, value: object, keys: frozenset[str], optional: frozenset[str]) -> Any:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be an object, got {type(value).__name__}")
+    present = set(value)
+    missing = keys - optional - present
+    unknown = present - keys
+    if missing or unknown:
+        raise ValueError(f"{name}: missing keys {sorted(missing)}, unknown keys {sorted(unknown)}")
+    return value
+
+
+def _real(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{name} must be a number, got {type(value).__name__}")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite, got {result}")
+    return result
+
+
+def _int(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer, got {value!r}")
+    return value
+
+
+def _reals(name: str, value: object, n: int) -> tuple[float, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence) or len(value) != n:
+        raise ValueError(f"{name} must be a list of {n} numbers")
+    return tuple(_real(f"{name}[{i}]", v) for i, v in enumerate(value))
+
+
+def _parse_push(i: int, data: object) -> Push:
+    d = _mapping(f"pushes[{i}]", data, _PUSH_KEYS, frozenset())
+    return Push(
+        start_step=_int(f"pushes[{i}].start_step", d["start_step"]),
+        n_substeps=_int(f"pushes[{i}].n_substeps", d["n_substeps"]),
+        magnitude_n=_real(f"pushes[{i}].magnitude_n", d["magnitude_n"]),
+        forward_sign=_real(f"pushes[{i}].forward_sign", d["forward_sign"]),
+        lateral_ratio=_real(f"pushes[{i}].lateral_ratio", d["lateral_ratio"]),
+    )
+
+
+def _parse_model(data: object) -> ModelOverrides:
+    d = _mapping("model", data, _MODEL_KEYS, frozenset())
+    gain = _reals("model.motor_gain", d["motor_gain"], 2)
+    return ModelOverrides(
+        chassis_mass_scale=_real("model.chassis_mass_scale", d["chassis_mass_scale"]),
+        com_x_offset_m=_real("model.com_x_offset_m", d["com_x_offset_m"]),
+        wheel_friction_scale=_real("model.wheel_friction_scale", d["wheel_friction_scale"]),
+        motor_gain=(gain[0], gain[1]),
+        frictionloss_scale=_real("model.frictionloss_scale", d["frictionloss_scale"]),
+        actuator_delay_s=_real("model.actuator_delay_s", d["actuator_delay_s"]),
+    )
+
+
+def _parse_sensors(data: object) -> SensorOffsets:
+    d = _mapping("sensors", data, _SENSOR_KEYS, frozenset())
+    bias = _reals("sensors.gyro_bias_rads", d["gyro_bias_rads"], 3)
+    return SensorOffsets(
+        imu_pitch_offset_rad=_real("sensors.imu_pitch_offset_rad", d["imu_pitch_offset_rad"]),
+        gyro_bias_rads=(bias[0], bias[1], bias[2]),
+    )
+
+
+def _parse_scenario(data: object) -> Scenario:
+    d = _mapping("scenario", data, _SCENARIO_KEYS, frozenset({"init_pitch_rate_rads"}))
+    pushes = d["pushes"]
+    if isinstance(pushes, (str, bytes)) or not isinstance(pushes, Sequence):
+        raise ValueError("pushes must be a list")
+    preset = d["preset"]
+    if not isinstance(preset, str) or preset not in PRESETS:
+        raise ValueError(f"unknown preset {preset!r}")
+    seed = validate_seed(d["seed"])
+    return Scenario(
+        seed=seed,
+        preset=preset,
+        init_pitch_rad=_real("init_pitch_rad", d["init_pitch_rad"]),
+        init_pitch_rate_rads=_real("init_pitch_rate_rads", d.get("init_pitch_rate_rads", 0.0)),
+        pushes=tuple(_parse_push(i, p) for i, p in enumerate(pushes)),
+        model=_parse_model(d["model"]),
+        sensors=_parse_sensors(d["sensors"]),
+    )
+
+
+def _check_range(name: str, value: float, low: float, high: float) -> None:
+    if not low <= value <= high:
+        raise ValueError(f"{name} = {value} is outside [{low}, {high}]")
+
+
+def _check_pushes(pushes: tuple[Push, ...], max_steps: int | None) -> None:
+    for i, push in enumerate(pushes):
+        upper = (max_steps - 1) if max_steps is not None else math.inf
+        _check_range(f"pushes[{i}].start_step", push.start_step, 0, upper)
+        _check_range(f"pushes[{i}].n_substeps", push.n_substeps, 1, math.inf)
+        _check_range(f"pushes[{i}].magnitude_n", push.magnitude_n, 0.0, MAX_PUSH_FORCE_N)
+        if push.forward_sign not in (1.0, -1.0):
+            raise ValueError(f"pushes[{i}].forward_sign must be +1 or -1")
+        _check_range(
+            f"pushes[{i}].lateral_ratio", push.lateral_ratio, -MAX_LATERAL_RATIO, MAX_LATERAL_RATIO
         )
+    steps = [p.start_step for p in pushes]
+    if any(b <= a for a, b in itertools.pairwise(steps)):
+        raise ValueError(f"pushes must be sorted by start_step with no repeats, got {steps}")
+
+
+def _check_model(model: ModelOverrides) -> None:
+    _check_range("model.chassis_mass_scale", model.chassis_mass_scale, *SCALE_BOUNDS)
+    _check_range("model.wheel_friction_scale", model.wheel_friction_scale, *SCALE_BOUNDS)
+    for i, gain in enumerate(model.motor_gain):
+        _check_range(f"model.motor_gain[{i}]", gain, *SCALE_BOUNDS)
+    _check_range("model.frictionloss_scale", model.frictionloss_scale, *FRICTIONLOSS_SCALE_BOUNDS)
+    _check_range(
+        "model.com_x_offset_m", model.com_x_offset_m, -MAX_COM_X_OFFSET_M, MAX_COM_X_OFFSET_M
+    )
+    _check_range("model.actuator_delay_s", model.actuator_delay_s, 0.0, MAX_ACTUATOR_DELAY_S)
+
+
+def _check_sensors(sensors: SensorOffsets) -> None:
+    limit = MAX_IMU_PITCH_OFFSET_RAD
+    _check_range("sensors.imu_pitch_offset_rad", sensors.imu_pitch_offset_rad, -limit, limit)
+    for i, bias in enumerate(sensors.gyro_bias_rads):
+        _check_range(f"sensors.gyro_bias_rads[{i}]", bias, -MAX_GYRO_BIAS_RADS, MAX_GYRO_BIAS_RADS)
+
+
+def validate_scenario(scenario: Scenario, *, max_steps: int | None = None) -> None:
+    """Raise ``ValueError`` unless ``scenario`` is inside the contract's sane bounds (§9)."""
+    if not (
+        math.isfinite(scenario.init_pitch_rad) and math.isfinite(scenario.init_pitch_rate_rads)
+    ):
+        raise ValueError(f"{_INVALID}initial pitch and pitch rate must be finite")
+    try:
+        _check_pushes(scenario.pushes, max_steps)
+        _check_model(scenario.model)
+        _check_sensors(scenario.sensors)
+    except ValueError as exc:
+        raise ValueError(f"{_INVALID}{exc}") from exc
 
 
 def _uniform(rng: Any, bounds: tuple[float, float]) -> float:

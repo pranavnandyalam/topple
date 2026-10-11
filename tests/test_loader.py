@@ -1,7 +1,10 @@
+import hashlib
+import os
 from pathlib import Path
 
 import pytest
 
+import topple.loader as loader_module
 from topple.contract import FEATURES, Controller, TaskSpec
 from topple.envs.balance import BalanceEnv
 from topple.loader import LoadError, load_submission, submission_sha256
@@ -140,3 +143,145 @@ def test_two_submissions_do_not_collide(tmp_path: Path) -> None:
 
 def test_spec_features_match_contract() -> None:
     assert SPEC.obs_features == FEATURES
+
+
+# ------------------------------------------------------------------ hashing and directory hygiene
+
+
+def reference_sha(root: Path, rels: list[str]) -> str:
+    """Length-framed (POSIX relpath, size, bytes) records, written out independently."""
+    digest = hashlib.sha256(b"topple.submission/1\n")
+    for rel in sorted(rels):
+        data = (root / rel).read_bytes()
+        name = rel.encode("utf-8")
+        digest.update(len(name).to_bytes(8, "big") + name)
+        digest.update(len(data).to_bytes(8, "big") + data)
+    return digest.hexdigest()
+
+
+def test_sha_follows_the_framing(tmp_path: Path) -> None:
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    write(root, "assets/gains.txt", "0.5")
+    assert submission_sha256(root) == reference_sha(root, ["assets/gains.txt", "controller.py"])
+    single = write(tmp_path, "solo.py", GOOD)
+    assert submission_sha256(single) == reference_sha(tmp_path, ["solo.py"])
+
+
+def test_sha_frames_names_and_contents(tmp_path: Path) -> None:
+    """Without framing, ("a", "bc") and ("ab", "c") would hash the same bytes."""
+    one, two = tmp_path / "one", tmp_path / "two"
+    write(one, "controller.py", GOOD)
+    write(two, "controller.py", GOOD)
+    write(one, "a", "bc")
+    write(two, "ab", "c")
+    assert submission_sha256(one) != submission_sha256(two)
+
+
+@pytest.mark.parametrize("junk", ["__pycache__/controller.cpython-312.pyc", "old.pyc", "lib/x.pyc"])
+def test_compiled_python_is_refused(tmp_path: Path, junk: str) -> None:
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    write(root, junk, "")
+    with pytest.raises(LoadError, match=r"__pycache__|\.pyc"):
+        load_submission(root)
+
+
+def test_empty_pycache_directory_is_refused(tmp_path: Path) -> None:
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    (root / "__pycache__").mkdir()
+    with pytest.raises(LoadError, match="__pycache__"):
+        load_submission(root)
+
+
+def test_loading_writes_no_bytecode_so_it_can_load_again(tmp_path: Path) -> None:
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    first = load_submission(root)
+    assert sorted(p.name for p in root.iterdir()) == ["controller.py"]
+    assert load_submission(root).sha256 == first.sha256
+
+
+def test_symlinked_files_are_refused(tmp_path: Path) -> None:
+    secret = write(tmp_path, "secret.txt", "token")
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    (root / "data.txt").symlink_to(secret)
+    with pytest.raises(LoadError, match="symlink"):
+        load_submission(root)
+
+
+def test_symlinked_directories_are_refused(tmp_path: Path) -> None:
+    elsewhere = tmp_path / "elsewhere"
+    write(elsewhere, "big.bin", "x")
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    (root / "lib").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(LoadError, match="symlink"):
+        load_submission(root)
+
+
+def test_a_symlinked_submission_path_is_refused(tmp_path: Path) -> None:
+    real = write(tmp_path, "real.py", GOOD)
+    link = tmp_path / "link.py"
+    link.symlink_to(real)
+    with pytest.raises(LoadError, match="symlink"):
+        load_submission(link)
+
+
+def test_special_files_are_refused_without_blocking(tmp_path: Path) -> None:
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    os.mkfifo(root / "pipe")
+    with pytest.raises(LoadError, match="regular file"):
+        load_submission(root)
+
+
+def test_size_cap_is_exact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    monkeypatch.setattr(loader_module, "MAX_BYTES", len(GOOD) + 10)
+    write(root, "data.bin", "x" * 10)
+    assert len(load_submission(root).sha256) == 64
+    write(root, "data.bin", "x" * 11)
+    with pytest.raises(LoadError, match="larger than"):
+        load_submission(root)
+
+
+def test_size_cap_stops_reading(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cap bounds what is read, not just what is counted afterwards."""
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    write(root, "huge.bin", "x" * 100_000)
+    monkeypatch.setattr(loader_module, "MAX_BYTES", len(GOOD) + 100)
+    sizes: list[int] = []
+    real_open = os.fdopen
+
+    class Spy:
+        def __init__(self, fh: object) -> None:
+            self.fh = fh
+
+        def __enter__(self) -> "Spy":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self.fh.close()  # type: ignore[attr-defined]
+
+        def read(self, n: int = -1) -> bytes:
+            data: bytes = self.fh.read(n)  # type: ignore[attr-defined]
+            sizes.append(len(data))
+            return data
+
+    monkeypatch.setattr(loader_module.os, "fdopen", lambda fd, mode: Spy(real_open(fd, mode)))
+    with pytest.raises(LoadError, match="larger than"):
+        submission_sha256(root)
+    assert sizes == [len(GOOD), 101]  # the 100 kB file: only one byte past what was left
+
+
+def test_hashing_a_symlinked_file_is_refused(tmp_path: Path) -> None:
+    real = write(tmp_path, "real.py", GOOD)
+    link = tmp_path / "link.py"
+    link.symlink_to(real)
+    with pytest.raises(LoadError, match="symlink"):
+        submission_sha256(link)

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
+import shutil
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -18,6 +20,7 @@ import pytest
 from gymnasium.utils.env_checker import check_env
 from pydantic import ValidationError
 
+from topple.challenge import load_challenge_dir
 from topple.contract import FEATURES, OBS_SCHEMA_ID, ActionError, BalancerObs
 from topple.controllers.pid import PIDController
 from topple.disturbances import (
@@ -575,8 +578,8 @@ def test_push_direction_is_frozen_at_the_onset_heading(forward_sign: float) -> N
     fx, fy, fz = info["push_force"]
     assert (math.hypot(fx, fy), fz) == (pytest.approx(push.magnitude_n), 0.0)
     along = heading if forward_sign > 0 else heading + math.pi
-    # The env reads the heading from the last physics evaluation: at most one 2 ms substep old.
-    assert abs(wrap_angle(math.atan2(fy, fx) - along)) < 0.02
+    # The heading at onset comes from the current qpos, not from MuJoCo's one-substep-old xmat.
+    assert abs(wrap_angle(math.atan2(fy, fx) - along)) < 1e-9
     kick = env.data.qvel[0:2] - twin.data.qvel[0:2]  # what the push alone did to the axle
     assert abs(wrap_angle(math.atan2(kick[1], kick[0]) - math.atan2(fy, fx))) < 0.01
 
@@ -700,35 +703,103 @@ def test_set_preset_rejects_unknown_names_and_keeps_the_pending_one() -> None:
 
 
 def test_ideal_preset_observes_noise_free_ground_truth() -> None:
-    """No noise, bias, mount offset, estimator or quantization: MuJoCo's own state.
+    """No noise, bias, mount offset, estimator or quantization: the exact current state.
 
-    Orientation and rates come from the last physics evaluation (MuJoCo computes kinematics and
-    sensors at the start of each substep), wheels from the current joint state.
+    MuJoCo's derived data (``xmat``, sensors) lag one substep behind ``qpos`` after ``mj_step``,
+    so the ideal observation is computed from ``qpos``/``qvel`` (contract §5, §11).
     """
     env = BalanceEnv("ideal")
     b, d = env.binding, env.data
     obs, info = env.reset(seed=4, options={"init_pitch_rate": 0.2})
     q0 = np.array([d.qpos[a] for a in b.wheel_qposadr])
     sign = np.array(b.wheel_sign)
+    da = b.root_dofadr
     policy = wobbly_pid(4)
     for _ in range(300):
         action = policy(obs, info)
         obs, _, terminated, truncated, info = env.step(action)
-        pitch, yaw = quat_pitch_yaw(d.xquat[b.chassis_body])
-        gyro = d.sensordata[b.gyro_adr : b.gyro_adr + 3]
+        pitch, yaw = quat_pitch_yaw(d.qpos[b.root_qposadr + 3 : b.root_qposadr + 7])
         truth = [
             pitch,
-            gyro[1],
+            d.qvel[da + 4],  # free-joint angular velocity is in the body frame
             yaw,
-            gyro[2],
+            d.qvel[da + 5],
             *(sign * (np.array([d.qpos[a] for a in b.wheel_qposadr]) - q0)),
             *(sign * np.array([d.qvel[v] for v in b.wheel_dofadr])),
             *np.clip(action, -1.0, 1.0),
         ]
-        np.testing.assert_allclose(obs, np.array(truth, dtype=np.float32), rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(obs, np.array(truth, dtype=np.float32), rtol=0, atol=1e-6)
+        assert obs[1] == np.float32(d.qvel[da + 4])
+        assert obs[3] == np.float32(d.qvel[da + 5])
         assert obs[0] == np.float32(info["true_pitch"])
+        assert info["true_pitch"] == pytest.approx(pitch, abs=1e-12)
         assert not terminated
         assert not truncated
+
+
+@pytest.mark.parametrize("preset", ["ideal", "clean", "standard"])
+def test_info_and_reward_use_the_exact_current_state(preset: str) -> None:
+    env = BalanceEnv(preset)
+    b, d = env.binding, env.data
+    obs, info = env.reset(seed=2)
+    policy = wobbly_pid(2)
+    for _ in range(200):
+        obs, _, terminated, _, info = env.step(policy(obs, info))
+        quat = d.qpos[b.root_qposadr + 3 : b.root_qposadr + 7]
+        x, y = float(quat[1]), float(quat[2])
+        assert info["tilt"] == pytest.approx(math.acos(1.0 - 2.0 * (x * x + y * y)), abs=1e-12)
+        assert info["true_pitch"] == pytest.approx(quat_pitch_yaw(quat)[0], abs=1e-12)
+        rate = float(d.qvel[b.root_dofadr + 4])
+        assert info["reward_terms"]["rate"] == min((rate / 3.0) ** 2, 1.0)
+        assert info["reward_terms"]["tilt"] == min((info["true_pitch"] / 0.2) ** 2, 1.0)
+        if terminated:
+            break
+
+
+@pytest.mark.parametrize("preset", ["ideal", "clean"])
+def test_fall_is_detected_on_the_substep_that_crosses_the_fall_angle(preset: str) -> None:
+    """A robot a hair below the fall angle and tipping over ends after exactly one substep."""
+    env = BalanceEnv(preset)
+    env.reset(seed=0, options={"init_pitch_rad": FALL_ANGLE - 1e-4, "init_pitch_rate": 1.0})
+    twin = copy.deepcopy(env.data)
+    twin.ctrl[:] = 0.0
+    mujoco.mj_step(env.model, twin)  # one substep of the same physics
+    _, _, terminated, _, info = env.step([0.0, 0.0])
+    assert terminated
+    assert info["termination_reason"] == "fell"
+    assert_bitwise_equal(env.data.qpos, twin.qpos)
+    assert info["tilt"] > FALL_ANGLE
+
+
+def test_energy_starts_from_the_reset_relative_wheel_angles(tmp_path: Path) -> None:
+    """A wheel hinge with a ``ref`` starts at qpos = ref, which must not count as motion."""
+    left = '<joint name="left_wheel" type="hinge" axis="0 1 0"/>'
+    path = robot_variant(tmp_path, "ref", (left, left.replace("/>", ' ref="0.5"/>')))
+    plain, offset = BalanceEnv("ideal"), BalanceEnv("ideal", robot_xml=path)
+    for env in (plain, offset):
+        env.reset(seed=0, options={"init_pitch_rad": 0.0})
+    assert offset.data.qpos[offset.binding.wheel_qposadr[0]] == 0.5
+    for _ in range(3):
+        *_, info_plain = plain.step([0.5, 0.5])
+        *_, info_offset = offset.step([0.5, 0.5])
+        assert info_offset["energy_j"] == pytest.approx(info_plain["energy_j"], rel=1e-9)
+    assert info_plain["energy_j"] > 0.0
+
+
+def test_ideal_preset_records_noiseless_imu_rows_every_step() -> None:
+    env = BalanceEnv("ideal", record=True)
+    b, d = env.binding, env.data
+    obs, info = env.reset(seed=1, options={"init_pitch_rad": 0.02})
+    gyro, accel = [], []
+    policy = wobbly_pid(1)
+    for _ in range(50):
+        obs, _, _, _, info = env.step(policy(obs, info))
+        gyro.append(d.sensordata[b.gyro_adr : b.gyro_adr + 3].copy())
+        accel.append(d.sensordata[b.accel_adr : b.accel_adr + 3].copy())
+    traj = env.trajectory()
+    assert_bitwise_equal(traj.gyro, np.array(gyro, dtype=np.float32))
+    assert_bitwise_equal(traj.accel, np.array(accel, dtype=np.float32))
+    assert len({tuple(row) for row in traj.gyro.tolist()}) == 50  # not a constant row
 
 
 def test_encoders_quantize_and_differentiate_wheel_angles() -> None:
@@ -1235,3 +1306,42 @@ def test_wheel_friction_randomization_below_one_reaches_the_contacts() -> None:
     ]
     assert frictions
     assert frictions == pytest.approx([0.9 * env.params.contact.wheel_friction] * len(frictions))
+
+
+# ------------------------------------------------------------------------------ bundles, scenarios
+
+
+def test_env_uses_the_challenge_object_it_is_given(tmp_path: Path) -> None:
+    """Hashing and scoring stay on one bundle: the env never re-loads the challenge by id."""
+    root = tmp_path / "balance-v1"
+    shutil.copytree(challenge_dir("balance-v1"), root)
+    yaml_path = root / "challenge.yaml"
+    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.3", "e_ref_j: 99.0"))
+    bundle = load_challenge_dir(root)
+    env = BalanceEnv("clean", challenge=bundle)
+    assert env.challenge is bundle
+    assert env.challenge.config.score.e_ref_j == 99.0
+    assert env.robot_xml == root / "robot" / "balancer.xml"
+    assert BalanceEnv("clean", challenge="balance-v1").challenge.config.score.e_ref_j == 13.3
+
+
+def test_reset_validates_scenario_dicts() -> None:
+    env = BalanceEnv("standard")
+    data = scenario_for(5, "standard").to_dict()
+    data["pushes"][0]["magnitude_n"] = 1e6
+    with pytest.raises(ValueError, match="scenario"):
+        env.reset(options={"scenario": data})
+    late = scenario_for(5, "standard").to_dict()
+    late["pushes"][-1]["start_step"] = env.max_steps
+    with pytest.raises(ValueError, match="scenario"):
+        env.reset(options={"scenario": late})
+
+
+def test_termination_reason_is_exposed() -> None:
+    env = BalanceEnv("ideal")
+    env.reset(seed=0, options={"init_pitch_rad": 0.9})
+    assert env.termination_reason is None
+    env.step([0.0, 0.0])
+    assert env.termination_reason == "fell"
+    env.reset(seed=0)
+    assert env.termination_reason is None

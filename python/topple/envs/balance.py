@@ -32,8 +32,8 @@ from topple.robot import (
     RobotParams,
     bind_robot,
     build_model,
+    quat_tilt,
     robot_hash,
-    tilt_angle,
     validate_robot,
 )
 from topple.traj import Trajectory
@@ -79,11 +79,30 @@ class _Nominal:
     actuator_delay: npt.NDArray[np.float64]
 
 
-def _true_pitch_yaw(xmat: npt.NDArray[np.float64]) -> tuple[float, float]:
-    r = xmat.reshape(3, 3)
+def _quat_pitch_yaw(quat: npt.NDArray[np.float64]) -> tuple[float, float]:
+    """ZYX pitch and yaw of the chassis from its root quaternion (wxyz).
+
+    Uses ``qpos`` rather than MuJoCo's ``xmat``: after ``mj_step`` the derived data still describe
+    the state at the start of the substep (contract §11).
+    """
+    q = np.asarray(quat, dtype=np.float64)
+    rot = np.zeros(9)
+    mujoco.mju_quat2Mat(rot, q / np.linalg.norm(q))
+    r = rot.reshape(3, 3)
     pitch = math.atan2(-r[2, 0], math.hypot(r[2, 1], r[2, 2]))
     yaw = math.atan2(r[1, 0], r[0, 0])
     return pitch, yaw
+
+
+@dataclass(frozen=True)
+class _TrueState:
+    """Exact chassis orientation and body-frame rates at the current ``qpos``/``qvel``."""
+
+    pitch: float
+    yaw: float
+    pitch_rate: float
+    yaw_rate: float
+    tilt: float
 
 
 class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
@@ -95,7 +114,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self,
         preset: str = "standard",
         *,
-        challenge: str = "balance-v1",
+        challenge: str | Challenge = "balance-v1",
         robot_xml: str | Path | None = None,
         params: RobotParams | None = None,
         render_mode: str | None = None,
@@ -104,9 +123,13 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         max_drift_m: float | None = None,
         record: bool = False,
     ) -> None:
-        self.challenge: Challenge = load_challenge(challenge)
+        # A Challenge object is used as is (never re-loaded by id), so a protocol's hashing and
+        # scoring stay on the one bundle it was built from.
+        self.challenge: Challenge = (
+            challenge if isinstance(challenge, Challenge) else load_challenge(challenge)
+        )
         if preset not in self.challenge.config.presets:
-            raise ValueError(f"preset {preset!r} is not part of {challenge}")
+            raise ValueError(f"preset {preset!r} is not part of {self.challenge.id}")
         if render_mode is not None and render_mode not in self.metadata["render_modes"]:
             raise ValueError(f"unsupported render_mode {render_mode!r}")
         self.params = params or self.challenge.params
@@ -190,6 +213,11 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             raise RuntimeError("call reset() first")
         return self._scenario
 
+    @property
+    def termination_reason(self) -> str | None:
+        """Why the current episode terminated (``fell``, ``floor_contact``, ...), else None."""
+        return self._termination
+
     def set_preset(self, preset: str) -> None:
         """Curriculum hook: switch disturbance preset at the next reset (works via env_method)."""
         if preset not in self.challenge.config.presets:
@@ -211,7 +239,11 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
 
         if "scenario" in opts:
             given = opts["scenario"]
-            scenario = given if isinstance(given, Scenario) else Scenario.from_dict(given)
+            scenario = (
+                given
+                if isinstance(given, Scenario)
+                else Scenario.from_dict(given, max_steps=self.max_steps)
+            )
         else:
             episode_seed = seed if seed is not None else int(self.np_random.integers(MAX_SEED))
             scenario = make_scenario(
@@ -281,7 +313,9 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
                 self._roll_back()
                 self._end("sim_unstable")
                 break
-            if not self._sensors_ideal:
+            if self._sensors_ideal:
+                self._gyro, self._accel = self._true_imu()
+            else:
                 self._gyro, self._accel = self._imu(noise[j])
                 self._pitch_est = cf_step(
                     self._pitch_est,
@@ -441,16 +475,21 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self._push_remaining = 0
         self._pushes_by_step = {p.start_step: p for p in scenario.pushes}
         self._xy0 = d.qpos[b.root_qposadr : b.root_qposadr + 2].copy()
-        self._yaw0 = _true_pitch_yaw(d.xmat[b.chassis_body])[1]
+        self._yaw0 = self._true_state().yaw
         self._wheel_q0 = tuple(float(d.qpos[a]) for a in b.wheel_qposadr)
         self._counts0 = tuple(
             encoder_counts(d.qpos[a], b.wheel_sign[i], cpr) for i, a in enumerate(b.wheel_qposadr)
         )
         self._counts = self._counts0
         self._prev_wheel_pos = (0.0, 0.0)
-        self._prev_wheel_q = self._wheel_q0
+        self._prev_wheel_q = (0.0, 0.0)  # reset-relative, like _wheel_angles()
+        # The filter starts where a standstill accelerometer reading puts it: the true pitch plus
+        # the mount offset (contract §5). The reset reading below uses the extra noise block.
         self._pitch_est = scenario.init_pitch_rad + scenario.sensors.imu_pitch_offset_rad
-        self._gyro, self._accel = self._imu(noise[-1])
+        if self._sensors_ideal:
+            self._gyro, self._accel = self._true_imu()
+        else:
+            self._gyro, self._accel = self._imu(noise[-1])
         self._epilogue = []
 
     def _draw_noise_block(self) -> npt.NDArray[np.float64]:
@@ -480,12 +519,30 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             accel_range=s.accel_range_ms2,
         )
 
+    def _true_imu(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        """Noiseless gyro and accelerometer readings as MuJoCo computed them (preset ``ideal``)."""
+        d, b = self.data, self.binding
+        g = d.sensordata[b.gyro_adr : b.gyro_adr + 3]
+        a = d.sensordata[b.accel_adr : b.accel_adr + 3]
+        return (float(g[0]), float(g[1]), float(g[2])), (float(a[0]), float(a[1]), float(a[2]))
+
+    def _true_state(self) -> _TrueState:
+        d, b = self.data, self.binding
+        quat = d.qpos[b.root_qposadr + 3 : b.root_qposadr + 7]
+        pitch, yaw = _quat_pitch_yaw(quat)
+        return _TrueState(
+            pitch=pitch,
+            yaw=yaw,
+            pitch_rate=float(d.qvel[b.root_dofadr + 4]),  # free-joint angular velocity: body frame
+            yaw_rate=float(d.qvel[b.root_dofadr + 5]),
+            tilt=quat_tilt(quat),
+        )
+
     def _start_push_if_due(self) -> None:
         push = self._pushes_by_step.get(self._step_count)
         if push is None:
             return
-        _, yaw = _true_pitch_yaw(self.data.xmat[self.binding.chassis_body])
-        self._push_force = push_force_world(push, yaw)
+        self._push_force = push_force_world(push, self._true_state().yaw)
         self._push_remaining = push.n_substeps
 
     def _unstable(self) -> bool:
@@ -504,8 +561,10 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         mujoco.mj_forward(self.model, d)
 
     def _fall_reason(self) -> str | None:
+        """Tilt from the current qpos; contacts from MuJoCo's last evaluation (one substep old)."""
         b, d = self.binding, self.data
-        if tilt_angle(d.xmat[b.chassis_body]) > self.params.safety.fall_angle_rad:
+        quat = d.qpos[b.root_qposadr + 3 : b.root_qposadr + 7]
+        if quat_tilt(quat) > self.params.safety.fall_angle_rad:
             return "fell"
         for i in range(d.ncon):
             c = d.contact[i]
@@ -554,16 +613,14 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         )
         self._counts = counts
         if self._sensors_ideal:
-            pitch, yaw = _true_pitch_yaw(d.xmat[b.chassis_body])
-            gyro = d.sensordata[b.gyro_adr : b.gyro_adr + 3]
+            true = self._true_state()
             pos = self._wheel_angles()
             vel = (
                 b.wheel_sign[0] * float(d.qvel[b.wheel_dofadr[0]]),
                 b.wheel_sign[1] * float(d.qvel[b.wheel_dofadr[1]]),
             )
-            return BalancerObs(
-                t, pitch, float(gyro[1]), wrap_angle(yaw - self._yaw0), float(gyro[2]), pos, vel, la
-            )
+            yaw = wrap_angle(true.yaw - self._yaw0)
+            return BalancerObs(t, true.pitch, true.pitch_rate, yaw, true.yaw_rate, pos, vel, la)
 
         pos2 = (
             wheel_angle_from_counts(counts[0], self._counts0[0], cpr),
@@ -586,14 +643,12 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         return float(math.hypot(xy[0] - self._xy0[0], xy[1] - self._xy0[1]))
 
     def _reward(self, u: tuple[float, ...]) -> tuple[float, dict[str, float]]:
-        d, b, w = self.data, self.binding, self.reward_config
-        pitch, _ = _true_pitch_yaw(d.xmat[b.chassis_body])
-        gyro = d.sensordata[b.gyro_adr : b.gyro_adr + 3]
+        w, true = self.reward_config, self._true_state()
         costs = {
-            "tilt": min((pitch / 0.2) ** 2, 1.0),
-            "rate": min((float(gyro[1]) / 3.0) ** 2, 1.0),
+            "tilt": min((true.pitch / 0.2) ** 2, 1.0),
+            "rate": min((true.pitch_rate / 3.0) ** 2, 1.0),
             "drift": min(self._drift() ** 2, 1.0),
-            "yaw_rate": min((float(gyro[2]) / 2.0) ** 2, 1.0),
+            "yaw_rate": min((true.yaw_rate / 2.0) ** 2, 1.0),
             "effort": (u[0] ** 2 + u[1] ** 2) / 2.0,
             "smooth": min(
                 ((u[0] - self._prev_u[0]) ** 2 + (u[1] - self._prev_u[1]) ** 2) / 2.0 / 0.25, 1.0
@@ -605,14 +660,13 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
     def _info(
         self, reward_terms: dict[str, float], push_force: tuple[float, float, float]
     ) -> dict[str, Any]:
-        d, b = self.data, self.binding
-        pitch, _ = _true_pitch_yaw(d.xmat[b.chassis_body])
+        true = self._true_state()
         info: dict[str, Any] = {
             "episode_seed": self.scenario.seed,
             "t": self._step_count * self.control_dt,
             "step": self._step_count,
-            "true_pitch": pitch,
-            "tilt": tilt_angle(d.xmat[b.chassis_body]),
+            "true_pitch": true.pitch,
+            "tilt": true.tilt,
             "drift_m": self._drift(),
             "energy_j": self._energy_j,
             "push_force": push_force,

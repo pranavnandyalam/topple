@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -21,7 +22,19 @@ from topple.contract import (
 from topple.disturbances import PRESETS
 from topple.ids import validate_challenge_id
 from topple.rng import validate_seed
-from topple.robot import RobotParams, challenge_dir, load_params
+from topple.robot import RobotParams, challenge_dir, load_params, referenced_files
+
+# Version of the env algorithm (sensing, estimation, termination, pushes, model overrides). Bump it
+# whenever a code change can change a fixed controller's results on a fixed seed (contract §13):
+# it is part of every protocol_hash, so results from different env algorithms never compare.
+ENV_ALGO_VERSION = 1
+BUNDLE_HASH_TAG = b"topple.bundle/1\n"
+PROTOCOL_HASH_FORMAT = "topple.protocol/1"
+_TEXT_SUFFIXES = frozenset({".xml", ".yaml", ".yml"})
+
+
+def _framed(data: bytes) -> bytes:
+    return len(data).to_bytes(8, "big") + data
 
 
 class _Frozen(BaseModel):
@@ -108,22 +121,71 @@ class Challenge:
             robot=RobotGeometry(wheel_radius_m=wheel_radius_m, track_width_m=track_width_m),
         )
 
+    def bundle_files(self) -> tuple[Path, ...]:
+        """The files that define the challenge, sorted: ``challenge.yaml``, the scene, the robot
+        params, every ``*.xml`` next to the robot MJCF, and every file the scene or robot MJCF
+        references (meshes, textures, includes). All must lie inside the bundle directory."""
+        robot_dir = self.robot_xml.parent
+        files = {
+            self.root / "challenge.yaml",
+            self.scene_xml,
+            self.root / self.config.params,
+            *robot_dir.glob("*.xml"),
+            *referenced_files(self.scene_xml),
+            *referenced_files(self.robot_xml),
+        }
+        root = self.root.resolve()
+        resolved = {path.resolve() for path in files}
+        outside = sorted(str(p) for p in resolved if not p.is_relative_to(root))
+        if outside:
+            raise ValueError(f"bundle files outside {root}: {outside}")
+        return tuple(sorted(resolved, key=lambda p: p.relative_to(root).as_posix()))
+
     def bundle_hash(self) -> str:
-        """sha256 over every file that defines the challenge (sorted, path-qualified)."""
-        digest = hashlib.sha256()
-        for path in sorted(
-            p for p in self.root.rglob("*") if p.is_file() and "__pycache__" not in p.parts
-        ):
-            digest.update(str(path.relative_to(self.root)).encode())
-            digest.update(path.read_bytes())
+        """sha256 over ``bundle_files`` (contract §13).
+
+        A tag, then per file in POSIX-path order: the length-framed relative path and the
+        length-framed bytes, with CRLF normalized to LF in text files (``.xml``, ``.yaml``). Stray
+        files (caches, notes, editor droppings) do not count, and where the bundle lives does not
+        matter.
+        """
+        root = self.root.resolve()
+        digest = hashlib.sha256(BUNDLE_HASH_TAG)
+        for path in self.bundle_files():
+            data = path.read_bytes()
+            if path.suffix in _TEXT_SUFFIXES:
+                data = data.replace(b"\r\n", b"\n")
+            digest.update(_framed(path.relative_to(root).as_posix().encode("utf-8")))
+            digest.update(_framed(data))
         return digest.hexdigest()
 
-    def protocol_hash(self, preset: str) -> str:
+    def protocol_hash(self, preset: str, seeds: Sequence[int] | None = None, salt: int = 0) -> str:
+        """sha256 of everything that fixes a protocol's scores (contract §13).
+
+        Covers the bundle hash, the preset definition (pushes, randomization ranges), the score
+        config, the seed list in order (default: the public seeds), the controller-seed salt and
+        ``ENV_ALGO_VERSION``, as canonical JSON.
+        """
+        if preset not in self.config.presets:
+            raise ValueError(f"{self.id} has no preset {preset!r}")
+        seed_list = list(self.config.seeds.public if seeds is None else seeds)
+        if not seed_list:
+            raise ValueError("a protocol needs at least one seed")
+        for seed in seed_list:
+            validate_seed(seed)
+        if isinstance(salt, bool) or not isinstance(salt, int) or salt < 0:
+            raise ValueError(f"salt must be a non-negative int, got {salt!r}")
         payload = {
-            "challenge": self.bundle_hash(),
+            "format": PROTOCOL_HASH_FORMAT,
+            "env_algo_version": ENV_ALGO_VERSION,
+            "bundle": self.bundle_hash(),
             "preset": PRESETS[preset].model_dump(mode="json"),
+            "score": self.config.score.model_dump(mode="json"),
+            "seeds": seed_list,
+            "salt": salt,
         }
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+        text = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def load_challenge_dir(root: Path) -> Challenge:

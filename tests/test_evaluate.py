@@ -1,5 +1,7 @@
 import json
 import math
+import shutil
+from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -8,11 +10,28 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from topple.contract import BalancerObs, TaskSpec
+import topple.evaluate as evaluate_module
+from topple.challenge import load_challenge_dir
+from topple.contract import BalancerObs, TaskSpec, controller_obs
 from topple.controllers.pid import PIDController
 from topple.envs.balance import BalanceEnv
-from topple.evaluate import EvalProtocol, evaluate, run_episode
-from topple.results import ControllerInfo, ErrorInfo, EvalResults, read_results, write_results
+from topple.evaluate import (
+    EvalProtocol,
+    evaluate,
+    run_episode,
+    summarize,
+    wants_epilogue,
+)
+from topple.results import (
+    ControllerInfo,
+    EpisodeResult,
+    ErrorInfo,
+    EvalResults,
+    read_results,
+    write_results,
+)
+from topple.rng import controller_seed
+from topple.robot import challenge_dir
 from topple.traj import load_npz
 from topple.verify import verify_episode
 
@@ -57,7 +76,7 @@ class Explodes:
     def act(self, obs: BalancerObs) -> Any:
         self.k += 1
         if self.k > self.at_step:
-            if isinstance(self.payload, Exception):
+            if isinstance(self.payload, BaseException):
                 raise self.payload
             return self.payload
         return (0.0, 0.0)
@@ -230,3 +249,264 @@ def test_truncated_trajectory_fails_verification(tmp_path: Path) -> None:
         }
     )
     assert not verify_episode(longer).ok
+
+
+# ------------------------------------------------------------------ controller misbehaviour (B)
+
+
+class Endless:
+    def __iter__(self) -> Iterator[float]:
+        while True:
+            yield 0.0
+
+
+class IterRaises:
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+
+    def __iter__(self) -> Iterator[float]:
+        raise self.exc
+
+
+class BadStrError(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("cannot describe myself")
+
+
+def lazy_action() -> Iterator[float]:
+    yield from (0.1, 0.2)
+
+
+MISBEHAVIOUR: dict[str, tuple[Any, str]] = {
+    "act raises SystemExit": (SystemExit(3), "exception"),
+    "act raises GeneratorExit": (GeneratorExit(), "exception"),
+    "act raises StopIteration": (StopIteration(), "exception"),
+    "exception with a broken __str__": (BadStrError(), "exception"),
+    "action iteration raises SystemExit": (IterRaises(SystemExit(1)), "exception"),
+    "action iteration raises ValueError": (IterRaises(ValueError("bad")), "invalid_action"),
+    "generator": (lazy_action(), "invalid_action"),
+    "huge int": ([10**400, 0.0], "invalid_action"),
+    "endless iterable": (Endless(), "invalid_action"),
+    "huge range": (range(10**12), "invalid_action"),
+    "set": ({0.1, 0.2}, "invalid_action"),
+}
+
+
+@pytest.mark.parametrize(("payload", "code"), MISBEHAVIOUR.values(), ids=MISBEHAVIOUR.keys())
+def test_misbehaving_controllers_never_crash_the_harness(payload: Any, code: str) -> None:
+    env = BalanceEnv("ideal", record=True)
+    run = run_episode(env, lambda spec: Explodes(5, payload), seed=0, index=0)
+    assert run.result.error is not None
+    assert run.result.error.code == code
+    assert run.result.error.step == 5
+    assert run.result.score == 0.0
+    assert not run.result.success
+    assert run.trajectory.steps == 5
+
+
+@pytest.mark.parametrize("where", ["factory", "reset"])
+@pytest.mark.parametrize("exc", [SystemExit(2), GeneratorExit(), BadStrError()])
+def test_setup_failures_are_exceptions(where: str, exc: BaseException) -> None:
+    class Fails(Zero):
+        def reset(self, rng_seed: int) -> None:
+            raise exc
+
+    def factory(spec: TaskSpec) -> Zero:
+        if where == "factory":
+            raise exc
+        return Fails()
+
+    run = run_episode(BalanceEnv("ideal", record=True), factory, seed=0, index=0)
+    assert run.result.error is not None
+    assert (run.result.error.code, run.result.error.step) == ("exception", 0)
+    assert run.trajectory.steps == 0
+
+
+@pytest.mark.parametrize("where", ["factory", "reset", "act", "action"])
+def test_keyboard_interrupt_still_stops_the_run(where: str) -> None:
+    class Interrupts(Zero):
+        def reset(self, rng_seed: int) -> None:
+            if where == "reset":
+                raise KeyboardInterrupt
+
+        def act(self, obs: BalancerObs) -> Any:
+            if where == "act":
+                raise KeyboardInterrupt
+            return IterRaises(KeyboardInterrupt()) if where == "action" else (0.0, 0.0)
+
+    def factory(spec: TaskSpec) -> Zero:
+        if where == "factory":
+            raise KeyboardInterrupt
+        return Interrupts()
+
+    with pytest.raises(KeyboardInterrupt):
+        run_episode(BalanceEnv("ideal", record=True), factory, seed=0, index=0)
+
+
+def test_sim_unstable_scores_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"n": 0}
+
+    def blows_up(self: BalanceEnv) -> bool:
+        calls["n"] += 1
+        return calls["n"] > 37  # the 38th substep: inside control step 7
+
+    monkeypatch.setattr(BalanceEnv, "_unstable", blows_up)
+    run = run_episode(BalanceEnv("ideal", record=True), pid, seed=0, index=0)
+    assert run.result.error is not None
+    assert (run.result.error.code, run.result.error.step) == ("sim_unstable", 8)
+    assert run.result.score == 0.0
+    assert not run.result.success
+    assert run.trajectory.meta["termination"]["reason"] == "sim_unstable"
+    assert run.trajectory.epilogue_qpos.shape[0] == 0  # nothing to show after a blow-up
+
+
+# ------------------------------------------------------------------ private seeds (B, §8)
+
+
+def test_private_seeds_use_the_salt() -> None:
+    Recorder.seeds.clear()
+    Recorder.specs.clear()
+    salt = 2**127 + 12345
+    p = replace(protocol("ideal", 2), seed_set="private", salt=salt)
+    evaluate(p, Recorder, INFO)
+    assert Recorder.seeds == [controller_seed(s, salt) for s in p.seeds]
+    assert not set(Recorder.seeds) & {controller_seed(s, 0) for s in p.seeds}
+
+
+def test_private_seeds_never_save_trajectories(tmp_path: Path) -> None:
+    p = replace(protocol("ideal", 2), seed_set="private", salt=99)
+    results = evaluate(p, pid, INFO, traj_dir=tmp_path / "traj")
+    assert not (tmp_path / "traj").exists() or not any((tmp_path / "traj").iterdir())
+    assert results.episodes is None
+    assert results.aggregate.episodes == 2
+    text = results.model_dump_json()
+    assert all(f'"seed":{s}' not in text.replace(" ", "") for s in p.seeds)
+
+
+def test_run_episode_can_hide_the_seed() -> None:
+    run = run_episode(BalanceEnv("ideal", record=True), pid, seed=7, index=0, report_seed=False)
+    assert run.result.seed is None
+    assert run_episode(BalanceEnv("ideal", record=True), pid, seed=7, index=0).result.seed == 7
+
+
+# ------------------------------------------------------------------ epilogue (C)
+
+
+@pytest.mark.parametrize(
+    ("reason", "has_error", "expected"),
+    [
+        ("fell", False, True),
+        ("floor_contact", False, True),
+        ("timeout", False, False),
+        ("timeout", True, True),
+        ("fell", True, True),
+        ("sim_unstable", True, False),
+        ("sim_unstable", False, False),
+        ("drift", False, False),
+    ],
+)
+def test_wants_epilogue(reason: str, has_error: bool, expected: bool) -> None:
+    assert wants_epilogue(reason, has_error) is expected
+
+
+def test_surviving_episode_has_no_epilogue() -> None:
+    run = run_episode(BalanceEnv("ideal", record=True), pid, seed=0, index=0)
+    assert run.trajectory.meta["termination"]["reason"] == "timeout"
+    assert run.trajectory.epilogue_qpos.shape == (0, run.trajectory.qpos.shape[1])
+
+
+def test_fallen_and_errored_episodes_get_a_one_second_epilogue() -> None:
+    fell = run_episode(BalanceEnv("ideal", record=True), lambda spec: Zero(), seed=0, index=0)
+    assert fell.trajectory.meta["termination"]["reason"] == "fell"
+    assert fell.trajectory.epilogue_qpos.shape[0] == 100
+    errored = run_episode(
+        BalanceEnv("ideal", record=True),
+        lambda spec: Explodes(5, RuntimeError("x")),
+        seed=0,
+        index=0,
+    )
+    assert errored.trajectory.epilogue_qpos.shape[0] == 100
+
+
+# ------------------------------------------------------------------ aggregates (E)
+
+
+def episode(index: int, score: float, success: bool, upright_s: float) -> EpisodeResult:
+    return EpisodeResult(
+        index=index,
+        seed=index,
+        success=success,
+        score=score,
+        metrics={"time_upright_s": upright_s},
+        error=None,
+    )
+
+
+def test_summarize_divides_by_the_expected_episode_count() -> None:
+    present = [episode(0, 90.0, True, 10.0), episode(1, 60.0, False, 4.0)]
+    agg = summarize(present, expected=4)
+    assert agg.score == 37.5  # missing episodes count as 0
+    assert agg.success_rate == 0.25
+    assert agg.mean_time_upright_s == 7.0  # over the episodes that are present
+    assert (agg.episodes, agg.errors) == (2, 0)
+
+
+def test_summarize_uses_exact_summation() -> None:
+    present = [episode(i, v, False, 1.0) for i, v in enumerate([1e-16, 1.0, -1e-16 + 1e-16])]
+    assert summarize(present, expected=3).score == math.fsum([1e-16, 1.0, 0.0]) / 3
+
+
+def test_summarize_rejects_more_episodes_than_expected() -> None:
+    with pytest.raises(ValueError, match="expected"):
+        summarize([episode(0, 1.0, True, 1.0), episode(1, 1.0, True, 1.0)], expected=1)
+
+
+def test_summarize_of_nothing_is_zero() -> None:
+    agg = summarize([], expected=3)
+    assert (agg.score, agg.success_rate, agg.mean_time_upright_s, agg.episodes) == (0, 0, 0, 0)
+
+
+# ------------------------------------------------------------------ observation path (F)
+
+
+def test_controllers_receive_controller_obs_of_the_recorded_vector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[float] = []
+
+    def spy(obs_arr: Any, t: float) -> BalancerObs:
+        calls.append(t)
+        return controller_obs(obs_arr, t)
+
+    seen: list[BalancerObs] = []
+
+    class Sees(Zero):
+        def act(self, obs: BalancerObs) -> tuple[float, float]:
+            seen.append(obs)
+            return PIDController().act(obs)
+
+    monkeypatch.setattr(evaluate_module, "controller_obs", spy)
+    run = run_episode(BalanceEnv("clean", record=True), lambda spec: Sees(), seed=1, index=0)
+    traj = run.trajectory
+    assert len(calls) == len(seen) == traj.steps
+    for k, obs in enumerate(seen):
+        assert obs.to_wire() == controller_obs(traj.obs[k], k * 0.01).to_wire()
+        assert BalancerObs.from_wire(obs.to_wire()) == obs
+
+
+# ------------------------------------------------------------------ one bundle per protocol (I)
+
+
+def test_evaluate_runs_on_the_protocols_challenge_object(tmp_path: Path) -> None:
+    root = tmp_path / "balance-v1"
+    shutil.copytree(challenge_dir("balance-v1"), root)
+    yaml_path = root / "challenge.yaml"
+    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.3", "e_ref_j: 0.001"))
+    base = protocol("clean", 1)
+    custom = replace(base, challenge=load_challenge_dir(root))
+    a = evaluate(base, pid, INFO)
+    b = evaluate(custom, pid, INFO)
+    assert a.episodes is not None
+    assert b.episodes is not None
+    assert b.episodes[0].score < a.episodes[0].score  # scored with the custom E_ref
+    assert b.protocol_hash != a.protocol_hash

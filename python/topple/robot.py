@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -31,6 +33,17 @@ GYRO_SENSOR = "imu_gyro"
 ACCEL_SENSOR = "imu_accel"
 TRACK_CAMERA = "track"
 DELAY_HISTORY = 8  # native actuator delay buffer: enough for 10 ms at 2 ms per sample
+SCENE_GEOMS = frozenset({"floor"})  # the only world-body geoms a balance scene may have
+TIRE_TYPES = frozenset(
+    int(t)
+    for t in (
+        mujoco.mjtGeom.mjGEOM_CYLINDER,
+        mujoco.mjtGeom.mjGEOM_SPHERE,
+        mujoco.mjtGeom.mjGEOM_CAPSULE,
+    )
+)
+_FILE_ATTRS = ("file", "fileright", "fileleft", "fileup", "filedown", "filefront", "fileback")
+_MESH_DIR_TAGS = frozenset({"mesh", "skin", "hfield"})  # MuJoCo resolves these via meshdir
 
 
 class _Frozen(BaseModel):
@@ -87,10 +100,86 @@ def load_params(path: Path) -> RobotParams:
     return RobotParams.model_validate(yaml.safe_load(path.read_text()))
 
 
+def _mjcf_trees(path: Path, model_dir: Path, seen: set[Path]) -> list[ET.Element]:
+    """The root element of ``path`` and of every file it ``<include>``s, recursively."""
+    root = ET.parse(path).getroot()
+    trees = [root]
+    for include in root.iter("include"):
+        target = _resolve(model_dir, "", include.get("file", ""), path)
+        if target not in seen:
+            seen.add(target)
+            trees += _mjcf_trees(target, model_dir, seen)
+    return trees
+
+
+def _resolve(model_dir: Path, subdir: str, name: str, owner: Path) -> Path:
+    path = (model_dir / subdir / name).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"{owner.name} references {name}, which does not exist ({path})")
+    return path
+
+
+def _compiler_dirs(trees: list[ET.Element]) -> tuple[str, str]:
+    """(meshdir, texturedir) as MuJoCo applies them: ``assetdir`` sets both, specific ones win."""
+    meshdir = texturedir = ""
+    for tree in trees:
+        for compiler in tree.iter("compiler"):
+            assetdir = compiler.get("assetdir")
+            meshdir = compiler.get("meshdir", assetdir if assetdir is not None else meshdir)
+            texturedir = compiler.get(
+                "texturedir", assetdir if assetdir is not None else texturedir
+            )
+    return meshdir, texturedir
+
+
+def referenced_files(xml_path: Path) -> tuple[Path, ...]:
+    """Every file an MJCF references, resolved the way MuJoCo resolves it, sorted.
+
+    Covers ``<include>`` (recursively), meshes, skins and height fields (``meshdir``), textures
+    including cube faces (``texturedir``), and any other element with a ``file`` attribute
+    (relative to the model's directory). A missing file raises ``FileNotFoundError``.
+    """
+    model_dir = xml_path.parent
+    includes: set[Path] = set()
+    trees = _mjcf_trees(xml_path, model_dir, includes)
+    meshdir, texturedir = _compiler_dirs(trees)
+    found = set(includes)
+    for tree in trees:
+        for element in tree.iter():
+            if element.tag in ("include", "compiler"):
+                continue
+            subdir = (
+                meshdir
+                if element.tag in _MESH_DIR_TAGS
+                else texturedir
+                if element.tag == "texture"
+                else ""
+            )
+            for attr in _FILE_ATTRS:
+                name = element.get(attr)
+                if name:
+                    found.add(_resolve(model_dir, subdir, name, xml_path))
+    return tuple(sorted(found))
+
+
+def _framed(data: bytes) -> bytes:
+    return len(data).to_bytes(8, "big") + data
+
+
 def robot_hash(robot_xml: Path, params: RobotParams) -> str:
+    """sha256 of the robot MJCF, its params and every file the MJCF references.
+
+    Referenced files are appended as length-framed (POSIX path relative to the MJCF's directory,
+    bytes) records, so a robot without asset files hashes exactly as before they were covered.
+    """
     digest = hashlib.sha256()
     digest.update(robot_xml.read_bytes())
     digest.update(json.dumps(params.model_dump(), sort_keys=True).encode())
+    base = robot_xml.parent.resolve()
+    for path in referenced_files(robot_xml):
+        rel = Path(os.path.relpath(path, base)).as_posix()
+        digest.update(_framed(rel.encode("utf-8")))
+        digest.update(_framed(path.read_bytes()))
     return digest.hexdigest()
 
 
@@ -197,12 +286,31 @@ def _wheel_geoms(model: mujoco.MjModel, body: int) -> list[int]:
     return [g for g in range(model.ngeom) if model.geom_bodyid[g] == body]
 
 
+def _collision_geoms(model: mujoco.MjModel, body: int) -> list[int]:
+    return [
+        g
+        for g in _wheel_geoms(model, body)
+        if model.geom_contype[g] != 0 or model.geom_conaffinity[g] != 0
+    ]
+
+
+def _tire_geom(model: mujoco.MjModel, joint_name: str) -> int:
+    """The single collision geom of a wheel body: the tire that touches the floor."""
+    body = int(model.jnt_bodyid[model.joint(joint_name).id])
+    tires = _collision_geoms(model, body)
+    if len(tires) != 1:
+        raise ValueError(
+            f"wheel body of '{joint_name}' must have exactly one collision geom, got {len(tires)}"
+        )
+    return tires[0]
+
+
 def bind_robot(model: mujoco.MjModel) -> RobotBinding:
     joints = [model.joint(name) for name in WHEEL_JOINTS]
     bodies = [int(model.jnt_bodyid[j.id]) for j in joints]
     signs = tuple(1.0 if _axis_in_chassis(model, j.id)[1] > 0 else -1.0 for j in joints)
-    geoms = [g for body in bodies for g in _wheel_geoms(model, body)]
-    radius = max(float(model.geom_size[g][0]) for g in geoms)
+    tires = [_tire_geom(model, name) for name in WHEEL_JOINTS]
+    radius = max(float(model.geom_size[g][0]) for g in tires)
     track = abs(float(model.body_pos[bodies[0]][1] - model.body_pos[bodies[1]][1]))
     root = model.joint(ROOT_JOINT)
     return RobotBinding(
@@ -216,7 +324,7 @@ def bind_robot(model: mujoco.MjModel) -> RobotBinding:
         push_site=model.site(PUSH_SITE).id,
         gyro_adr=int(model.sensor(GYRO_SENSOR).adr[0]),
         accel_adr=int(model.sensor(ACCEL_SENSOR).adr[0]),
-        wheel_geoms=frozenset(geoms),
+        wheel_geoms=frozenset(tires),
         wheel_radius_m=radius,
         track_width_m=track,
         wheel_sign=(signs[0], signs[1]),
@@ -227,12 +335,13 @@ def _lookup(model: mujoco.MjModel, kind: mujoco.mjtObj, name: str) -> int:
     return int(mujoco.mj_name2id(model, kind, name))
 
 
-def validate_robot(model: mujoco.MjModel) -> list[str]:
-    """Every way ``model`` violates ``balancer.robot.v1`` (empty list = valid)."""
+def _name(model: mujoco.MjModel, kind: mujoco.mjtObj, index: int) -> str:
+    return mujoco.mj_id2name(model, kind, index) or f"#{index}"
+
+
+def _root_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
+    """The robot must be free to fall: a free root joint, no welds, no gravity compensation."""
     problems: list[str] = []
-    chassis = _lookup(model, mujoco.mjtObj.mjOBJ_BODY, CHASSIS)
-    if chassis < 0:
-        return [f"body '{CHASSIS}' is missing"]
     root = _lookup(model, mujoco.mjtObj.mjOBJ_JOINT, ROOT_JOINT)
     if (
         root < 0
@@ -240,22 +349,50 @@ def validate_robot(model: mujoco.MjModel) -> list[str]:
         or model.jnt_bodyid[root] != chassis
     ):
         problems.append(f"free joint '{ROOT_JOINT}' on body '{CHASSIS}' is missing")
-    for name in WHEEL_JOINTS:
-        jid = _lookup(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        if jid < 0:
-            problems.append(f"joint '{name}' is missing")
-            continue
-        if model.jnt_type[jid] != mujoco.mjtJoint.mjJNT_HINGE:
-            problems.append(f"joint '{name}' must be a hinge")
-        body = model.jnt_bodyid[jid]
-        if model.body_parentid[body] != chassis:
-            problems.append(f"joint '{name}' must be on a direct child body of '{CHASSIS}'")
-        axis = _axis_in_chassis(model, jid)
-        if abs(abs(float(axis[1])) - 1.0) > 1e-6:
-            got = axis.round(3).tolist()
-            problems.append(f"joint '{name}' axis must be +-y in the chassis frame, got {got}")
-        if not _wheel_geoms(model, body):
-            problems.append(f"joint '{name}' body has no wheel geom")
+    if model.neq > 0:
+        problems.append(f"equality constraints are not allowed, found {model.neq}")
+    for body in range(1, model.nbody):
+        if model.body_gravcomp[body] != 0:
+            name = _name(model, mujoco.mjtObj.mjOBJ_BODY, body)
+            problems.append(f"body '{name}' uses gravcomp; the robot must feel full gravity")
+    return problems
+
+
+def _tire_problems(model: mujoco.MjModel, name: str, body: int) -> list[str]:
+    tires = _collision_geoms(model, body)
+    if len(tires) != 1:
+        return [f"wheel body of '{name}' must have exactly one collision geom, got {len(tires)}"]
+    if int(model.geom_type[tires[0]]) not in TIRE_TYPES:
+        return [f"tire of '{name}' must be a cylinder, sphere or capsule"]
+    return []
+
+
+def _wheel_problems(model: mujoco.MjModel, chassis: int, name: str, side: float) -> list[str]:
+    """One wheel joint: an unlimited ±y hinge on a direct child of the chassis, on its side."""
+    jid = _lookup(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    if jid < 0:
+        return [f"joint '{name}' is missing"]
+    problems: list[str] = []
+    if model.jnt_type[jid] != mujoco.mjtJoint.mjJNT_HINGE:
+        problems.append(f"joint '{name}' must be a hinge")
+    if model.jnt_limited[jid]:
+        problems.append(f"joint '{name}' must be unlimited (wheels turn freely)")
+    body = int(model.jnt_bodyid[jid])
+    if model.body_parentid[body] != chassis:
+        problems.append(f"joint '{name}' must be on a direct child body of '{CHASSIS}'")
+    if float(model.body_pos[body][1]) * side <= 0:
+        where = "y > 0 (left)" if side > 0 else "y < 0 (right)"
+        problems.append(f"joint '{name}' body must sit at {where} in the chassis frame")
+    axis = _axis_in_chassis(model, jid)
+    if abs(abs(float(axis[1])) - 1.0) > 1e-6:
+        got = axis.round(3).tolist()
+        problems.append(f"joint '{name}' axis must be +-y in the chassis frame, got {got}")
+    return problems + _tire_problems(model, name, body)
+
+
+def _interface_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
+    """Sites on the chassis, the injected motors and IMU sensors."""
+    problems: list[str] = []
     for name in (IMU_SITE, PUSH_SITE):
         sid = _lookup(model, mujoco.mjtObj.mjOBJ_SITE, name)
         if sid < 0:
@@ -273,6 +410,42 @@ def validate_robot(model: mujoco.MjModel) -> list[str]:
     return problems
 
 
-def tilt_angle(xmat: np.ndarray) -> float:
-    """Angle between the chassis z axis and world z (covers pitch and roll falls)."""
-    return math.acos(max(-1.0, min(1.0, float(xmat[8]))))
+def _world_problems(model: mujoco.MjModel, chassis: int, scene_geoms: frozenset[str]) -> list[str]:
+    """Nothing in the world but the robot and the scene's own geoms (the floor)."""
+    problems: list[str] = []
+    for body in range(1, model.nbody):
+        if model.body_rootid[body] != chassis:
+            name = _name(model, mujoco.mjtObj.mjOBJ_BODY, body)
+            problems.append(f"world body '{name}' is not part of the robot")
+    for geom in range(model.ngeom):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom) or ""
+        if model.geom_bodyid[geom] == 0 and name not in scene_geoms:
+            problems.append(f"world geom '{name or f'#{geom}'}' is not allowed; the scene owns it")
+    return problems
+
+
+def validate_robot(
+    model: mujoco.MjModel, *, scene_geoms: frozenset[str] = SCENE_GEOMS
+) -> list[str]:
+    """Every way ``model`` violates ``balancer.robot.v1`` (empty list = valid, contract §3)."""
+    chassis = _lookup(model, mujoco.mjtObj.mjOBJ_BODY, CHASSIS)
+    if chassis < 0:
+        return [f"body '{CHASSIS}' is missing"]
+    problems = _root_problems(model, chassis)
+    for name, side in zip(WHEEL_JOINTS, (1.0, -1.0), strict=True):
+        problems += _wheel_problems(model, chassis, name, side)
+    problems += _interface_problems(model, chassis)
+    problems += _world_problems(model, chassis, scene_geoms)
+    return problems
+
+
+def quat_tilt(quat: npt.ArrayLike) -> float:
+    """Angle between the chassis z axis and world z, from the root quaternion (wxyz).
+
+    Covers pitch and roll falls. Computed from ``qpos`` rather than MuJoCo's ``xmat``, which lags
+    one substep behind after ``mj_step`` (contract §11). Tolerates a non-unit quaternion.
+    """
+    w, x, y, z = (float(v) for v in np.asarray(quat, dtype=np.float64))
+    norm2 = w * w + x * x + y * y + z * z
+    cos_tilt = 1.0 - 2.0 * (x * x + y * y) / norm2
+    return math.acos(max(-1.0, min(1.0, cos_tilt)))

@@ -5,8 +5,11 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-_CHALLENGE_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*-v[1-9][0-9]*$")
-_PRESET_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# Every segment starts with a letter, so the PascalCase Gymnasium name keeps segment boundaries
+# (``foo-1bar`` and ``foo1bar`` would both be ``Foo1bar``) and ``gym_id`` is injective.
+# Always matched with ``fullmatch``: ``$`` would also accept a trailing newline.
+_CHALLENGE_RE = re.compile(r"[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*-v[1-9][0-9]*")
+_PRESET_RE = re.compile(r"[a-z][a-z0-9_]*")
 
 PROTOCOL_ALIASES: Mapping[str, str] = {
     "eval_v1": "balance-v1/standard",
@@ -15,13 +18,13 @@ PROTOCOL_ALIASES: Mapping[str, str] = {
 
 
 def validate_challenge_id(challenge_id: str) -> str:
-    if not _CHALLENGE_RE.match(challenge_id):
+    if not isinstance(challenge_id, str) or not _CHALLENGE_RE.fullmatch(challenge_id):
         raise ValueError(f"invalid challenge id {challenge_id!r}: expected e.g. 'balance-v1'")
     return challenge_id
 
 
 def gym_id(challenge_id: str) -> str:
-    """``balance-v1`` -> ``topple/Balance-v1``."""
+    """``balance-v1`` -> ``topple/Balance-v1`` (injective: distinct ids never collide)."""
     validate_challenge_id(challenge_id)
     name, _, version = challenge_id.rpartition("-")
     pascal = "".join(part[:1].upper() + part[1:] for part in name.split("-"))
@@ -31,7 +34,7 @@ def gym_id(challenge_id: str) -> str:
 def parse_protocol(protocol_id: str) -> tuple[str, str]:
     """``balance-v1/standard`` -> ``("balance-v1", "standard")``."""
     parts = protocol_id.split("/")
-    if len(parts) != 2 or not _PRESET_RE.match(parts[1]):
+    if len(parts) != 2 or not _PRESET_RE.fullmatch(parts[1]):
         raise ValueError(f"invalid protocol id {protocol_id!r}: expected '<challenge>/<preset>'")
     try:
         validate_challenge_id(parts[0])

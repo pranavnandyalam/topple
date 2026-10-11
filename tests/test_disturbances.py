@@ -1,15 +1,23 @@
+import copy
 import itertools
 import json
 import math
+from collections.abc import Callable
+from dataclasses import replace
+from typing import Any
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from topple.disturbances import (
+    MAX_PUSH_FORCE_N,
     PRESETS,
     PushConfig,
     Scenario,
     make_scenario,
     push_force_world,
+    validate_scenario,
 )
 
 TIMESTEP = 0.002
@@ -112,3 +120,142 @@ def test_push_force_world_follows_heading_at_onset() -> None:
 def test_scenario_rejects_unknown_preset_name() -> None:
     with pytest.raises(ValueError, match="preset"):
         Scenario.from_dict({**scenario(1).to_dict(), "preset": "nope"})
+
+
+# ------------------------------------------------------------------ Scenario.from_dict validation
+
+MAX_STEPS = round(EPISODE_S / CONTROL_DT)
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    st.integers(min_value=0, max_value=2**53 - 1),
+    st.sampled_from(["ideal", "clean", "standard"]),
+)
+def test_every_drawn_scenario_round_trips_and_validates(seed: int, preset: str) -> None:
+    s = scenario(seed, preset)
+    assert Scenario.from_dict(json.loads(json.dumps(s.to_dict())), max_steps=MAX_STEPS) == s
+
+
+def test_from_dict_accepts_json_integers_for_real_fields() -> None:
+    data = scenario(2, "ideal").to_dict()
+    data["init_pitch_rad"] = 0
+    data["model"]["chassis_mass_scale"] = 1
+    assert Scenario.from_dict(data).init_pitch_rad == 0.0
+
+
+def with_two_pushes() -> dict[str, Any]:
+    seed = next(seed for seed in itertools.count() if len(scenario(seed).pushes) >= 2)
+    return scenario(seed).to_dict()
+
+
+def setter(*path: Any, value: Any) -> Callable[[dict[str, Any]], None]:
+    def apply(data: dict[str, Any]) -> None:
+        target = data
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+
+    return apply
+
+
+def deleter(*path: Any) -> Callable[[dict[str, Any]], None]:
+    def apply(data: dict[str, Any]) -> None:
+        target = data
+        for key in path[:-1]:
+            target = target[key]
+        del target[path[-1]]
+
+    return apply
+
+
+def swap_pushes(data: dict[str, Any]) -> None:
+    data["pushes"][0], data["pushes"][1] = data["pushes"][1], data["pushes"][0]
+
+
+def duplicate_push(data: dict[str, Any]) -> None:
+    data["pushes"][1]["start_step"] = data["pushes"][0]["start_step"]
+
+
+BAD_SCENARIOS: dict[str, Callable[[dict[str, Any]], None]] = {
+    "seed negative": setter("seed", value=-1),
+    "seed too big": setter("seed", value=2**53),
+    "seed str": setter("seed", value="1"),
+    "pitch nan": setter("init_pitch_rad", value=math.nan),
+    "pitch inf": setter("init_pitch_rad", value=math.inf),
+    "pitch str": setter("init_pitch_rad", value="0.1"),
+    "pitch bool": setter("init_pitch_rad", value=True),
+    "pitch rate nan": setter("init_pitch_rate_rads", value=math.nan),
+    "preset unhashable": setter("preset", value=["standard"]),
+    "seed unhashable": setter("seed", value=[1]),
+    "unknown top-level key": setter("surprise", value=1),
+    "missing model": deleter("model"),
+    "pushes not a list": setter("pushes", value={"0": 1}),
+    "pushes unsorted": swap_pushes,
+    "pushes share a step": duplicate_push,
+    "push before the episode": setter("pushes", 0, "start_step", value=-1),
+    "push after the episode": setter("pushes", 1, "start_step", value=MAX_STEPS),
+    "push step not int": setter("pushes", 0, "start_step", value=150.5),
+    "push step bool": setter("pushes", 0, "start_step", value=True),
+    "push without substeps": setter("pushes", 0, "n_substeps", value=0),
+    "push above the force cap": setter("pushes", 0, "magnitude_n", value=MAX_PUSH_FORCE_N + 1),
+    "push negative magnitude": setter("pushes", 0, "magnitude_n", value=-1.0),
+    "push magnitude nan": setter("pushes", 0, "magnitude_n", value=math.nan),
+    "push sign not unit": setter("pushes", 0, "forward_sign", value=0.5),
+    "push lateral above 1": setter("pushes", 0, "lateral_ratio", value=1.5),
+    "push unknown key": setter("pushes", 0, "torque", value=1.0),
+    "push missing key": deleter("pushes", 0, "magnitude_n"),
+    "mass scale zero": setter("model", "chassis_mass_scale", value=0.0),
+    "mass scale huge": setter("model", "chassis_mass_scale", value=100.0),
+    "mass scale nan": setter("model", "chassis_mass_scale", value=math.nan),
+    "com offset huge": setter("model", "com_x_offset_m", value=1.0),
+    "friction scale tiny": setter("model", "wheel_friction_scale", value=0.01),
+    "motor gain one wheel": setter("model", "motor_gain", value=[1.0]),
+    "motor gain huge": setter("model", "motor_gain", value=[1.0, 5.0]),
+    "frictionloss negative": setter("model", "frictionloss_scale", value=-0.1),
+    "delay negative": setter("model", "actuator_delay_s", value=-0.002),
+    "delay beyond the buffer": setter("model", "actuator_delay_s", value=0.5),
+    "model unknown key": setter("model", "gravity", value=9.81),
+    "imu offset huge": setter("sensors", "imu_pitch_offset_rad", value=1.0),
+    "gyro bias two axes": setter("sensors", "gyro_bias_rads", value=[0.0, 0.0]),
+    "gyro bias huge": setter("sensors", "gyro_bias_rads", value=[0.0, 5.0, 0.0]),
+    "gyro bias nan": setter("sensors", "gyro_bias_rads", value=[0.0, math.nan, 0.0]),
+    "sensors unknown key": setter("sensors", "accel_bias", value=[0.0, 0.0, 0.0]),
+}
+
+
+@pytest.mark.parametrize("mutate", BAD_SCENARIOS.values(), ids=BAD_SCENARIOS.keys())
+def test_from_dict_rejects_bad_scenarios(mutate: Callable[[dict[str, Any]], None]) -> None:
+    data = copy.deepcopy(with_two_pushes())
+    Scenario.from_dict(copy.deepcopy(data), max_steps=MAX_STEPS)  # the unmutated one is fine
+    mutate(data)
+    with pytest.raises(ValueError, match="scenario"):
+        Scenario.from_dict(data, max_steps=MAX_STEPS)
+
+
+@pytest.mark.parametrize("data", [None, [], "scenario", 3])
+def test_from_dict_rejects_non_mappings(data: Any) -> None:
+    with pytest.raises(ValueError, match="scenario"):
+        Scenario.from_dict(data)
+
+
+def test_push_steps_are_only_bounded_above_when_the_episode_length_is_known() -> None:
+    data = with_two_pushes()
+    data["pushes"][1]["start_step"] = MAX_STEPS + 5
+    assert Scenario.from_dict(data).pushes[1].start_step == MAX_STEPS + 5
+    with pytest.raises(ValueError, match="scenario"):
+        Scenario.from_dict(data, max_steps=MAX_STEPS)
+
+
+def test_presets_stay_inside_the_scenario_bounds() -> None:
+    """The randomization ranges and push config can only produce scenarios from_dict accepts."""
+    for seed in range(200):
+        Scenario.from_dict(scenario(seed).to_dict(), max_steps=MAX_STEPS)
+    assert PushConfig().max_force_n == MAX_PUSH_FORCE_N
+
+
+@pytest.mark.parametrize("field", ["init_pitch_rad", "init_pitch_rate_rads"])
+def test_validate_scenario_rejects_a_non_finite_initial_state(field: str) -> None:
+    bad = replace(scenario(1), **{field: math.inf})
+    with pytest.raises(ValueError, match="scenario"):
+        validate_scenario(bad)

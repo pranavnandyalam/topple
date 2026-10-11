@@ -1,17 +1,19 @@
 """The controller contract (docs/contract.md §6-8).
 
 Everything a controller touches lives here. This module imports only the standard library
-(numpy is imported lazily inside ``to_array``/``from_array``) so the subprocess runner, Pyodide
-and lesson-1 submissions can import it cheaply.
+(numpy is imported lazily inside ``to_array``/``controller_obs``) so the subprocess runner,
+Pyodide and lesson-1 submissions can import it cheaply.
 """
 
 from __future__ import annotations
 
+import itertools
 import math
 import numbers
 import struct
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 if TYPE_CHECKING:
@@ -113,6 +115,22 @@ class BalancerObs:
 Observation = BalancerObs  # permanent alias for obs_v1 submissions
 
 
+def controller_obs(obs_arr: Sequence[float] | npt.NDArray[Any], t: float) -> BalancerObs:
+    """The observation a controller receives: the only way a harness builds it (contract §6).
+
+    The 10 features are quantized to float32 (what the env emits and the trajectory stores), then
+    widened exactly to Python floats; ``t`` is kept as given. ``to_wire`` carries these exact
+    values, so in-process and out-of-process controllers see identical bits.
+    """
+    import numpy as np
+
+    with np.errstate(over="ignore"):  # a float64 beyond float32 range becomes inf, as in the env
+        arr = np.asarray(obs_arr, dtype=np.float32)
+    if arr.shape != (len(FEATURES),):
+        raise ValueError(f"expected {len(FEATURES)} features of shape (10,), got shape {arr.shape}")
+    return BalancerObs.from_array(arr, t)
+
+
 class ActionError(ValueError):
     """The controller returned something that is not a valid action."""
 
@@ -133,35 +151,63 @@ BALANCE_V1_ACTION = ActionSpec(id="diffdrive.effort.v1", names=("left", "right")
 
 
 def validate_action(action: object, dim: int) -> tuple[float, ...]:
-    """Return the action as a tuple of finite floats, or raise ``ActionError``.
+    """Return the action as a tuple of ``dim`` finite floats, or raise ``ActionError``.
 
-    Accepts a list, tuple or 1-D numpy array of real numbers. Rejects bools, strings, complex
-    numbers, NaN/inf and the wrong length. Does not clip.
+    Accepts any ordered, re-iterable container of real numbers: list, tuple, 1-D numpy array,
+    ``range``, ``array.array``, ``memoryview``. Rejects strings and bytes, mappings, sets,
+    one-shot iterators and generators (never advanced, so their code never runs), bools, complex
+    numbers, values that do not fit a float (huge ints), NaN/inf and the wrong length. At most
+    ``dim + 1`` items are read, so an endless container cannot hang the harness. Any ``Exception``
+    raised by the object while it is inspected, iterated or converted becomes ``ActionError``;
+    ``BaseException``s that are not ``Exception`` (``KeyboardInterrupt``, ``SystemExit``)
+    propagate. Does not clip.
     """
-    if isinstance(action, (str, bytes, Mapping)) or action is None:
+    try:
+        return _read_action(action, dim)
+    except ActionError:
+        raise
+    except Exception as exc:
+        raise ActionError(f"action could not be read: {type(exc).__name__}") from exc
+
+
+def _read_action(action: object, dim: int) -> tuple[float, ...]:
+    if isinstance(action, (str, bytes, bytearray, Mapping, Set)) or action is None:
         raise ActionError(
             f"action must be a sequence of {dim} numbers, got {type(action).__name__}"
+        )
+    if isinstance(action, Iterator):
+        raise ActionError(
+            f"action must be a sequence of {dim} numbers, not a one-shot generator or iterator"
         )
     ndim = getattr(action, "ndim", None)
     if ndim is not None and ndim != 1:
         raise ActionError(f"action must be 1-dimensional, got ndim={ndim}")
-    try:
-        items = list(action)  # type: ignore[call-overload]
-    except TypeError as exc:
-        raise ActionError(f"action must be a sequence of {dim} numbers") from exc
+    if not isinstance(action, Iterable):
+        raise ActionError(
+            f"action must be a sequence of {dim} numbers, got {type(action).__name__}"
+        )
+    items = list(itertools.islice(action, dim + 1))
+    if len(items) > dim:
+        raise ActionError(f"action must have exactly {dim} values, got more than {dim}")
     if len(items) != dim:
         raise ActionError(f"action must have exactly {dim} values, got {len(items)}")
-    values = []
-    for i, item in enumerate(items):
-        if isinstance(item, bool) or type(item).__name__ == "bool_":
-            raise ActionError(f"action[{i}] is a bool, expected a number")
-        if not isinstance(item, numbers.Real):
-            raise ActionError(f"action[{i}] must be a real number, got {type(item).__name__}")
+    return tuple(_action_value(i, item) for i, item in enumerate(items))
+
+
+def _action_value(index: int, item: object) -> float:
+    if isinstance(item, bool) or type(item).__name__ == "bool_":
+        raise ActionError(f"action[{index}] is a bool, expected a number")
+    if not isinstance(item, numbers.Real):
+        raise ActionError(f"action[{index}] must be a real number, got {type(item).__name__}")
+    try:
         value = float(item)
-        if not math.isfinite(value):
-            raise ActionError(f"action[{i}] is not finite: {value}")
-        values.append(value)
-    return tuple(values)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ActionError(
+            f"action[{index}] cannot be converted to a float: {type(exc).__name__}"
+        ) from exc
+    if not math.isfinite(value):
+        raise ActionError(f"action[{index}] is not finite: {value}")
+    return value
 
 
 def clip_action(
@@ -181,7 +227,12 @@ class RobotGeometry:
 
 @dataclass(frozen=True, slots=True)
 class TaskSpec:
-    """Everything a controller may know about its task, handed to ``make_controller``."""
+    """Everything a controller may know about its task, handed to ``make_controller``.
+
+    Immutable all the way down: ``extras`` is a read-only copy (str -> float), so a controller
+    cannot change the spec another episode receives. Specs are hashable, compare by value and
+    pickle (vectorized training ships them between processes).
+    """
 
     challenge: str
     obs_schema: str
@@ -193,12 +244,45 @@ class TaskSpec:
     extras: Mapping[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "extras", _frozen_extras(self.extras))
+        if not (math.isfinite(self.control_dt) and self.control_dt > 0):
+            raise ValueError(f"control_dt must be positive and finite, got {self.control_dt}")
         steps = self.episode_seconds / self.control_dt
-        if abs(steps - round(steps)) > 1e-9 or round(steps) < 1:
+        if not math.isfinite(steps) or abs(steps - round(steps)) > 1e-9 or round(steps) < 1:
             raise ValueError(
                 f"episode_seconds ({self.episode_seconds}) must be a positive multiple of "
                 f"control_dt ({self.control_dt})"
             )
+
+    def __hash__(self) -> int:
+        return hash(
+            (
+                self.challenge,
+                self.obs_schema,
+                self.obs_features,
+                self.action,
+                self.control_dt,
+                self.episode_seconds,
+                self.robot,
+                tuple(sorted(self.extras.items())),
+            )
+        )
+
+    def __reduce__(self) -> tuple[type[TaskSpec], tuple[Any, ...]]:
+        """Pickle/copy support: a mappingproxy cannot be pickled, so rebuild from a plain dict."""
+        return (
+            TaskSpec,
+            (
+                self.challenge,
+                self.obs_schema,
+                self.obs_features,
+                self.action,
+                self.control_dt,
+                self.episode_seconds,
+                self.robot,
+                dict(self.extras),
+            ),
+        )
 
     @property
     def max_steps(self) -> int:
@@ -242,6 +326,21 @@ class TaskSpec:
             robot=RobotGeometry(**data["robot"]),
             extras=dict(data.get("extras", {})),
         )
+
+
+def _frozen_extras(extras: object) -> Mapping[str, float]:
+    """Read-only copy of ``extras`` with str keys and finite float values."""
+    if not isinstance(extras, Mapping):
+        raise TypeError(f"extras must be a mapping of str to numbers, got {type(extras).__name__}")
+    values: dict[str, float] = {}
+    for key, raw in extras.items():
+        if not isinstance(key, str):
+            raise TypeError(f"extras keys must be str, got {type(key).__name__}")
+        value = _as_float(f"extras[{key!r}]", raw)
+        if not math.isfinite(value):
+            raise ValueError(f"extras[{key!r}] must be finite, got {value}")
+        values[key] = value
+    return MappingProxyType(values)
 
 
 ObsT_contra = TypeVar("ObsT_contra", contravariant=True)

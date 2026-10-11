@@ -11,6 +11,7 @@ from topple.robot import (
     build_model,
     challenge_dir,
     load_params,
+    referenced_files,
     robot_hash,
     validate_robot,
 )
@@ -229,3 +230,230 @@ def test_robot_hash_changes_with_params(params: RobotParams) -> None:
     assert h1 != h2
     assert h1 == robot_hash(ROBOT_XML, params)
     assert len(h1) == 64
+
+
+BALANCE_V1_ROBOT_HASH = "03f5654f03eff5be5cb7689b3b06356f42c8c4a1b3ed60795d7e8501a767ca59"
+LEFT_BODY = '<body name="left_wheel_body" pos="0 0.07 0">'
+RIGHT_BODY = '<body name="right_wheel_body" pos="0 -0.07 0">'
+LEFT_JOINT = '<joint name="left_wheel" type="hinge" axis="0 1 0"/>'
+LEFT_TIRE = '<geom name="left_tire" type="cylinder"'
+WORLD_END = "  </worldbody>"
+
+
+def model_from(params: RobotParams, tmp_path: Path, *edits: tuple[str, str]) -> mujoco.MjModel:
+    xml = ROBOT_XML.read_text()
+    for old, new in edits:
+        assert old in xml, old
+        xml = xml.replace(old, new, 1)
+    path = tmp_path / "variant.xml"
+    path.write_text(xml)
+    return build_model(path, SCENE_XML, params)
+
+
+VIOLATIONS = {
+    "wheels on the wrong sides": (
+        [
+            (LEFT_BODY, '<body name="left_wheel_body" pos="0 -0.07 0">'),
+            (RIGHT_BODY, '<body name="right_wheel_body" pos="0 0.07 0">'),
+        ],
+        "y > 0",
+    ),
+    "limited wheel joint": (
+        [(LEFT_JOINT, LEFT_JOINT.replace("/>", ' range="-1 1"/>'))],
+        "unlimited",
+    ),
+    "second collision geom on a wheel": (
+        [(LEFT_JOINT, LEFT_JOINT + '<geom type="sphere" size="0.01" pos="0 0 0.02"/>')],
+        "exactly one collision geom",
+    ),
+    "box tire": (
+        [
+            (
+                LEFT_TIRE + ' size="0.034 0.013"',
+                '<geom name="left_tire" type="box" size="0.03 0.01 0.03"',
+            )
+        ],
+        "cylinder, sphere or capsule",
+    ),
+    "equality constraint": (
+        [("</worldbody>", '</worldbody><equality><weld body1="chassis"/></equality>')],
+        "equality",
+    ),
+    "extra world body": (
+        [
+            (
+                WORLD_END,
+                '<body name="ramp" pos="1 0 0"><geom type="box" size="0.1 0.1 0.01"/></body>\n'
+                + WORLD_END,
+            )
+        ],
+        "world",
+    ),
+    "extra world geom": (
+        [
+            (
+                WORLD_END,
+                '<geom name="wall" type="box" size="0.1 0.1 0.1" pos="2 0 0"/>\n' + WORLD_END,
+            )
+        ],
+        "world",
+    ),
+    "root cannot fall": (
+        [('<freejoint name="root"/>', '<joint name="root" type="slide" axis="0 0 1"/>')],
+        "free joint",
+    ),
+    "gravity compensation": (
+        [
+            (
+                '<body name="chassis" pos="0 0 0.034">',
+                '<body name="chassis" pos="0 0 0.034" gravcomp="1">',
+            )
+        ],
+        "gravcomp",
+    ),
+}
+
+
+@pytest.mark.parametrize(("edits", "message"), VIOLATIONS.values(), ids=VIOLATIONS.keys())
+def test_validate_reports_each_violation(
+    params: RobotParams, tmp_path: Path, edits: list[tuple[str, str]], message: str
+) -> None:
+    problems = validate_robot(model_from(params, tmp_path, *edits))
+    assert any(message in p for p in problems), problems
+
+
+def test_visual_geoms_on_a_wheel_are_allowed_and_do_not_set_the_radius(
+    params: RobotParams, tmp_path: Path
+) -> None:
+    hubcap = '<geom type="sphere" size="0.05" contype="0" conaffinity="0" mass="0.001"/>'
+    m = model_from(params, tmp_path, (LEFT_JOINT, LEFT_JOINT + hubcap))
+    assert validate_robot(m) == []
+    b = bind_robot(m)
+    assert b.wheel_radius_m == pytest.approx(0.034)
+    assert set(b.wheel_geoms) == {m.geom("left_tire").id, m.geom("right_tire").id}
+
+
+def test_bind_robot_refuses_ambiguous_tires(params: RobotParams, tmp_path: Path) -> None:
+    m = model_from(params, tmp_path, (LEFT_JOINT, LEFT_JOINT + '<geom type="sphere" size="0.02"/>'))
+    with pytest.raises(ValueError, match="exactly one collision geom"):
+        bind_robot(m)
+
+
+# ------------------------------------------------------------------------------- robot_hash
+
+
+def test_balance_v1_robot_hash_is_unchanged(params: RobotParams) -> None:
+    """balance-v1 references no asset files, so covering them leaves its hash as it was."""
+    assert referenced_files(ROBOT_XML) == ()
+    assert robot_hash(ROBOT_XML, params) == BALANCE_V1_ROBOT_HASH
+
+
+MESH = "v 0 0 0\nv 0.01 0 0\nv 0 0.01 0\nv 0 0 0.01\nf 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n"
+
+
+def mesh_robot(tmp_path: Path, meshdir: str | None = "assets") -> Path:
+    compiler = '<compiler angle="radian" autolimits="true"/>'
+    new_compiler = (
+        compiler if meshdir is None else compiler.replace("/>", f' meshdir="{meshdir}"/>')
+    )
+    xml = (
+        ROBOT_XML.read_text()
+        .replace(compiler, new_compiler + '<asset><mesh name="logo" file="logo.obj"/></asset>')
+        .replace(
+            '<site name="imu"',
+            '<geom type="mesh" mesh="logo" contype="0" conaffinity="0" mass="0.001"/>'
+            '<site name="imu"',
+        )
+    )
+    path = tmp_path / "robot" / "bot.xml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(xml)
+    mesh_dir = path.parent / meshdir if meshdir else path.parent
+    mesh_dir.mkdir(parents=True, exist_ok=True)
+    (mesh_dir / "logo.obj").write_text(MESH)
+    return path
+
+
+@pytest.mark.parametrize("meshdir", ["assets", None])
+def test_robot_hash_covers_referenced_mesh_files(
+    params: RobotParams, tmp_path: Path, meshdir: str | None
+) -> None:
+    path = mesh_robot(tmp_path, meshdir)
+    mesh = path.parent / (meshdir or ".") / "logo.obj"
+    assert referenced_files(path) == (mesh.resolve(),)
+    build_model(path, SCENE_XML, params)  # MuJoCo resolves the file the same way
+    before = robot_hash(path, params)
+    mesh.write_text(MESH.replace("0.01", "0.02"))
+    assert robot_hash(path, params) != before
+
+
+def test_robot_hash_covers_included_files(params: RobotParams, tmp_path: Path) -> None:
+    part = tmp_path / "part.xml"
+    part.write_text('<mujoco><default><geom rgba="1 0 0 1"/></default></mujoco>\n')
+    xml = ROBOT_XML.read_text().replace(
+        '<compiler angle="radian" autolimits="true"/>',
+        '<compiler angle="radian" autolimits="true"/><include file="part.xml"/>',
+    )
+    path = tmp_path / "bot.xml"
+    path.write_text(xml)
+    assert referenced_files(path) == (part.resolve(),)
+    before = robot_hash(path, params)
+    part.write_text(part.read_text().replace("1 0 0 1", "0 1 0 1"))
+    assert robot_hash(path, params) != before
+
+
+def test_robot_hash_refuses_missing_referenced_files(params: RobotParams, tmp_path: Path) -> None:
+    path = mesh_robot(tmp_path)
+    (path.parent / "assets" / "logo.obj").unlink()
+    with pytest.raises(FileNotFoundError, match=r"logo\.obj"):
+        robot_hash(path, params)
+
+
+def test_validate_reports_a_bare_robot_without_injected_parts() -> None:
+    """The raw MJCF, compiled alone, lacks everything build_model injects."""
+    problems = validate_robot(mujoco.MjModel.from_xml_path(str(ROBOT_XML)))
+    for message in (
+        "actuator 'left_motor' is missing",
+        "expected 2 actuators, got 0",
+        "sensor 'imu_gyro' is missing",
+        "sensor 'imu_accel' is missing",
+    ):
+        assert message in problems
+
+
+def test_validate_reports_a_missing_chassis() -> None:
+    model = mujoco.MjModel.from_xml_string(
+        '<mujoco><worldbody><body name="box"><freejoint/>'
+        '<geom type="box" size="0.1 0.1 0.1"/></body></worldbody></mujoco>'
+    )
+    assert validate_robot(model) == ["body 'chassis' is missing"]
+
+
+@pytest.mark.parametrize(
+    ("edits", "message"),
+    [
+        ([(LEFT_JOINT, '<joint name="left_wheel" type="slide" axis="0 1 0"/>')], "hinge"),
+        (
+            [
+                (LEFT_BODY, '<body name="hub" pos="0 0.07 0"><body name="left_wheel_body">'),
+                (
+                    '</body>\n      <body name="right_wheel_body"',
+                    '</body></body>\n      <body name="right_wheel_body"',
+                ),
+            ],
+            "direct child body",
+        ),
+        ([('<site name="imu"', '<site name="imu_board"')], "site 'imu' is missing"),
+    ],
+)
+def test_validate_reports_wheel_and_site_problems(
+    params: RobotParams, tmp_path: Path, edits: list[tuple[str, str]], message: str
+) -> None:
+    xml = ROBOT_XML.read_text()
+    for old, new in edits:
+        assert old in xml, old
+        xml = xml.replace(old, new, 1)
+    path = tmp_path / "variant.xml"
+    path.write_text(xml)
+    model = mujoco.MjModel.from_xml_path(str(path))  # raw: build_model would refuse some
+    assert any(message in p for p in validate_robot(model)), validate_robot(model)
