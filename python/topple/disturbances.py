@@ -148,12 +148,13 @@ class Scenario:
     init_pitch_rate_rads: float = 0.0  # nonzero only for injected states (fuzzer, RoA maps)
 
     def to_dict(self) -> dict[str, Any]:
+        """JSON data (a new dict: editing it never reaches this frozen scenario)."""
         return {
             "seed": self.seed,
             "preset": self.preset,
             "init_pitch_rad": self.init_pitch_rad,
             "init_pitch_rate_rads": self.init_pitch_rate_rads,
-            "pushes": [vars(p) for p in self.pushes],
+            "pushes": [dict(vars(p)) for p in self.pushes],  # vars() is the Push's own __dict__
             "model": {**vars(self.model), "motor_gain": list(self.model.motor_gain)},
             "sensors": {**vars(self.sensors), "gyro_bias_rads": list(self.sensors.gyro_bias_rads)},
         }
@@ -190,13 +191,14 @@ _MODEL_KEYS = frozenset(f.name for f in fields(ModelOverrides))
 _SENSOR_KEYS = frozenset(f.name for f in fields(SensorOffsets))
 
 
-def _mapping(name: str, value: object, keys: frozenset[str], optional: frozenset[str]) -> Any:
+def _mapping(name: str, value: object, keys: frozenset[str]) -> Any:
+    """``value`` if it is a mapping with exactly ``keys`` (all strings), else ``ValueError``."""
     if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be an object, got {type(value).__name__}")
     if not all(isinstance(key, str) for key in value):
         raise ValueError(f"{name}: keys must be strings")
     present = set(value)
-    missing = keys - optional - present
+    missing = keys - present
     unknown = present - keys
     if missing or unknown:
         raise ValueError(f"{name}: missing keys {sorted(missing)}, unknown keys {sorted(unknown)}")
@@ -230,7 +232,7 @@ def _reals(name: str, value: object, n: int) -> tuple[float, ...]:
 
 
 def _parse_push(i: int, data: object) -> Push:
-    d = _mapping(f"pushes[{i}]", data, _PUSH_KEYS, frozenset())
+    d = _mapping(f"pushes[{i}]", data, _PUSH_KEYS)
     return Push(
         start_step=_int(f"pushes[{i}].start_step", d["start_step"]),
         n_substeps=_int(f"pushes[{i}].n_substeps", d["n_substeps"]),
@@ -241,7 +243,7 @@ def _parse_push(i: int, data: object) -> Push:
 
 
 def _parse_model(data: object) -> ModelOverrides:
-    d = _mapping("model", data, _MODEL_KEYS, frozenset())
+    d = _mapping("model", data, _MODEL_KEYS)
     gain = _reals("model.motor_gain", d["motor_gain"], 2)
     return ModelOverrides(
         chassis_mass_scale=_real("model.chassis_mass_scale", d["chassis_mass_scale"]),
@@ -254,7 +256,7 @@ def _parse_model(data: object) -> ModelOverrides:
 
 
 def _parse_sensors(data: object) -> SensorOffsets:
-    d = _mapping("sensors", data, _SENSOR_KEYS, frozenset())
+    d = _mapping("sensors", data, _SENSOR_KEYS)
     bias = _reals("sensors.gyro_bias_rads", d["gyro_bias_rads"], 3)
     return SensorOffsets(
         imu_pitch_offset_rad=_real("sensors.imu_pitch_offset_rad", d["imu_pitch_offset_rad"]),
@@ -263,7 +265,7 @@ def _parse_sensors(data: object) -> SensorOffsets:
 
 
 def _parse_scenario(data: object) -> Scenario:
-    d = _mapping("scenario", data, _SCENARIO_KEYS, frozenset({"init_pitch_rate_rads"}))
+    d = _mapping("scenario", data, _SCENARIO_KEYS)
     pushes = d["pushes"]
     if isinstance(pushes, (str, bytes)) or not isinstance(pushes, Sequence):
         raise ValueError("pushes must be a list")
@@ -275,7 +277,7 @@ def _parse_scenario(data: object) -> Scenario:
         seed=seed,
         preset=preset,
         init_pitch_rad=_real("init_pitch_rad", d["init_pitch_rad"]),
-        init_pitch_rate_rads=_real("init_pitch_rate_rads", d.get("init_pitch_rate_rads", 0.0)),
+        init_pitch_rate_rads=_real("init_pitch_rate_rads", d["init_pitch_rate_rads"]),
         pushes=tuple(_parse_push(i, p) for i, p in enumerate(pushes)),
         model=_parse_model(d["model"]),
         sensors=_parse_sensors(d["sensors"]),

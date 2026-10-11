@@ -285,8 +285,9 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   expression, but its macOS arm64 and Linux x86_64 builds disagree in the last bit). Choices (push
   count, push sign, actuator delay) use `Generator.integers`, which only uses raw bits.
 - `Scenario.from_dict(data, *, clock=None)` validates what it reads, and `ValueError` rejects
-  anything else: exact key sets of string keys; numbers that fit a float (a huge JSON integer
-  does not) and are finite; integer `start_step`/`n_substeps`, exact in a float (|n| ≤ 2**53);
+  anything else: exact key sets of string keys (every key `to_dict` writes, none optional:
+  `init_pitch_rate_rads` included); numbers that fit a float (a huge JSON integer does not) and
+  are finite; integer `start_step`/`n_substeps`, exact in a float (|n| ≤ 2**53);
   pushes sorted by `start_step` with no two at the same step, `start_step ≥ 0`,
   `n_substeps ≥ 1`, `0 ≤ magnitude_n ≤ 50` N, `forward_sign = ±1`, `|lateral_ratio| ≤ 1`; scales
   in [0.5, 2] (frictionloss [0, 3]), `|com_x_offset_m| ≤ 0.02`, `0 ≤ actuator_delay_s ≤ 0.010`,

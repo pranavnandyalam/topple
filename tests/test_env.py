@@ -1248,6 +1248,20 @@ def test_trajectory_replays_open_loop_from_scenario_and_commands() -> None:
         assert_bitwise_equal(getattr(again, name), getattr(traj, name))
 
 
+def test_trajectory_meta_never_reaches_the_live_scenario() -> None:
+    """Editing a trajectory's meta.scenario (a viewer, a fuzzer building its next candidate)
+    must not change the pushes the env is still running."""
+    env = BalanceEnv("standard", record=True)
+    rollout(env, seed=9, max_steps=50)
+    pushes = env.scenario.pushes
+    expected = [vars(p).copy() for p in pushes]
+    meta = env.trajectory().meta["scenario"]
+    for push in meta["pushes"]:
+        push["magnitude_n"] = 0.0
+    assert [vars(p) for p in env.scenario.pushes] == expected
+    assert [vars(p) for p in env._pushes_by_step.values()] == expected
+
+
 def test_trajectory_needs_record_and_an_episode() -> None:
     plain = BalanceEnv("ideal")
     plain.reset(seed=0)

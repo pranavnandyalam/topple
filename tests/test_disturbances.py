@@ -59,6 +59,31 @@ def test_json_round_trip() -> None:
     assert Scenario.from_dict(json.loads(text)) == s
 
 
+def test_to_dict_hands_out_copies() -> None:
+    """A Scenario is frozen: editing the dict it returns (trajectories embed one as
+    meta.scenario) must never reach the scenario, its pushes included."""
+    s = scenario(5)
+    assert s.pushes
+    before = copy.deepcopy(s)
+    data = s.to_dict()
+    data["pushes"][0]["magnitude_n"] = 49.0
+    data["pushes"][0]["start_step"] = 0
+    data["model"]["chassis_mass_scale"] = 1.9
+    data["model"]["motor_gain"][0] = 1.9
+    data["sensors"]["gyro_bias_rads"][0] = 0.09
+    assert s == before
+    assert s.to_dict() == before.to_dict() != data
+
+
+def test_every_key_is_required() -> None:
+    """Exact key sets (contract §9): to_dict always writes init_pitch_rate_rads, so a scenario
+    without it is not one this code wrote."""
+    data = scenario(5).to_dict()
+    del data["init_pitch_rate_rads"]
+    with pytest.raises(ValueError, match=r"missing keys \['init_pitch_rate_rads'\]"):
+        Scenario.from_dict(data)
+
+
 def test_ideal_has_nominal_model_and_no_pushes() -> None:
     s = scenario(3, "ideal")
     assert s.pushes == ()
@@ -224,6 +249,7 @@ BAD_SCENARIOS: dict[str, Callable[[dict[str, Any]], None]] = {
     "seed unhashable": setter("seed", value=[1]),
     "unknown top-level key": setter("surprise", value=1),
     "missing model": deleter("model"),
+    "missing pitch rate": deleter("init_pitch_rate_rads"),
     "pushes not a list": setter("pushes", value={"0": 1}),
     "pushes unsorted": swap_pushes,
     "pushes share a step": duplicate_push,
