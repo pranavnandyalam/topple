@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -652,6 +653,37 @@ def test_episode_index_must_be_an_int_not_an_equal_float_or_bool(
     assert not verdict.ok
     assert verdict.code == "not_reproducible"
     assert verdict.reason == f"meta.episode_index is {forged!r}, expected {index}"
+    assert (verdict.result.score, verdict.result.success) == (0.0, False)
+
+
+SCENARIO_RETYPES: dict[str, Callable[[dict[str, Any]], None]] = {
+    "seed as a float": lambda sc: sc.update(seed=float(sc["seed"])),
+    "n_substeps as a float": lambda sc: sc["pushes"][0].update(
+        n_substeps=float(sc["pushes"][0]["n_substeps"])
+    ),
+    "forward_sign as an int": lambda sc: sc["pushes"][0].update(
+        forward_sign=int(sc["pushes"][0]["forward_sign"])
+    ),
+    "pitch rate 0.0 as false": lambda sc: sc.update(init_pitch_rate_rads=False),
+}
+"""Edits Python's ``==`` cannot see: the same numbers, retyped."""
+
+
+@pytest.mark.parametrize("retype", SCENARIO_RETYPES.values(), ids=SCENARIO_RETYPES.keys())
+def test_a_retyped_scenario_value_is_a_different_scenario(
+    honest_runs: dict[str, Honest], retype: Callable[[dict[str, Any]], None]
+) -> None:
+    """§16 step 2 compares scenarios as canonical JSON, so ``1000`` and ``1000.0``, ``-1.0``
+    and ``-1``, ``0.0`` and ``false`` all differ, although a plain ``==`` calls them equal."""
+    run = honest_runs["pid"]
+    upload = run.uploads[0]
+    scenario = copy.deepcopy(upload.meta["scenario"])
+    retype(scenario)
+    assert scenario == upload.meta["scenario"]
+    verdict = verify_episode(with_meta(upload, scenario=scenario), run.protocol, 0)
+    assert not verdict.ok
+    assert verdict.code == "not_reproducible"
+    assert verdict.reason == "meta.scenario differs from the scenario of the protocol seed"
     assert (verdict.result.score, verdict.result.success) == (0.0, False)
 
 

@@ -33,9 +33,16 @@ from topple.disturbances import (
     push_force_world,
 )
 from topple.envs import BALANCE_V1, BalanceEnv, RewardConfig
-from topple.estimation import encoder_counts, odometry_yaw, wheel_angle_from_counts, wrap_angle
-from topple.rng import MAX_SEED
+from topple.estimation import (
+    encoder_counts,
+    imu_reading,
+    odometry_yaw,
+    wheel_angle_from_counts,
+    wrap_angle,
+)
+from topple.rng import MAX_SEED, Stream, stream_rng
 from topple.robot import challenge_dir, robot_hash
+from topple.scoring import episode_metrics
 from topple.traj import load_npz
 
 Obs = npt.NDArray[np.float32]
@@ -854,6 +861,61 @@ def test_ideal_preset_records_noiseless_imu_rows_every_step() -> None:
     assert len({tuple(row) for row in traj.gyro.tolist()}) == 50  # not a constant row
 
 
+def test_recorded_imu_rows_are_the_last_substeps_board_readings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§14: gyro and accel rows are the last substep's IMU readings after the mounting rotation,
+    bias, noise and full-scale clamp of §5, recomputed here from MuJoCo's sensordata and the
+    SENSOR stream (§9). A 50 N shove drives the accelerometer past full scale, so the clamp is
+    exercised, and the fall that follows ends a step early (its last substep is not the 5th)."""
+    seed, shove = 3, Push(20, 10, 50.0, forward_sign=1.0, lateral_ratio=0.0)
+    env = BalanceEnv("clean", record=True)
+    b, s, frame_skip = env.binding, env.params.sensing, env.frame_skip
+    obs, info = env.reset(seed=seed, options={"pushes": [shove]})
+    sensed: list[npt.NDArray[np.float64]] = []
+    real_step = mujoco.mj_step
+
+    def spy(m: mujoco.MjModel, d: mujoco.MjData) -> None:
+        real_step(m, d)
+        sensed.append(d.sensordata.copy())
+
+    monkeypatch.setattr(mujoco, "mj_step", spy)
+    ends: list[int] = []  # how many substeps had run when each control step returned
+    terminated = False
+    while not terminated and len(ends) < 100:
+        obs, _, terminated, _, info = env.step(pid(obs, info))
+        ends.append(len(sensed))
+    assert terminated
+    assert ends[-1] % frame_skip != 0  # the fall cut the last step short
+
+    sc = env.scenario.sensors
+    rng = stream_rng(seed, Stream.SENSOR)
+    scale = np.array([s.gyro_noise_rads] * 3 + [s.accel_noise_ms2] * 3)
+    rng.standard_normal((frame_skip, 6))  # the extra block drawn at reset
+    expected: list[tuple[tuple[float, ...], tuple[float, ...]]] = []
+    for start, end in zip([0, *ends[:-1]], ends, strict=True):
+        noise = rng.standard_normal((frame_skip, 6)) * scale  # one block per step, always
+        row, last = noise[end - start - 1], sensed[end - 1]
+        expected.append(
+            imu_reading(
+                gyro_true=tuple(float(v) for v in last[b.gyro_adr : b.gyro_adr + 3]),
+                accel_true=tuple(float(v) for v in last[b.accel_adr : b.accel_adr + 3]),
+                mount_pitch_rad=sc.imu_pitch_offset_rad,
+                gyro_bias=sc.gyro_bias_rads,
+                gyro_noise=(float(row[0]), float(row[1]), float(row[2])),
+                accel_noise=(float(row[3]), float(row[4]), float(row[5])),
+                gyro_range=s.gyro_range_rads,
+                accel_range=s.accel_range_ms2,
+            )
+        )
+    traj = env.trajectory()
+    assert_bitwise_equal(traj.gyro, np.array([g for g, _ in expected], dtype=np.float32))
+    assert_bitwise_equal(traj.accel, np.array([a for _, a in expected], dtype=np.float32))
+    assert np.abs(traj.accel).max() == np.float32(s.accel_range_ms2)
+    true_accel = [sensed[end - 1][b.accel_adr : b.accel_adr + 3] for end in ends]
+    assert not np.isin(traj.accel, np.array(true_accel, dtype=np.float32)).any()
+
+
 def test_encoders_quantize_and_differentiate_wheel_angles() -> None:
     env = BalanceEnv("clean")
     b, cpr = env.binding, env.params.sensing.encoder_cpr
@@ -1318,6 +1380,7 @@ def test_energy_follows_the_battery_formula() -> None:
     expected = math.fsum(np.maximum(power, 0.0).ravel()) * env.control_dt
     energies = [info["energy_j"] for info in ep.infos]
     assert energies[-1] == pytest.approx(expected, rel=1e-9)
+    assert episode_metrics(traj, motor).energy_j == pytest.approx(expected, rel=1e-9)
     assert energies == sorted(energies)
     assert energies[-1] > 0.5
 

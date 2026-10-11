@@ -77,6 +77,16 @@ def test_survival_gates_secondary_terms() -> None:
     assert not episode_success(m, CFG)
 
 
+def test_a_timeout_before_max_steps_is_not_survival() -> None:
+    """The env records a controller error as reason "timeout" at the step it happened
+    (contract §14), so only ``T == max_steps`` tells survival from an error at step 400."""
+    m = episode_metrics(synthetic(400, max_steps=1000, termination="timeout"), MOTOR)
+    assert m.termination == "timeout"
+    assert not m.survived
+    assert not episode_success(m, CFG)
+    assert episode_metrics(synthetic(1000, max_steps=1000), MOTOR).survived
+
+
 def test_tilt_term() -> None:
     m = episode_metrics(synthetic(10, pitch=0.1), MOTOR)
     assert m.rms_tilt_rad == pytest.approx(0.1)
@@ -112,6 +122,25 @@ def test_energy_formula_matches_hand_calculation() -> None:
         2 * 10 * 7.4 * 1.5 * (-0.5) * (-0.5 - 20 / 30) * 0.01
     )
     assert battery_energy_j(np.full((10, 2), 0.5), spinning, 0.01, motor) == 0.0
+
+
+def test_episode_energy_counts_the_wheels_motion() -> None:
+    """episode_metrics feeds the recorded wheel angles into the formula: at u = 0.5 a wheel
+    turning at 10 rad/s draws (0.5 - 10/30)/0.5 of its stall power, at 20 rad/s none."""
+    p = MOTOR.v_nom * MOTOR.stall_current_a
+    turning = episode_metrics(synthetic(10, ctrl=0.5, wheel_rate=10.0), MOTOR)
+    assert turning.energy_j == pytest.approx(2 * 10 * p * 0.5 * (0.5 - 10 / 30) * 0.01, rel=1e-12)
+    assert episode_metrics(synthetic(10, ctrl=0.5, wheel_rate=20.0), MOTOR).energy_j == 0.0
+    stalled = episode_metrics(synthetic(10, ctrl=0.5), MOTOR)
+    assert stalled.energy_j == pytest.approx(2 * 10 * p * 0.25 * 0.01, rel=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("ctrl", "fraction"), [(0.99, 1.0), (-0.99, 1.0), (0.9899, 0.0), (-0.9899, 0.0)]
+)
+def test_saturation_starts_at_0_99(ctrl: float, fraction: float) -> None:
+    """§12: a step is saturated when any |u| >= 0.99 after clipping, the boundary included."""
+    assert episode_metrics(synthetic(10, ctrl=ctrl), MOTOR).saturation_fraction == fraction
 
 
 def test_energy_cap_blocks_success() -> None:

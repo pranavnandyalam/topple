@@ -6,9 +6,11 @@
 - `topple run` writes results.json, traj.npz and an MP4
 """
 
+import math
 from dataclasses import replace
 from pathlib import Path
 
+import imageio_ffmpeg
 import numpy as np
 import pytest
 from gymnasium.utils.env_checker import check_env
@@ -20,6 +22,7 @@ from topple.controllers.pid import PIDController
 from topple.envs.balance import BalanceEnv
 from topple.evaluate import EvalProtocol, evaluate
 from topple.results import ControllerInfo
+from topple.traj import load_npz
 
 INFO = ControllerInfo(id="pid", sha256="0" * 64)
 
@@ -64,3 +67,7 @@ def test_topple_run_writes_mp4(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     for name in ("results.json", "traj_000.npz", "episode.mp4"):
         assert (out / name).stat().st_size > 0, name
+    traj = load_npz(out / "traj_000.npz", max_steps=1000)
+    assert traj.epilogue_qpos.shape[0] == 0  # the PID survives the first public seed
+    frames = math.ceil(traj.qpos.shape[0] / 2)  # every recorded row at 50 fps: 501
+    assert imageio_ffmpeg.count_frames_and_secs(str(out / "episode.mp4"))[0] == frames

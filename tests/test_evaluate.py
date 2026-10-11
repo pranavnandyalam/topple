@@ -212,6 +212,35 @@ def test_controller_errors_are_recorded_not_raised(payload: Any, code: str) -> N
     assert run.trajectory.steps == 5
 
 
+class FailsLate:
+    """Balances with the PID, then raises at step ``at``."""
+
+    def __init__(self, at: int) -> None:
+        self.at, self.pid, self.k = at, PIDController(), 0
+
+    def reset(self, rng_seed: int) -> None:
+        self.pid.reset(rng_seed)
+
+    def act(self, obs: BalancerObs) -> tuple[float, float]:
+        if self.k == self.at:
+            raise RuntimeError("late failure")
+        self.k += 1
+        return self.pid.act(obs)
+
+
+def test_an_errored_episode_did_not_survive() -> None:
+    """The trajectory stops at the error with reason "timeout" (§14), so ``survived`` hinges on
+    ``T == max_steps``: an episode that raised at step 400 must never report survival."""
+    env = BalanceEnv("ideal", record=True)
+    run = run_episode(env, lambda spec: FailsLate(400), seed=0, index=0)
+    assert run.result.error is not None
+    assert (run.result.error.code, run.result.error.step) == ("exception", 400)
+    assert run.trajectory.meta["termination"] == {"step": 400, "reason": "timeout"}
+    assert run.result.metrics is not None
+    assert run.result.metrics["survived"] is False
+    assert (run.result.score, run.result.success) == (0.0, False)
+
+
 def test_factory_errors_are_recorded() -> None:
     def bad_factory(spec: TaskSpec) -> Zero:
         raise ImportError("missing dependency")

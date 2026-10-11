@@ -1,16 +1,21 @@
 import json
+import math
 import re
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import imageio.v3 as iio
 import mujoco
 import pytest
 from typer.testing import CliRunner
 
+import topple.cli as cli_module
+import topple.video
 from topple import __version__
 from topple.cli import app
+from topple.traj import load_npz
 
 runner = CliRunner()
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -120,6 +125,114 @@ def test_eval_alias_protocol_all_seeds(tmp_path: Path) -> None:
     assert len(list(out.glob("traj_*.npz"))) == 20
     assert "balance-v1/clean: score" in result.output
     assert json.loads((out / "results.json").read_text())["complete"] is True
+
+
+ZERO_SUBMISSION = """
+class Zero:
+    def reset(self, rng_seed):
+        pass
+
+    def act(self, obs):
+        return (0.0, 0.0)
+
+
+def make_controller(spec):
+    return Zero()
+"""
+
+
+def _eval_zero(tmp_path: Path, *args: str) -> tuple[Any, Path, list[dict[str, Any]]]:
+    """`topple eval` of a zero-torque bot on balance-v1/clean: every episode falls within a
+    second, so the whole protocol is cheap."""
+    out = tmp_path / "eval"
+    bot = _submission(tmp_path, ZERO_SUBMISSION)
+    result = runner.invoke(
+        app, ["eval", str(bot), "--protocol", "balance-v1/clean", "--out", str(out), *args]
+    )
+    assert result.exit_code == 0, result.output
+    episodes: list[dict[str, Any]] = json.loads((out / "results.json").read_text())["episodes"]
+    return result, out, episodes
+
+
+def _worst(episodes: list[dict[str, Any]]) -> int:
+    worst: int = min(episodes, key=lambda e: (e["score"], e["index"]))["index"]
+    return worst
+
+
+@pytest.mark.parametrize("videos", ["worst", "first", "all", "none", None])
+def test_eval_renders_the_episodes_it_is_asked_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, videos: str | None
+) -> None:
+    """`--videos worst` (the default) renders the lowest-scoring episode (ties: the lowest
+    index), `first` episode 0, `all` every episode in order and `none` nothing, each from its
+    own traj_<index>.npz to episode_<index>."""
+    rendered: list[tuple[str, str, str]] = []
+
+    def spy(traj_path: Path, out: Path, fmt: Any, protocol: Any) -> None:
+        rendered.append((traj_path.name, out.name, fmt.value))
+
+    monkeypatch.setattr(cli_module, "_render", spy)
+    _, _, episodes = _eval_zero(tmp_path, *([] if videos is None else ["--videos", videos]))
+    worst = _worst(episodes)
+    best = max(episodes, key=lambda e: e["score"])["index"]
+    assert worst not in (0, best)  # worst, first and best are three different episodes here
+    chosen = {
+        "worst": [worst],
+        None: [worst],
+        "first": [0],
+        "all": [e["index"] for e in episodes],
+        "none": [],
+    }[videos]
+    assert rendered == [(f"traj_{i:03d}.npz", f"episode_{i:03d}", "mp4") for i in chosen]
+
+
+@pytest.mark.render
+def test_eval_renders_the_worst_episode_as_a_gif(tmp_path: Path) -> None:
+    """The PR-comment path (Phase 3): one GIF, the worst episode's, showing every recorded row
+    at 50 fps plus the second after the fall."""
+    _, out, episodes = _eval_zero(tmp_path, "--video-format", "gif")
+    worst = _worst(episodes)
+    path = out / f"episode_{worst:03d}.gif"
+    assert sorted(p.name for p in out.glob("episode_*")) == [path.name]
+    traj = load_npz(out / f"traj_{worst:03d}.npz", max_steps=1000)
+    assert traj.epilogue_qpos.shape[0] == 100
+    frames = math.ceil((traj.qpos.shape[0] + traj.epilogue_qpos.shape[0]) / 2)
+    stored = iio.improps(path, index=None).n_images
+    durations = [iio.immeta(path, index=i)["duration"] for i in range(stored)]
+    assert sum(durations) == frames * 20  # Pillow merges identical frames: count frame time
+
+
+def test_a_video_that_cannot_be_made_is_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The results are already written when a video fails: a ValueError, OSError or missing GL
+    backend becomes one escaped warning line and the run still exits 0."""
+
+    def broken(traj: Any, path: Path, **kwargs: Any) -> int:
+        raise ValueError("no \x1b[31mframes")
+
+    monkeypatch.setattr(topple.video, "render_trajectory", broken)
+    result, out, episodes = _eval_zero(tmp_path)
+    assert "warning: video skipped: no \\x1b[31mframes" in result.output
+    assert len(episodes) == 20
+    assert not list(out.glob("episode_*"))
+
+
+def test_an_unexpected_render_failure_is_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the expected failures become warnings: a bug in the renderer must fail the run."""
+
+    def broken(traj: Any, path: Path, **kwargs: Any) -> int:
+        raise RuntimeError("renderer bug")
+
+    monkeypatch.setattr(topple.video, "render_trajectory", broken)
+    bot = _submission(tmp_path, ZERO_SUBMISSION)
+    result = runner.invoke(
+        app, ["eval", str(bot), "--protocol", "balance-v1/clean", "--out", str(tmp_path / "e")]
+    )
+    assert result.exit_code != 0
+    assert isinstance(result.exception, RuntimeError)
 
 
 def test_verify_and_score_commands(tmp_path: Path) -> None:
