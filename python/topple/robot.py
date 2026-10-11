@@ -51,6 +51,8 @@ TIRE_CENTRE_TOLERANCE_M = 1e-6  # how far a tire's centre may sit from its hinge
 _FILE_ATTRS = ("file", "fileright", "fileleft", "fileup", "filedown", "filefront", "fileback")
 _MESH_DIR_TAGS = frozenset({"mesh", "skin", "hfield"})  # MuJoCo resolves these via meshdir
 _SUBMODEL_TAG = "model"  # <asset><model file="..."/>: a whole MJCF that <attach> places
+# Text files: hashed with CRLF -> LF, so a checkout's line endings never change a hash (§3, §13).
+TEXT_SUFFIXES = frozenset({".xml", ".yaml", ".yml"})
 
 
 class _Frozen(BaseModel):
@@ -187,15 +189,23 @@ def _framed(data: bytes) -> bytes:
     return len(data).to_bytes(8, "big") + data
 
 
+def hashed_bytes(path: Path) -> bytes:
+    """A file's bytes as the robot and bundle hashes take them: CRLF -> LF in text files
+    (``TEXT_SUFFIXES``), so a Windows checkout (``core.autocrlf``) hashes like any other."""
+    data = path.read_bytes()
+    return data.replace(b"\r\n", b"\n") if path.suffix in TEXT_SUFFIXES else data
+
+
 def robot_hash(robot_xml: Path, params: RobotParams) -> str:
     """sha256 of the robot MJCF, its params and every file the MJCF references.
 
     Referenced files are appended as length-framed (POSIX path relative to the MJCF's directory,
     bytes) records in POSIX-path string order (``a-c.obj`` before ``a/b.obj``), so a robot without
-    asset files hashes exactly as before they were covered.
+    asset files hashes exactly as before they were covered. Text files are read through
+    ``hashed_bytes``.
     """
     digest = hashlib.sha256()
-    digest.update(robot_xml.read_bytes())
+    digest.update(hashed_bytes(robot_xml))
     digest.update(json.dumps(params.model_dump(), sort_keys=True).encode())
     base = robot_xml.parent.resolve()
     records = sorted(
@@ -203,7 +213,7 @@ def robot_hash(robot_xml: Path, params: RobotParams) -> str:
     )
     for rel, path in records:  # POSIX-path string order, as in the bundle hash (contract §3)
         digest.update(_framed(rel.encode("utf-8")))
-        digest.update(_framed(path.read_bytes()))
+        digest.update(_framed(hashed_bytes(path)))
     return digest.hexdigest()
 
 

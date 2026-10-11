@@ -10,7 +10,7 @@ import pytest
 import topple.challenge as challenge_module
 from topple.challenge import ENV_ALGO_VERSION, Challenge, load_challenge, load_challenge_dir
 from topple.disturbances import PRESETS
-from topple.robot import challenge_dir
+from topple.robot import challenge_dir, robot_hash
 
 BUNDLE_FILES = ("challenge.yaml", "robot/balancer.xml", "robot/params.yaml", "scene.xml")
 
@@ -69,6 +69,31 @@ def test_bundle_hash_normalizes_line_endings(bundle: Path) -> None:
     for rel in BUNDLE_FILES:
         path = bundle / rel
         path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    assert load_challenge_dir(bundle).bundle_hash() == before
+
+
+def test_a_crlf_checkout_has_the_same_hashes_everywhere(bundle: Path) -> None:
+    """A Windows checkout (``core.autocrlf``) gets CRLF XML and YAML. It is the same challenge
+    and the same robot, so the bundle, protocol and robot hashes must all be unchanged: a
+    trajectory recorded there must not carry a foreign ``robot_hash``."""
+    stock = load_challenge("balance-v1")
+    for rel in BUNDLE_FILES:
+        path = bundle / rel
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+    crlf = load_challenge_dir(bundle)
+    assert crlf.bundle_hash() == stock.bundle_hash()
+    assert crlf.protocol_hash("standard") == stock.protocol_hash("standard")
+    assert robot_hash(crlf.robot_xml, crlf.params) == robot_hash(stock.robot_xml, stock.params)
+
+
+def test_yml_files_are_text_too(bundle: Path) -> None:
+    """Contract §13: CRLF -> LF in ``.xml``, ``.yaml`` and ``.yml`` files."""
+    (bundle / "robot" / "params.yaml").rename(bundle / "robot" / "params.yml")
+    yaml_path = bundle / "challenge.yaml"
+    yaml_path.write_text(yaml_path.read_text().replace("params.yaml", "params.yml"))
+    before = load_challenge_dir(bundle).bundle_hash()
+    params = bundle / "robot" / "params.yml"
+    params.write_bytes(params.read_bytes().replace(b"\n", b"\r\n"))
     assert load_challenge_dir(bundle).bundle_hash() == before
 
 

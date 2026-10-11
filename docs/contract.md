@@ -97,7 +97,9 @@ references, recursively, resolved as MuJoCo does against the sub-model's own dir
 `<compiler>`), a record `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths, POSIX path
 relative to the MJCF's directory) in POSIX-path string order (`a-c.obj` before `a/b.obj`). A
 referenced file that does not exist is an error. A robot without asset files (balance-v1) hashes
-the MJCF and params only.
+the MJCF and params only. Text files (`.xml`, `.yaml`, `.yml`: the MJCF and any it includes) are
+hashed with CRLF → LF, exactly as in `bundle_hash` (§13), so a checkout's line endings (Git's
+`core.autocrlf` on Windows) never change a robot's hash; other files count byte for byte.
 
 The scene (`scene.xml`) owns physics options: `timestep=0.002`, `integrator=implicitfast`,
 `<flag autoreset="disable"/>`, a floor plane and lights. The robot is attached with prefix `""`.
@@ -404,10 +406,10 @@ a change cannot land unnoticed.
 
 - `bundle_hash()` = sha256 of the tag `topple.bundle/1\n`, then, for each bundle file in POSIX-path
   order, `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths, path relative to the bundle
-  root, CRLF → LF in `.xml`/`.yaml` files). The bundle files are exactly: `challenge.yaml`, the
-  scene, the robot params, every `*.xml` in the robot MJCF's directory, and every file the scene
-  or robot MJCF references (§3). Other files in the directory do not count; a listed file outside
-  the bundle directory is an error.
+  root, CRLF → LF in text files: `.xml`, `.yaml` and `.yml`, as for `robot_hash`, §3). The bundle
+  files are exactly: `challenge.yaml`, the scene, the robot params, every `*.xml` in the robot
+  MJCF's directory, and every file the scene or robot MJCF references (§3). Other files in the
+  directory do not count; a listed file outside the bundle directory is an error.
 - `protocol_hash(preset, seeds, salt)` = sha256 of the canonical JSON (sorted keys, no
   whitespace) of `{format: "topple.protocol/1", env_algo_version, bundle: bundle_hash,
   preset: <the full preset definition: name, sensor model, randomize flag, randomization ranges,

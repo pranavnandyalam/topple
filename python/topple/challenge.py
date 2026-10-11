@@ -22,7 +22,7 @@ from topple.contract import (
 from topple.disturbances import PRESETS
 from topple.ids import validate_challenge_id
 from topple.rng import validate_seed
-from topple.robot import RobotParams, challenge_dir, load_params, referenced_files
+from topple.robot import RobotParams, challenge_dir, hashed_bytes, load_params, referenced_files
 
 # Version of the env algorithm (sensing, estimation, termination, pushes, model overrides). Bump it
 # whenever a code change can change a fixed controller's results on a fixed seed (contract §13):
@@ -30,7 +30,6 @@ from topple.robot import RobotParams, challenge_dir, load_params, referenced_fil
 ENV_ALGO_VERSION = 1
 BUNDLE_HASH_TAG = b"topple.bundle/1\n"
 PROTOCOL_HASH_FORMAT = "topple.protocol/1"
-_TEXT_SUFFIXES = frozenset({".xml", ".yaml", ".yml"})
 
 
 def _framed(data: bytes) -> bytes:
@@ -145,18 +144,15 @@ class Challenge:
         """sha256 over ``bundle_files`` (contract §13).
 
         A tag, then per file in POSIX-path order: the length-framed relative path and the
-        length-framed bytes, with CRLF normalized to LF in text files (``.xml``, ``.yaml``). Stray
-        files (caches, notes, editor droppings) do not count, and where the bundle lives does not
-        matter.
+        length-framed bytes, with CRLF normalized to LF in text files (``.xml``, ``.yaml``,
+        ``.yml``: ``topple.robot.hashed_bytes``, as in the robot hash). Stray files (caches,
+        notes, editor droppings) do not count, and where the bundle lives does not matter.
         """
         root = self.root.resolve()
         digest = hashlib.sha256(BUNDLE_HASH_TAG)
         for path in self.bundle_files():
-            data = path.read_bytes()
-            if path.suffix in _TEXT_SUFFIXES:
-                data = data.replace(b"\r\n", b"\n")
             digest.update(_framed(path.relative_to(root).as_posix().encode("utf-8")))
-            digest.update(_framed(data))
+            digest.update(_framed(hashed_bytes(path)))
         return digest.hexdigest()
 
     def protocol_hash(self, preset: str, seeds: Sequence[int] | None = None, salt: int = 0) -> str:

@@ -518,6 +518,40 @@ def test_robot_hash_covers_referenced_mesh_files(
     assert robot_hash(path, params) != before
 
 
+def to_crlf(path: Path) -> None:
+    path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+
+
+def test_robot_hash_ignores_line_endings_like_the_bundle_hash(
+    params: RobotParams, tmp_path: Path
+) -> None:
+    """A CRLF checkout of the stock robot is the stock robot (contract §3, §13)."""
+    crlf = tmp_path / "balancer.xml"
+    crlf.write_bytes(ROBOT_XML.read_bytes())
+    to_crlf(crlf)
+    assert crlf.read_bytes() != ROBOT_XML.read_bytes()
+    assert robot_hash(crlf, params) == BALANCE_V1_ROBOT_HASH
+
+
+def test_robot_hash_normalizes_text_files_only(params: RobotParams, tmp_path: Path) -> None:
+    """Included MJCF files are text (CRLF -> LF, as in the bundle hash); a mesh is data and
+    counts byte for byte."""
+    lf, crlf = mesh_robot(tmp_path / "lf"), mesh_robot(tmp_path / "crlf")
+    include = '<compiler angle="radian" autolimits="true"/><include file="part.xml"/>'
+    for path in (lf, crlf):
+        path.write_text(
+            path.read_text().replace('<compiler angle="radian" autolimits="true"/>', include)
+        )
+        (path.parent / "part.xml").write_text(
+            '<mujoco>\n<default><geom rgba="1 0 0 1"/></default>\n</mujoco>\n'
+        )
+    to_crlf(crlf)
+    to_crlf(crlf.parent / "part.xml")
+    assert robot_hash(crlf, params) == robot_hash(lf, params)
+    to_crlf(crlf.parent / "assets" / "logo.obj")
+    assert robot_hash(crlf, params) != robot_hash(lf, params)
+
+
 def test_robot_hash_covers_included_files(params: RobotParams, tmp_path: Path) -> None:
     part = tmp_path / "part.xml"
     part.write_text('<mujoco><default><geom rgba="1 0 0 1"/></default></mujoco>\n')
