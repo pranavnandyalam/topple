@@ -238,7 +238,9 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   itself never crosses the controller boundary. With a private protocol's secret salt it carries
   no usable information about the episode. `EvalProtocol` enforces the salts: a public
   protocol's salt is 0 and a private protocol's is an `int` in `[2**64, 2**128)`; anything else
-  (a forgotten salt of 0, a hand-typed `99`, a bool) raises `ValueError`.
+  (a forgotten salt of 0, a hand-typed `99`, a bool) raises `ValueError`. Its `repr` (so also
+  `str` and f-strings) never shows a private protocol's seeds or salt, so a log line or an
+  exception message cannot leak them.
 - **Public seeds are identifiable.** Public protocols use salt 0, so `rng_seed` (and equally the
   initial observation) identifies which public episode is running: a controller can recognize a
   public seed and replay a memorized answer. Scores on public seeds are therefore provisional.

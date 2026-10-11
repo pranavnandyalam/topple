@@ -116,6 +116,18 @@ class EvalProtocol:
                 "(e.g. 2**64 + secrets.randbelow(2**128 - 2**64))"
             )
 
+    def __repr__(self) -> str:
+        """Never shows a private protocol's seeds or salt (contract §8): they are the secret
+        that makes its runs rankable, and a repr ends up in logs and exception messages. (A
+        field-by-field diff of two protocols, as pytest prints for ``==``, still shows them.)"""
+        if self.seed_set == "private":
+            seeds, salt = f"<{len(self.seeds)} secret seeds>", "<secret>"
+        else:
+            seeds, salt = repr(self.seeds), repr(self.salt)
+        return (
+            f"EvalProtocol(id={self.id!r}, seed_set={self.seed_set!r}, seeds={seeds}, salt={salt})"
+        )
+
     @property
     def id(self) -> str:
         return f"{self.challenge.id}/{self.preset}"

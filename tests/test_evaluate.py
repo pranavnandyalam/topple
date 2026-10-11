@@ -303,6 +303,28 @@ def test_results_reject_nan_and_extra_fields() -> None:
         EvalResults.model_validate(data)
 
 
+def test_a_private_protocol_never_shows_its_seeds_or_salt() -> None:
+    """§8, §13: the salt and the private seed list are what make a private run rankable. Any
+    formatting of the protocol (a log line, an exception message, an f-string, an assertion
+    message) must leave them out; a public protocol's seeds are no secret."""
+    seeds = (12345, 67890)
+    private = replace(protocol("standard"), seeds=seeds, seed_set="private", salt=SALT)
+    for text in (repr(private), str(private), f"{private}", f"{private!r:>10}", repr([private])):
+        assert str(SALT) not in text
+        assert hex(SALT)[2:] not in text
+        assert all(str(seed) not in text for seed in seeds)
+        assert "balance-v1/standard" in text
+        assert "'private'" in text
+    assert repr(private) == (
+        "EvalProtocol(id='balance-v1/standard', seed_set='private', seeds=<2 secret seeds>, "
+        "salt=<secret>)"
+    )
+    public = protocol("standard", 2)
+    assert repr(public) == (
+        "EvalProtocol(id='balance-v1/standard', seed_set='public', seeds=(0, 1), salt=0)"
+    )
+
+
 def test_private_seed_set_redacts_episodes() -> None:
     p = replace(protocol("ideal", 2), seed_set="private", salt=SALT)
     results = evaluate(p, pid, INFO)
