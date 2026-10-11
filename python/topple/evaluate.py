@@ -228,8 +228,14 @@ def _control_loop(
     obs_arr: npt.NDArray[np.float32],
     info: dict[str, Any],
 ) -> ErrorInfo | None:
-    """Step until the episode ends; return the controller or physics error, if any."""
-    while True:
+    """Step until the episode ends; return the controller or physics error, if any.
+
+    Bounded by the challenge's episode length (``task_spec.max_steps``), not by the env's own
+    counter: an env that stopped ending its episodes is a harness bug, and evaluation fails
+    loudly instead of recording (about 1 KB per step) without end.
+    """
+    limit = env.task_spec.max_steps
+    for _ in range(limit):
         step = int(info["step"])
         action = _next_action(controller, obs_arr, float(info["t"]), step)
         if isinstance(action, ErrorInfo):  # our own object either way: safe to inspect
@@ -239,6 +245,10 @@ def _control_loop(
             return _error("sim_unstable", int(info["step"]), SIM_UNSTABLE_DETAIL)
         if terminated or truncated:
             return None
+    raise RuntimeError(
+        f"the env did not end the episode within {env.challenge.id}'s {limit} steps "
+        "(a harness bug, not the controller's)"
+    )
 
 
 def run_episode(

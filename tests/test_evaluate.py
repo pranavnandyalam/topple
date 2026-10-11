@@ -241,6 +241,27 @@ def test_an_errored_episode_did_not_survive() -> None:
     assert (run.result.score, run.result.success) == (0.0, False)
 
 
+class CountsActs(PIDController):
+    acts = 0
+
+    def act(self, obs: BalancerObs) -> Sequence[float]:
+        CountsActs.acts += 1
+        return super().act(obs)
+
+
+def test_the_control_loop_stops_at_the_challenges_episode_length() -> None:
+    """An env that no longer ends its episodes (say a refactor moved the time limit into a
+    wrapper) must not make evaluation record forever, about 1 KB per step on every worker:
+    the loop stops at the challenge's own episode length and fails loudly, as a harness bug."""
+    env = BalanceEnv("ideal", record=True)
+    env.max_steps = 10**9  # the env no longer truncates at step 1000
+    CountsActs.acts = 0
+    with pytest.raises(RuntimeError, match=r"did not end the episode within .*'s 1000 steps"):
+        run_episode(env, lambda spec: CountsActs(), seed=0, index=0)
+    assert CountsActs.acts == env.task_spec.max_steps == 1000
+    assert env.trajectory().steps == 1000
+
+
 def test_factory_errors_are_recorded() -> None:
     def bad_factory(spec: TaskSpec) -> Zero:
         raise ImportError("missing dependency")

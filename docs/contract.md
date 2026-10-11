@@ -249,6 +249,9 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   which the runner's controller proxy raises to end it with the runner's own code (§15); an
   unusable return value is `invalid_action` (§7).
   Errored episodes score 0. Only `KeyboardInterrupt` (the operator stopping the run) propagates.
+  The harness bounds every episode by itself: it calls `act` at most `max_steps` times (the
+  challenge's episode length, §4), and an env that has not ended the episode by then is a
+  harness bug that raises `RuntimeError`, never an error charged to the controller.
   This holds even for exceptions whose own machinery is hostile (a failing `__str__`, a metaclass
   `__name__` that raises, a `str` subclass as message or name, a raising `__class__`): the error
   detail is `Type: message` built from the real class name and exact `str` copies, and the
