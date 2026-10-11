@@ -2,7 +2,7 @@ import copy
 import itertools
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -177,6 +177,21 @@ def duplicate_push(data: dict[str, Any]) -> None:
     data["pushes"][1]["start_step"] = data["pushes"][0]["start_step"]
 
 
+def mixed_type_keys(*path: Any) -> Callable[[dict[str, Any]], None]:
+    """Add unknown keys of mixed types, which cannot be sorted against each other."""
+
+    def apply(data: dict[str, Any]) -> None:
+        target = data
+        for key in path:
+            target = target[key]
+        target[1] = 0
+        target["zz"] = 0
+
+    return apply
+
+
+HUGE_INT = json.loads("1" + "0" * 400)  # valid JSON; does not fit a float
+
 BAD_SCENARIOS: dict[str, Callable[[dict[str, Any]], None]] = {
     "seed negative": setter("seed", value=-1),
     "seed too big": setter("seed", value=2**53),
@@ -221,6 +236,17 @@ BAD_SCENARIOS: dict[str, Callable[[dict[str, Any]], None]] = {
     "gyro bias huge": setter("sensors", "gyro_bias_rads", value=[0.0, 5.0, 0.0]),
     "gyro bias nan": setter("sensors", "gyro_bias_rads", value=[0.0, math.nan, 0.0]),
     "sensors unknown key": setter("sensors", "accel_bias", value=[0.0, 0.0, 0.0]),
+    "pitch huge int": setter("init_pitch_rad", value=HUGE_INT),
+    "pitch rate huge int": setter("init_pitch_rate_rads", value=HUGE_INT),
+    "mass scale huge int": setter("model", "chassis_mass_scale", value=HUGE_INT),
+    "motor gain huge int": setter("model", "motor_gain", value=[1.0, HUGE_INT]),
+    "push lateral huge int": setter("pushes", 0, "lateral_ratio", value=HUGE_INT),
+    "push magnitude huge int": setter("pushes", 0, "magnitude_n", value=-HUGE_INT),
+    "gyro bias huge int": setter("sensors", "gyro_bias_rads", value=[0.0, HUGE_INT, 0.0]),
+    "non-str top-level keys": mixed_type_keys(),
+    "non-str push keys": mixed_type_keys("pushes", 0),
+    "non-str model keys": mixed_type_keys("model"),
+    "a single non-str key": setter(7, value=0),
 }
 
 
@@ -231,6 +257,82 @@ def test_from_dict_rejects_bad_scenarios(mutate: Callable[[dict[str, Any]], None
     mutate(data)
     with pytest.raises(ValueError, match="scenario"):
         Scenario.from_dict(data, max_steps=MAX_STEPS)
+
+
+JSON_LEAVES = (
+    st.none()
+    | st.booleans()
+    | st.integers()
+    | st.integers(min_value=10**300, max_value=10**400)
+    | st.floats()
+    | st.text(max_size=5)
+)
+JSON_VALUES = st.recursive(
+    JSON_LEAVES,
+    lambda inner: (
+        st.lists(inner, max_size=4)
+        | st.dictionaries(st.text(max_size=3) | st.integers(), inner, max_size=4)
+    ),
+    max_leaves=12,
+)
+
+
+def json_paths(value: Any, prefix: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+    """Every key path inside a JSON-like value (the root excluded)."""
+    if isinstance(value, dict):
+        children = value.items()
+    elif isinstance(value, list):
+        children = enumerate(value)
+    else:
+        return []
+    paths: list[tuple[Any, ...]] = []
+    for key, child in children:
+        paths += [(*prefix, key), *json_paths(child, (*prefix, key))]
+    return paths
+
+
+SCENARIO_PATHS = json_paths(with_two_pushes())
+
+
+@settings(max_examples=300, deadline=None)
+@given(st.sampled_from(SCENARIO_PATHS), JSON_VALUES)
+def test_from_dict_raises_only_value_error(path: tuple[Any, ...], value: Any) -> None:
+    """Whatever JSON-like value replaces any part of a valid scenario, the only failure is a
+    ``ValueError`` (never ``TypeError``, ``OverflowError``, ``KeyError``...)."""
+    data = with_two_pushes()
+    setter(*path, value=value)(data)
+    try:
+        Scenario.from_dict(data, max_steps=MAX_STEPS)
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        return
+    assert "scenario" in message
+
+
+class LyingMapping(Mapping[str, Any]):
+    """Has the right keys but fails with ``exc`` when a value is read."""
+
+    def __init__(self, keys: list[str], exc: Exception) -> None:
+        self.keys_, self.exc = keys, exc
+
+    def __getitem__(self, key: str) -> Any:
+        raise self.exc
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.keys_)
+
+    def __len__(self) -> int:
+        return len(self.keys_)
+
+
+@pytest.mark.parametrize(
+    "exc", [TypeError("nope"), OverflowError("too big")], ids=["type", "overflow"]
+)
+def test_from_dict_turns_any_type_or_overflow_error_into_value_error(exc: Exception) -> None:
+    data = LyingMapping(list(with_two_pushes()), exc)
+    with pytest.raises(ValueError, match="invalid scenario"):
+        Scenario.from_dict(data)
 
 
 @pytest.mark.parametrize("data", [None, [], "scenario", 3])

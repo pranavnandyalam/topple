@@ -118,17 +118,25 @@ def _import(entry: Path, sha: str) -> ModuleType:
         raise LoadError(f"cannot import {entry}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    # No __pycache__ next to the submission: it would change the directory we just hashed and
-    # make the next load refuse it.
-    write_bytecode, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    stop_writing_bytecode()
     try:
         spec.loader.exec_module(module)
     except Exception as exc:
         sys.modules.pop(name, None)
         raise LoadError(f"importing {entry.name} failed: {type(exc).__name__}: {exc}") from exc
-    finally:
-        sys.dont_write_bytecode = write_bytecode
     return module
+
+
+def stop_writing_bytecode() -> None:
+    """Turn bytecode writing off for the rest of this process (``sys.dont_write_bytecode``).
+
+    A ``__pycache__`` next to the submission would change the directory we hashed and make the
+    next load refuse it. The submission's code can import a sibling module at any time, in
+    ``make_controller``, ``reset`` or ``act``, not only while it is imported, so the flag is never
+    restored: once a submission is loaded, nothing in this process writes bytecode. Restoring it
+    after each call would also race with other threads.
+    """
+    sys.dont_write_bytecode = True
 
 
 def _wrap_factory(raw: Callable[..., Any], entry: Path) -> Callable[[TaskSpec], Controller[Any]]:

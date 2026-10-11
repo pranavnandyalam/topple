@@ -531,6 +531,30 @@ def test_reset_rejects_pushes_that_are_not_push_objects(pushes: Any) -> None:
         BalanceEnv("ideal").reset(seed=0, options={"pushes": pushes})
 
 
+@pytest.mark.parametrize(
+    "pushes",
+    [
+        [Push(5, 50, 3.0, 1.0, 0.0), Push(5, 50, 9.0, 1.0, 0.0)],
+        [Push(40, 50, 3.0, 1.0, 0.0), Push(5, 50, 3.0, 1.0, 0.0)],
+    ],
+    ids=["same step", "unsorted"],
+)
+@pytest.mark.parametrize("via", ["pushes option", "scenario object"])
+def test_reset_rejects_push_schedules_that_cannot_run_as_written(
+    pushes: list[Push], via: str
+) -> None:
+    """Two pushes at one step would silently drop one, and an unsorted list would not survive
+    the scenario's JSON round trip: every reset path refuses both."""
+    env = BalanceEnv("ideal")
+    options: dict[str, Any] = (
+        {"pushes": pushes}
+        if via == "pushes option"
+        else {"scenario": replace(scenario_for(0, "ideal"), pushes=tuple(pushes))}
+    )
+    with pytest.raises(ValueError, match="start_step"):
+        env.reset(seed=0, options=options)
+
+
 def test_seed_range_follows_the_contract() -> None:
     env = BalanceEnv("ideal")
     assert env.reset(seed=MAX_SEED - 1)[1]["episode_seed"] == MAX_SEED - 1

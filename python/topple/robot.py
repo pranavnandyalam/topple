@@ -170,14 +170,17 @@ def robot_hash(robot_xml: Path, params: RobotParams) -> str:
     """sha256 of the robot MJCF, its params and every file the MJCF references.
 
     Referenced files are appended as length-framed (POSIX path relative to the MJCF's directory,
-    bytes) records, so a robot without asset files hashes exactly as before they were covered.
+    bytes) records in POSIX-path string order (``a-c.obj`` before ``a/b.obj``), so a robot without
+    asset files hashes exactly as before they were covered.
     """
     digest = hashlib.sha256()
     digest.update(robot_xml.read_bytes())
     digest.update(json.dumps(params.model_dump(), sort_keys=True).encode())
     base = robot_xml.parent.resolve()
-    for path in referenced_files(robot_xml):
-        rel = Path(os.path.relpath(path, base)).as_posix()
+    records = sorted(
+        (Path(os.path.relpath(path, base)).as_posix(), path) for path in referenced_files(robot_xml)
+    )
+    for rel, path in records:  # POSIX-path string order, as in the bundle hash (contract §3)
         digest.update(_framed(rel.encode("utf-8")))
         digest.update(_framed(path.read_bytes()))
     return digest.hexdigest()
@@ -310,7 +313,7 @@ def bind_robot(model: mujoco.MjModel) -> RobotBinding:
     bodies = [int(model.jnt_bodyid[j.id]) for j in joints]
     signs = tuple(1.0 if _axis_in_chassis(model, j.id)[1] > 0 else -1.0 for j in joints)
     tires = [_tire_geom(model, name) for name in WHEEL_JOINTS]
-    radius = max(float(model.geom_size[g][0]) for g in tires)
+    radius = float(model.geom_size[tires[0]][0])  # validate_robot checks both tires agree
     track = abs(float(model.body_pos[bodies[0]][1] - model.body_pos[bodies[1]][1]))
     root = model.joint(ROOT_JOINT)
     return RobotBinding(
@@ -364,6 +367,27 @@ def _tire_problems(model: mujoco.MjModel, name: str, body: int) -> list[str]:
         return [f"wheel body of '{name}' must have exactly one collision geom, got {len(tires)}"]
     if int(model.geom_type[tires[0]]) not in TIRE_TYPES:
         return [f"tire of '{name}' must be a cylinder, sphere or capsule"]
+    return []
+
+
+TIRE_RADIUS_TOLERANCE_M = 1e-9
+
+
+def _tire_radius_problems(model: mujoco.MjModel) -> list[str]:
+    """Both tires must have one radius: ``wheel_radius_m`` (and odometry) assume a single one."""
+    radii: list[float] = []
+    for name in WHEEL_JOINTS:
+        jid = _lookup(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        tires = _collision_geoms(model, int(model.jnt_bodyid[jid])) if jid >= 0 else []
+        if len(tires) != 1:
+            return []  # already reported by _wheel_problems
+        radii.append(float(model.geom_size[tires[0]][0]))
+    if abs(radii[0] - radii[1]) > TIRE_RADIUS_TOLERANCE_M:
+        left, right = WHEEL_JOINTS
+        return [
+            f"tires of '{left}' and '{right}' must have the same radius, "
+            f"got {radii[0]:g} and {radii[1]:g} m"
+        ]
     return []
 
 
@@ -434,6 +458,7 @@ def validate_robot(
     problems = _root_problems(model, chassis)
     for name, side in zip(WHEEL_JOINTS, (1.0, -1.0), strict=True):
         problems += _wheel_problems(model, chassis, name, side)
+    problems += _tire_radius_problems(model)
     problems += _interface_problems(model, chassis)
     problems += _world_problems(model, chassis, scene_geoms)
     return problems

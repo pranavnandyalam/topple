@@ -137,13 +137,16 @@ class Scenario:
     def from_dict(cls, data: Any, *, max_steps: int | None = None) -> Scenario:
         """Parse and validate a scenario from JSON data; any problem raises ``ValueError``.
 
-        Checks key sets, types, finiteness and the bounds above; pushes must be sorted by
-        ``start_step`` with no two at the same step. With ``max_steps``, every push must also start
-        inside the episode (``0 <= start_step < max_steps``).
+        Checks key sets (string keys only), types, that every number fits a float and is
+        finite, and the bounds above; pushes must be sorted by ``start_step`` with no two at the
+        same step. With ``max_steps``, every push must also start inside the episode
+        (``0 <= start_step < max_steps``).
         """
         try:
             scenario = _parse_scenario(data)
             validate_scenario(scenario, max_steps=max_steps)
+        except (TypeError, OverflowError) as exc:  # a case the checks above missed: still bad data
+            raise ValueError(f"{_INVALID}{type(exc).__name__}: {exc}") from exc
         except ValueError as exc:
             message = str(exc)
             if not message.startswith(_INVALID):
@@ -164,6 +167,8 @@ _SENSOR_KEYS = frozenset(f.name for f in fields(SensorOffsets))
 def _mapping(name: str, value: object, keys: frozenset[str], optional: frozenset[str]) -> Any:
     if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be an object, got {type(value).__name__}")
+    if not all(isinstance(key, str) for key in value):
+        raise ValueError(f"{name}: keys must be strings")
     present = set(value)
     missing = keys - optional - present
     unknown = present - keys
@@ -175,7 +180,10 @@ def _mapping(name: str, value: object, keys: frozenset[str], optional: frozenset
 def _real(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise ValueError(f"{name} must be a number, got {type(value).__name__}")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:  # e.g. a JSON integer above 1.8e308
+        raise ValueError(f"{name} does not fit a float ({type(exc).__name__})") from exc
     if not math.isfinite(result):
         raise ValueError(f"{name} must be finite, got {result}")
     return result
@@ -262,6 +270,16 @@ def _check_pushes(pushes: tuple[Push, ...], max_steps: int | None) -> None:
         _check_range(
             f"pushes[{i}].lateral_ratio", push.lateral_ratio, -MAX_LATERAL_RATIO, MAX_LATERAL_RATIO
         )
+    check_push_schedule(pushes)
+
+
+def check_push_schedule(pushes: Sequence[Push]) -> None:
+    """Raise ``ValueError`` unless pushes are sorted by ``start_step`` with no two at one step.
+
+    Two pushes at one step cannot both run (one would silently replace the other), and an
+    unsorted list would not survive the scenario's JSON round trip, so every path into the env
+    enforces this, including in-process ``Scenario`` objects that skip the bounds checks.
+    """
     steps = [p.start_step for p in pushes]
     if any(b <= a for a, b in itertools.pairwise(steps)):
         raise ValueError(f"pushes must be sorted by start_step with no repeats, got {steps}")

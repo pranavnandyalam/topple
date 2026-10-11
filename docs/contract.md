@@ -46,7 +46,7 @@ A robot MJCF (body tree only; no `<option>`, floor or lights) must contain, by e
 | body + free joint | `chassis`, free joint `root` | root of the robot, a child of the world |
 | hinge joints | `left_wheel`, `right_wheel` | unlimited, axes ±y in the chassis frame |
 | wheel bodies | the bodies of the two hinges | direct children of `chassis`; left at y > 0, right at y < 0 |
-| tire geoms | the one collision geom of each wheel body | cylinder, sphere or capsule; size[0] is the wheel radius |
+| tire geoms | the one collision geom of each wheel body | cylinder, sphere or capsule; size[0] is the wheel radius, equal on both tires |
 | site | `imu` | child of `chassis`; where the IMU board is mounted |
 | site | `push_point` | child of `chassis`; where pushes are applied |
 
@@ -75,15 +75,17 @@ world:
 - every body other than the world belongs to the robot (its root body is `chassis`), and the world
   body has no geoms except the scene's own (`floor`).
 
-`wheel_radius_m` is the tire geom's radius and `track_width_m` the distance between the wheel bodies
-along y; both reach the controller through `TaskSpec.robot`.
+`wheel_radius_m` is the tire geom's radius (both tires must agree to within 1e-9 m) and
+`track_width_m` the distance between the wheel bodies along y; both reach the controller through
+`TaskSpec.robot`.
 
 `robot_hash(robot_xml, params)` = sha256 of the MJCF bytes, then the params as sorted-key JSON,
 then, for every file the MJCF references (`<include>` recursively, meshes, skins and height fields
 via `meshdir`, textures via `texturedir`, other `file` attributes relative to the MJCF; `assetdir`
 sets both directories), a record `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths, POSIX
-path relative to the MJCF's directory) in path order. A referenced file that does not exist is an
-error. A robot without asset files (balance-v1) hashes the MJCF and params only.
+path relative to the MJCF's directory) in POSIX-path string order (`a-c.obj` before `a/b.obj`). A
+referenced file that does not exist is an error. A robot without asset files (balance-v1) hashes
+the MJCF and params only.
 
 The scene (`scene.xml`) owns physics options: `timestep=0.002`, `integrator=implicitfast`,
 `<flag autoreset="disable"/>`, a floor plane and lights. The robot is attached with prefix `""`.
@@ -205,13 +207,19 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   `reset` or `act` (any `BaseException`, including `SystemExit` and `GeneratorExit`) ends the
   episode with error `exception` at that step; an unusable return value is `invalid_action` (§7).
   Errored episodes score 0. Only `KeyboardInterrupt` (the operator stopping the run) propagates.
+  This holds even for exceptions whose own machinery is hostile (a failing `__str__`, a metaclass
+  `__name__` that raises, a `str` subclass as message or name, a raising `__class__`): the error
+  detail is `Type: message` built from the real class name and exact `str` copies, and the
+  harness never asks the controller object or its exceptions what class they are.
   In-process runs are for trusted code; isolation from hostile code is the runner's job (Phase 3).
 - Submission kinds: a `.py` file, or a directory with `controller.py` plus assets located via
   `Path(__file__).parent` (ONNX policies arrive in Phase 2). A directory may hold at most 50
   regular files and 20 MiB in total (enforced while reading); symlinks, special files,
-  `__pycache__` and `.pyc` files are refused, and loading never writes bytecode next to the
-  submission. The submission sha256 covers every file as length-framed
-  `(POSIX relpath, size, bytes)` records in path order.
+  `__pycache__` and `.pyc` files are refused. Loading a submission turns bytecode writing off for
+  the rest of the process (`sys.dont_write_bytecode`), so neither its import nor a later import
+  of a sibling module (in `make_controller`, `reset` or `act`) writes bytecode next to it. The
+  submission sha256 covers every file as length-framed `(POSIX relpath, size, bytes)` records in
+  POSIX-path string order.
 
 ## 9. Randomness, seeds and scenarios
 
@@ -233,12 +241,17 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   `wheel_friction_scale`, `motor_gain` per wheel, `frictionloss_scale`) plus `com_x_offset_m`
   (added to the chassis COM x) and `actuator_delay_s`, not absolute values.
 - `Scenario.from_dict` validates what it reads, and `ValueError` rejects anything else: exact key
-  sets; finite numbers; integer `start_step`/`n_substeps`; pushes sorted by `start_step` with no
-  two at the same step, `0 ≤ start_step < max_steps` (when the episode length is known),
-  `n_substeps ≥ 1`, `0 ≤ magnitude_n ≤ 50` N, `forward_sign = ±1`, `|lateral_ratio| ≤ 1`; scales in
-  [0.5, 2] (frictionloss [0, 3]), `|com_x_offset_m| ≤ 0.02`, `0 ≤ actuator_delay_s ≤ 0.010`,
+  sets of string keys; numbers that fit a float (a huge JSON integer does not) and are finite;
+  integer `start_step`/`n_substeps`; pushes sorted by `start_step` with no two at the same step,
+  `0 ≤ start_step < max_steps` (when the episode length is known), `n_substeps ≥ 1`,
+  `0 ≤ magnitude_n ≤ 50` N, `forward_sign = ±1`, `|lateral_ratio| ≤ 1`; scales in [0.5, 2]
+  (frictionloss [0, 3]), `|com_x_offset_m| ≤ 0.02`, `0 ≤ actuator_delay_s ≤ 0.010`,
   `|imu_pitch_offset_rad| ≤ 0.1`, `|gyro_bias| ≤ 0.1` rad/s per axis. Every preset draws well
-  inside these bounds; `reset(options={"scenario": dict})` goes through this check.
+  inside these bounds; `reset(options={"scenario": dict})` goes through this check. In-process
+  `Scenario` objects and the `pushes`/`init_pitch_rad`/`init_pitch_rate` reset options are trusted
+  test hooks and skip the bounds (robustness tests use absurd pushes), but every reset path still
+  requires finite initial pitch and rate and pushes sorted by `start_step` with no two at one step
+  (two at one step could not both run).
 - `reset(seed=None)` (training): `episode_seed = int(self.np_random.integers(2**53))`, returned in
   `info["episode_seed"]` so any training failure can be replayed.
 
@@ -259,6 +272,9 @@ offset U(−1°, 1°), gyro bias U(−0.01, 0.01) rad/s per axis. Initial pitch 
 Pushes (`standard`): count ∈ {1, 2, 3}; first at t ≥ 1.0 s, spacing ≥ 1.5 s, all before
 t = 8.5 s; rectangular pulse of 0.1 s applied at site `push_point` (`mj_applyFT`); direction fixed
 in the world frame at onset: ± along the heading, lateral component ≤ 0.3 of the magnitude;
+the application point (`push_point`'s position) and the Jacobian `mj_applyFT` uses come from
+MuJoCo's data of the previous substep, so like contacts and the IMU (§5, §11) they lag the state
+by one substep (2 ms);
 impulse magnitude **[calibrated]** (target: reference LQR survives ≥ 80% and PID 40–90% of
 `standard` episodes; initial band U(0.25, 0.45) N·s). Force is capped at 50 N.
 

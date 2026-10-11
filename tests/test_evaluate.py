@@ -1,10 +1,10 @@
 import json
 import math
 import shutil
-from collections.abc import Iterator
-from dataclasses import replace
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 import numpy as np
 import pytest
@@ -16,6 +16,7 @@ from topple.contract import BalancerObs, TaskSpec, controller_obs
 from topple.controllers.pid import PIDController
 from topple.envs.balance import BalanceEnv
 from topple.evaluate import (
+    EpisodeRun,
     EvalProtocol,
     evaluate,
     run_episode,
@@ -101,6 +102,27 @@ def test_protocol_hash_depends_on_preset() -> None:
         EvalProtocol.from_id("balance-v1/clean").protocol_hash()
         != EvalProtocol.from_id("balance-v1/standard").protocol_hash()
     )
+
+
+def test_protocol_hash_covers_the_seed_list_and_the_salt() -> None:
+    p = protocol("ideal", 3)
+    expected = p.challenge.protocol_hash(p.preset, seeds=p.seeds, salt=p.salt)
+    assert p.protocol_hash() == expected
+    others = {
+        replace(p, seeds=p.seeds[:-1]).protocol_hash(),
+        replace(p, seeds=(p.seeds[1], p.seeds[0], p.seeds[2])).protocol_hash(),
+        replace(p, salt=1).protocol_hash(),
+        replace(p, seed_set="private", salt=2**127 + 1).protocol_hash(),
+    }
+    assert expected not in others
+    assert len(others) == 4
+
+
+def test_results_carry_the_protocols_full_hash() -> None:
+    p = replace(protocol("ideal", 1), seed_set="private", salt=99)
+    results = evaluate(p, pid, INFO)
+    assert results.protocol_hash == p.challenge.protocol_hash(p.preset, seeds=p.seeds, salt=99)
+    assert results.protocol_hash != replace(p, salt=0).protocol_hash()
 
 
 def test_pid_on_clean_scores_high(tmp_path: Path) -> None:
@@ -254,10 +276,36 @@ def test_truncated_trajectory_fails_verification(tmp_path: Path) -> None:
 # ------------------------------------------------------------------ controller misbehaviour (B)
 
 
+READ_CAP = 16  # far above dim + 1: reading this many items means the islice guard is gone
+
+
 class Endless:
+    """Never runs out, but refuses to serve more than ``READ_CAP`` items.
+
+    Unbounded, a regression that materializes the action (``list(action)``) would grow until the
+    machine runs out of memory instead of failing.
+    """
+
     def __iter__(self) -> Iterator[float]:
-        while True:
+        for _ in range(READ_CAP):
             yield 0.0
+        raise AssertionError(f"the harness read more than {READ_CAP} action items")
+
+
+class Huge(Sequence[float]):
+    """Claims 10**12 items (like ``range(10**12)``) but only ever serves ``READ_CAP`` of them."""
+
+    def __len__(self) -> int:
+        return 10**12
+
+    @overload
+    def __getitem__(self, index: int) -> float: ...
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[float]: ...
+    def __getitem__(self, index: int | slice) -> float | Sequence[float]:
+        if not isinstance(index, int) or index >= READ_CAP:
+            raise AssertionError(f"the harness read more than {READ_CAP} action items")
+        return 0.0
 
 
 class IterRaises:
@@ -273,8 +321,90 @@ class BadStrError(Exception):
         raise RuntimeError("cannot describe myself")
 
 
+class _NamelessMeta(type):
+    """A metaclass whose ``__name__`` property wins over ``type.__name__`` and raises."""
+
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]
+        raise ZeroDivisionError("no name for you")
+
+
+class NamelessError(Exception, metaclass=_NamelessMeta):
+    pass
+
+
+@dataclass(frozen=True)
+class Deferred:
+    """Builds a payload when the test runs. pytest renders test arguments with ``reprlib``, which
+    reads ``type(x).__name__`` and would itself crash on a ``NamelessError`` argument."""
+
+    build: Callable[[], Any]
+    label: str
+
+    def __repr__(self) -> str:
+        return self.label
+
+
+def materialize(payload: Any) -> Any:
+    return payload.build() if isinstance(payload, Deferred) else payload
+
+
+NAMELESS = Deferred(NamelessError, "NamelessError()")
+
+
+class ClasslessError(Exception):
+    """``isinstance(exc, str)`` consults ``exc.__class__`` after the real type: this one raises."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        raise ZeroDivisionError("no class for you")
+
+
+CLASSLESS = Deferred(ClasslessError, "ClasslessError()")
+
+
+class FormatBomb(str):
+    def __format__(self, spec: str) -> str:
+        raise RuntimeError("cannot format myself")
+
+    def __str__(self) -> str:
+        raise RuntimeError("cannot str myself")
+
+
+class FormatBombError(Exception):
+    """``str(exc)`` hands back a ``str`` subclass whose own methods raise."""
+
+    def __str__(self) -> str:
+        return FormatBomb("boom")
+
+
+def _renamed_error() -> type[Exception]:
+    """An exception class whose real ``__name__`` is a hostile ``str`` subclass."""
+
+    class RenamedError(Exception):
+        pass
+
+    RenamedError.__name__ = FormatBomb("Renamed")
+    return RenamedError
+
+
 def lazy_action() -> Iterator[float]:
     yield from (0.1, 0.2)
+
+
+def run_contained(factory: Any) -> EpisodeRun:
+    """``run_episode`` on ``ideal`` seed 0, failing cleanly if anything escapes it.
+
+    The failure is raised outside the ``except`` block, so pytest never has to render the escaped
+    exception (a hostile one can break pytest's own reporting).
+    """
+    try:
+        return run_episode(BalanceEnv("ideal", record=True), factory, seed=0, index=0)
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        pass
+    pytest.fail("run_episode raised for controller misbehaviour")
 
 
 MISBEHAVIOUR: dict[str, tuple[Any, str]] = {
@@ -282,20 +412,23 @@ MISBEHAVIOUR: dict[str, tuple[Any, str]] = {
     "act raises GeneratorExit": (GeneratorExit(), "exception"),
     "act raises StopIteration": (StopIteration(), "exception"),
     "exception with a broken __str__": (BadStrError(), "exception"),
+    "exception type whose __name__ raises": (NAMELESS, "exception"),
+    "__str__ returns a str subclass that cannot be formatted": (FormatBombError(), "exception"),
+    "exception type named by a hostile str subclass": (_renamed_error()(), "exception"),
+    "exception whose __class__ raises": (CLASSLESS, "exception"),
     "action iteration raises SystemExit": (IterRaises(SystemExit(1)), "exception"),
     "action iteration raises ValueError": (IterRaises(ValueError("bad")), "invalid_action"),
     "generator": (lazy_action(), "invalid_action"),
     "huge int": ([10**400, 0.0], "invalid_action"),
     "endless iterable": (Endless(), "invalid_action"),
-    "huge range": (range(10**12), "invalid_action"),
+    "huge sequence": (Huge(), "invalid_action"),
     "set": ({0.1, 0.2}, "invalid_action"),
 }
 
 
 @pytest.mark.parametrize(("payload", "code"), MISBEHAVIOUR.values(), ids=MISBEHAVIOUR.keys())
 def test_misbehaving_controllers_never_crash_the_harness(payload: Any, code: str) -> None:
-    env = BalanceEnv("ideal", record=True)
-    run = run_episode(env, lambda spec: Explodes(5, payload), seed=0, index=0)
+    run = run_contained(lambda spec: Explodes(5, materialize(payload)))
     assert run.result.error is not None
     assert run.result.error.code == code
     assert run.result.error.step == 5
@@ -304,22 +437,107 @@ def test_misbehaving_controllers_never_crash_the_harness(payload: Any, code: str
     assert run.trajectory.steps == 5
 
 
+@pytest.mark.parametrize(
+    ("exc", "detail"),
+    [
+        (BadStrError(), "BadStrError: <str() failed>"),
+        (NAMELESS, "NamelessError: "),
+        (FormatBombError(), "FormatBombError: boom"),
+        (_renamed_error()("why"), "Renamed: why"),
+        (CLASSLESS, "ClasslessError: "),
+    ],
+    ids=[
+        "broken __str__",
+        "raising __name__",
+        "str subclass message",
+        "str subclass name",
+        "raising __class__",
+    ],
+)
+def test_hostile_exceptions_are_described_by_their_real_name(exc: Any, detail: str) -> None:
+    run = run_contained(lambda spec: Explodes(2, materialize(exc)))
+    assert run.result.error is not None
+    assert (run.result.error.code, run.result.error.detail) == ("exception", detail)
+    assert type(run.result.error.detail) is str
+
+
+def test_an_undescribable_exception_still_becomes_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whatever describing the exception does, the harness records an error and carries on."""
+
+    def explode(exc: BaseException) -> str:
+        raise MemoryError
+
+    monkeypatch.setattr(evaluate_module, "_exception_detail", explode)
+    run = run_contained(lambda spec: Explodes(2, RuntimeError("x")))
+    assert run.result.error is not None
+    assert run.result.error.code == "exception"
+    assert run.result.error.detail == "<exception could not be described>"
+
+
 @pytest.mark.parametrize("where", ["factory", "reset"])
-@pytest.mark.parametrize("exc", [SystemExit(2), GeneratorExit(), BadStrError()])
-def test_setup_failures_are_exceptions(where: str, exc: BaseException) -> None:
+@pytest.mark.parametrize(
+    "exc",
+    [SystemExit(2), GeneratorExit(), BadStrError(), NAMELESS, FormatBombError(), CLASSLESS],
+    ids=["SystemExit", "GeneratorExit", "BadStr", "Nameless", "FormatBomb", "Classless"],
+)
+def test_setup_failures_are_exceptions(where: str, exc: Any) -> None:
     class Fails(Zero):
         def reset(self, rng_seed: int) -> None:
-            raise exc
+            raise materialize(exc)
 
     def factory(spec: TaskSpec) -> Zero:
         if where == "factory":
-            raise exc
+            raise materialize(exc)
         return Fails()
 
-    run = run_episode(BalanceEnv("ideal", record=True), factory, seed=0, index=0)
+    run = run_contained(factory)
     assert run.result.error is not None
     assert (run.result.error.code, run.result.error.step) == ("exception", 0)
     assert run.trajectory.steps == 0
+
+
+class InterruptingStrError(Exception):
+    def __str__(self) -> str:
+        raise KeyboardInterrupt
+
+
+def test_keyboard_interrupt_while_describing_an_exception_still_stops_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(KeyboardInterrupt):
+        run_episode(
+            BalanceEnv("ideal", record=True),
+            lambda spec: Explodes(2, InterruptingStrError()),
+            seed=0,
+            index=0,
+        )
+
+    def interrupted(exc: BaseException) -> str:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(evaluate_module, "_exception_detail", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        run_episode(
+            BalanceEnv("ideal", record=True),
+            lambda spec: Explodes(2, RuntimeError("x")),
+            seed=0,
+            index=0,
+        )
+
+
+def test_a_controller_whose_class_attribute_raises_still_runs() -> None:
+    """The harness never asks the controller object what class it is (``isinstance`` would)."""
+
+    class Classless(Zero):
+        @property  # type: ignore[misc]
+        def __class__(self) -> type:  # type: ignore[override]
+            raise ZeroDivisionError("no class for you")
+
+    run = run_contained(lambda spec: Classless())
+    assert run.result.error is None
+    assert run.trajectory.meta["termination"]["reason"] == "fell"
 
 
 @pytest.mark.parametrize("where", ["factory", "reset", "act", "action"])
@@ -452,8 +670,12 @@ def test_summarize_divides_by_the_expected_episode_count() -> None:
 
 
 def test_summarize_uses_exact_summation() -> None:
-    present = [episode(i, v, False, 1.0) for i, v in enumerate([1e-16, 1.0, -1e-16 + 1e-16])]
-    assert summarize(present, expected=3).score == math.fsum([1e-16, 1.0, 0.0]) / 3
+    # Python 3.12's sum() is already compensated (Neumaier), so it takes an awkward case to tell
+    # it from the correctly rounded fsum: the subnormal throws the compensation off.
+    scores = [1.0, 1.0, 5e-324, 2.0**-52]
+    assert sum(scores) / 4 != math.fsum(scores) / 4
+    present = [episode(i, v, False, 1.0) for i, v in enumerate(scores)]
+    assert summarize(present, expected=4).score == math.fsum(scores) / 4
 
 
 def test_summarize_rejects_more_episodes_than_expected() -> None:

@@ -95,34 +95,58 @@ def wants_epilogue(termination_reason: str, has_error: bool) -> bool:
     return termination_reason in FALL_REASONS or has_error
 
 
-def _describe(exc: BaseException) -> str:
-    """``Type: message`` for an exception from untrusted code, even if its ``__str__`` fails."""
+UNDESCRIBABLE = "<exception could not be described>"
+_TYPE_NAME = type.__dict__["__name__"]  # the real class name; a metaclass property cannot hide it
+
+
+def _exception_detail(exc: BaseException) -> str:
+    """``Type: message`` as plain ``str``s, whatever the exception's own code does.
+
+    The class name comes from ``type``'s own descriptor and both parts are copied to exact
+    ``str`` with ``str.__str__``, so no method the controller defined (a metaclass ``__name__``,
+    a ``str`` subclass's ``__format__`` or ``__str__``) runs while the detail is assembled. Only
+    the exception's ``__str__`` runs, and its failure is reported, not raised.
+    """
+    name = str.__str__(_TYPE_NAME.__get__(type(exc), type))
     try:
         message = str(exc)
     except KeyboardInterrupt:
         raise
     except BaseException:
         message = "<str() failed>"
-    return f"{type(exc).__name__}: {message}"
+    return name + ": " + str.__str__(message)
 
 
-def _error(code: str, step: int, exc: BaseException | str) -> ErrorInfo:
-    detail = exc if isinstance(exc, str) else _describe(exc)
+def _describe(exc: BaseException) -> str:
+    """Detail for an exception from untrusted code. Never raises, except ``KeyboardInterrupt``."""
+    try:
+        return _exception_detail(exc)
+    except KeyboardInterrupt:
+        raise
+    except BaseException:  # e.g. MemoryError from a gigantic message
+        return UNDESCRIBABLE
+
+
+def _error(code: str, step: int, detail: str) -> ErrorInfo:
     return ErrorInfo.model_validate({"code": code, "step": step, "detail": detail})
 
 
 def _start_controller(
     env: BalanceEnv, factory: ControllerFactory, seed: int, salt: int
-) -> Controller[Any] | ErrorInfo:
-    """Build and reset a fresh controller, or describe why that failed."""
+) -> tuple[Controller[Any], None] | tuple[None, ErrorInfo]:
+    """Build and reset a fresh controller: ``(controller, None)``, or ``(None, why it failed)``.
+
+    A pair rather than a union so the caller never has to ask the untrusted object what it is
+    (``isinstance`` would run the object's own ``__class__``).
+    """
     try:
         controller = factory(env.task_spec)
         controller.reset(controller_seed(seed, salt))
     except KeyboardInterrupt:
         raise
     except BaseException as exc:  # SystemExit, GeneratorExit, ...: all the controller's fault
-        return _error("exception", 0, exc)
-    return controller
+        return None, _error("exception", 0, _describe(exc))
+    return controller, None
 
 
 def _next_action(
@@ -134,15 +158,15 @@ def _next_action(
     except KeyboardInterrupt:
         raise
     except BaseException as exc:
-        return _error("exception", step, exc)
+        return _error("exception", step, _describe(exc))
     try:
         return validate_action(raw, BALANCE_V1_ACTION.dim)
     except ActionError as exc:
-        return _error("invalid_action", step, exc)
+        return _error("invalid_action", step, _describe(exc))
     except KeyboardInterrupt:
         raise
     except BaseException as exc:  # the returned object's own code raised e.g. SystemExit
-        return _error("exception", step, exc)
+        return _error("exception", step, _describe(exc))
 
 
 def _control_loop(
@@ -155,7 +179,7 @@ def _control_loop(
     while True:
         step = int(info["step"])
         action = _next_action(controller, obs_arr, float(info["t"]), step)
-        if isinstance(action, ErrorInfo):
+        if isinstance(action, ErrorInfo):  # our own object either way: safe to inspect
             return action
         obs_arr, _, terminated, truncated, info = env.step(action)
         if info["termination_reason"] == "sim_unstable":
@@ -179,11 +203,9 @@ def run_episode(
     it returns) becomes a typed error that scores 0; only ``KeyboardInterrupt`` propagates.
     """
     obs_arr, info = env.reset(seed=seed)
-    started = _start_controller(env, factory, seed, salt)
-    if isinstance(started, ErrorInfo):
-        error: ErrorInfo | None = started
-    else:
-        error = _control_loop(env, started, obs_arr, info)
+    controller, error = _start_controller(env, factory, seed, salt)
+    if controller is not None:
+        error = _control_loop(env, controller, obs_arr, info)
     if wants_epilogue(env.termination_reason or "timeout", error is not None):
         env.simulate_epilogue(EPILOGUE_S)
     traj = env.trajectory({"episode_index": index, "error": error.model_dump() if error else None})

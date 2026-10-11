@@ -1,4 +1,9 @@
+import hashlib
+import json
 import math
+import re
+import struct
+import zlib
 from pathlib import Path
 
 import mujoco
@@ -237,6 +242,7 @@ LEFT_BODY = '<body name="left_wheel_body" pos="0 0.07 0">'
 RIGHT_BODY = '<body name="right_wheel_body" pos="0 -0.07 0">'
 LEFT_JOINT = '<joint name="left_wheel" type="hinge" axis="0 1 0"/>'
 LEFT_TIRE = '<geom name="left_tire" type="cylinder"'
+RIGHT_TIRE = '<geom name="right_tire" type="cylinder"'
 WORLD_END = "  </worldbody>"
 
 
@@ -310,6 +316,18 @@ VIOLATIONS = {
             )
         ],
         "gravcomp",
+    ),
+    "right wheel on the left": (
+        [(RIGHT_BODY, '<body name="right_wheel_body" pos="0 0.07 0">')],
+        "y < 0 (right)",
+    ),
+    "left wheel on the right": (
+        [(LEFT_BODY, '<body name="left_wheel_body" pos="0 -0.07 0">')],
+        "y > 0 (left)",
+    ),
+    "tires of different radii": (
+        [(RIGHT_TIRE + ' size="0.034 0.013"', RIGHT_TIRE + ' size="0.030 0.013"')],
+        "same radius",
     ),
 }
 
@@ -399,6 +417,139 @@ def test_robot_hash_covers_included_files(params: RobotParams, tmp_path: Path) -
     assert referenced_files(path) == (part.resolve(),)
     before = robot_hash(path, params)
     part.write_text(part.read_text().replace("1 0 0 1", "0 1 0 1"))
+    assert robot_hash(path, params) != before
+
+
+def reference_robot_hash(xml: Path, params: RobotParams, rels: list[str]) -> str:
+    """Contract §3 written out independently: records in POSIX-path string order."""
+    digest = hashlib.sha256(xml.read_bytes())
+    digest.update(json.dumps(params.model_dump(), sort_keys=True).encode())
+    for rel in sorted(rels):
+        name, data = rel.encode("utf-8"), (xml.parent / rel).read_bytes()
+        digest.update(len(name).to_bytes(8, "big") + name)
+        digest.update(len(data).to_bytes(8, "big") + data)
+    return digest.hexdigest()
+
+
+def test_robot_hash_orders_records_by_posix_path_string(
+    params: RobotParams, tmp_path: Path
+) -> None:
+    """``a-c.obj`` sorts before ``a/b.obj`` as a string ('-' < '/'), after it as a Path."""
+    path = mesh_robot(tmp_path, "meshes")
+    xml = path.read_text().replace(
+        '<mesh name="logo" file="logo.obj"/>',
+        '<mesh name="m1" file="a/b.obj"/><mesh name="m2" file="a-c.obj"/>',
+    )
+    path.write_text(xml.replace('mesh="logo"', 'mesh="m1"'))
+    meshes = path.parent / "meshes"
+    (meshes / "logo.obj").unlink()
+    (meshes / "a").mkdir()
+    (meshes / "a" / "b.obj").write_text(MESH)
+    (meshes / "a-c.obj").write_text(MESH.replace("0.01", "0.02"))
+    build_model(path, SCENE_XML, params)
+    expected = reference_robot_hash(path, params, ["meshes/a/b.obj", "meshes/a-c.obj"])
+    assert robot_hash(path, params) == expected
+
+
+def tiny_png() -> bytes:
+    """A valid 1x1 RGB PNG, built from its chunks."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(kind + data).to_bytes(4, "big")
+        return len(data).to_bytes(4, "big") + kind + data + crc
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    pixels = zlib.compress(b"\x00\xff\x00\x00")
+    return (
+        b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", pixels) + chunk(b"IEND", b"")
+    )
+
+
+def asset_robot(tmp_path: Path, compiler_attrs: str) -> Path:
+    """A robot with one mesh and one 2D texture, loaded through ``<compiler {compiler_attrs}>``."""
+    compiler = '<compiler angle="radian" autolimits="true"/>'
+    xml = (
+        ROBOT_XML.read_text()
+        .replace(
+            compiler,
+            compiler.replace("/>", f" {compiler_attrs}/>")
+            + '<asset><mesh name="logo" file="logo.obj"/>'
+            '<texture name="skin" type="2d" file="skin.png"/>'
+            '<material name="skin" texture="skin"/></asset>',
+        )
+        .replace(
+            '<site name="imu"',
+            '<geom type="mesh" mesh="logo" material="skin" contype="0" conaffinity="0"'
+            ' mass="0.001"/><site name="imu"',
+        )
+    )
+    path = tmp_path / "robot" / "bot.xml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(xml)
+    return path
+
+
+ASSET_LAYOUTS = {
+    "texturedir": ('meshdir="m" texturedir="t"', "m/logo.obj", "t/skin.png"),
+    "assetdir": ('assetdir="a"', "a/logo.obj", "a/skin.png"),
+    "assetdir with meshdir": ('assetdir="a" meshdir="m"', "m/logo.obj", "a/skin.png"),
+    "assetdir with texturedir": ('assetdir="a" texturedir="t"', "a/logo.obj", "t/skin.png"),
+}
+
+
+@pytest.mark.parametrize(
+    ("attrs", "mesh_rel", "texture_rel"), ASSET_LAYOUTS.values(), ids=ASSET_LAYOUTS.keys()
+)
+def test_referenced_files_resolve_like_mujoco(
+    params: RobotParams, tmp_path: Path, attrs: str, mesh_rel: str, texture_rel: str
+) -> None:
+    path = asset_robot(tmp_path, attrs)
+    base = path.parent
+    for rel, data in ((mesh_rel, MESH.encode()), (texture_rel, tiny_png())):
+        (base / rel).parent.mkdir(parents=True, exist_ok=True)
+        (base / rel).write_bytes(data)
+    for decoy in ("logo.obj", "skin.png"):  # next to the MJCF, where a wrong resolver would look
+        (base / decoy).write_bytes(
+            (base / (mesh_rel if decoy.endswith("obj") else texture_rel)).read_bytes()
+        )
+    build_model(path, SCENE_XML, params)
+    assert referenced_files(path) == tuple(
+        sorted([(base / mesh_rel).resolve(), (base / texture_rel).resolve()])
+    )
+    for rel in (mesh_rel, texture_rel):
+        before = robot_hash(path, params)
+        target = base / rel
+        original = target.read_bytes()
+        target.write_bytes(original + b"\n")
+        assert robot_hash(path, params) != before, rel
+        target.write_bytes(original)
+        target.unlink()  # MuJoCo needs exactly this file: the decoy does not stand in for it
+        with pytest.raises(ValueError, match=re.escape(target.name)):
+            build_model(path, SCENE_XML, params)
+        target.write_bytes(original)
+
+
+def test_nested_includes_resolve_against_the_model_directory(
+    params: RobotParams, tmp_path: Path
+) -> None:
+    """``sub/a.xml`` includes ``b.xml``; MuJoCo looks for it next to the top-level MJCF."""
+    robot_dir = tmp_path / "robot"
+    (robot_dir / "sub").mkdir(parents=True)
+    (robot_dir / "sub" / "a.xml").write_text('<mujoco><include file="b.xml"/></mujoco>\n')
+    b = robot_dir / "b.xml"
+    b.write_text('<mujoco><default><geom rgba="1 0 0 1"/></default></mujoco>\n')
+    xml = ROBOT_XML.read_text().replace(
+        '<compiler angle="radian" autolimits="true"/>',
+        '<compiler angle="radian" autolimits="true"/><include file="sub/a.xml"/>',
+    )
+    path = robot_dir / "bot.xml"
+    path.write_text(xml)
+    build_model(path, SCENE_XML, params)
+    assert referenced_files(path) == tuple(
+        sorted([b.resolve(), (robot_dir / "sub/a.xml").resolve()])
+    )
+    before = robot_hash(path, params)
+    b.write_text(b.read_text().replace("1 0 0 1", "0 1 0 1"))
     assert robot_hash(path, params) != before
 
 

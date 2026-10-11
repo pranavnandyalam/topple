@@ -1,5 +1,7 @@
 import hashlib
 import os
+import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -203,6 +205,56 @@ def test_loading_writes_no_bytecode_so_it_can_load_again(tmp_path: Path) -> None
     assert load_submission(root).sha256 == first.sha256
 
 
+LAZY = """
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+
+class C:
+    def reset(self, rng_seed):
+        pass
+
+    def act(self, obs):
+        import {name}_act
+
+        return {name}_act.ACTION
+
+
+def make_controller(spec):
+    import {name}_factory
+
+    return C()
+"""
+
+
+def test_lazy_imports_from_the_submission_write_no_bytecode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sibling modules imported later (in make_controller or act) leave no __pycache__ behind,
+    so the submission still loads and hashes the same after it has run."""
+    name = f"lazy_{tmp_path.name.replace('-', '_')}"
+    root = tmp_path / "bot"
+    write(root, "controller.py", LAZY.replace("{name}", name))
+    write(root, f"{name}_factory.py", "X = 1\n")
+    write(root, f"{name}_act.py", "ACTION = (0.0, 0.0)\n")
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    try:
+        first = load_submission(root)
+        controller = first.factory(SPEC)
+        controller.reset(0)
+        assert controller.act(None) == (0.0, 0.0)  # type: ignore[arg-type]
+    finally:
+        for module in (f"{name}_factory", f"{name}_act"):
+            sys.modules.pop(module, None)
+    assert sorted(p.name for p in root.iterdir()) == sorted(
+        ["controller.py", f"{name}_factory.py", f"{name}_act.py"]
+    )
+    assert load_submission(root).sha256 == first.sha256
+
+
 def test_symlinked_files_are_refused(tmp_path: Path) -> None:
     secret = write(tmp_path, "secret.txt", "token")
     root = tmp_path / "bot"
@@ -234,8 +286,28 @@ def test_special_files_are_refused_without_blocking(tmp_path: Path) -> None:
     root = tmp_path / "bot"
     write(root, "controller.py", GOOD)
     os.mkfifo(root / "pipe")
-    with pytest.raises(LoadError, match="regular file"):
-        load_submission(root)
+    outcome: list[BaseException | None] = []
+
+    def load() -> None:
+        try:
+            load_submission(root)
+        except BaseException as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    # Opening a FIFO blocks until a writer appears: run the load in a daemon thread so that a
+    # regression fails this test instead of hanging the worker forever.
+    worker = threading.Thread(target=load, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    if worker.is_alive():
+        with open(root / "pipe", "wb"):  # unblock the reader so the thread can finish
+            pass
+        pytest.fail("load_submission blocked on a FIFO")
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], LoadError)
+    assert "regular file" in str(outcome[0])
 
 
 def test_size_cap_is_exact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

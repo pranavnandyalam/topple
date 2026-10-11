@@ -16,7 +16,15 @@ from pydantic import BaseModel, ConfigDict, NonNegativeFloat, model_validator
 from topple import __version__
 from topple.challenge import Challenge, load_challenge
 from topple.contract import FEATURES, BalancerObs, clip_action, validate_action
-from topple.disturbances import PRESETS, Preset, Push, Scenario, make_scenario, push_force_world
+from topple.disturbances import (
+    PRESETS,
+    Preset,
+    Push,
+    Scenario,
+    check_push_schedule,
+    make_scenario,
+    push_force_world,
+)
 from topple.estimation import (
     cf_step,
     encoder_counts,
@@ -266,6 +274,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             math.isfinite(scenario.init_pitch_rad) and math.isfinite(scenario.init_pitch_rate_rads)
         ):
             raise ValueError("initial pitch and pitch rate must be finite")
+        check_push_schedule(scenario.pushes)
 
         self._scenario = scenario
         self._sensors_ideal = PRESETS[scenario.preset].sensors == "ideal"

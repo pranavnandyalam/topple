@@ -154,3 +154,21 @@ def test_protocol_hash_rejects_unknown_presets_and_bad_seeds() -> None:
 
 def test_env_algo_version_starts_at_one() -> None:
     assert ENV_ALGO_VERSION == 1
+
+
+def test_bundle_hash_covers_files_the_scene_references(bundle: Path) -> None:
+    """A scene asset (here a floor texture) is part of the bundle: editing it changes the hash."""
+    scene = bundle / "scene.xml"
+    scene.write_text(
+        scene.read_text().replace(
+            "<asset>", '<asset>\n    <texture name="tiles" type="2d" file="tiles.png"/>', 1
+        )
+    )
+    tiles = bundle / "tiles.png"
+    tiles.write_bytes(b"first")
+    challenge = load_challenge_dir(bundle)
+    assert tiles.resolve() in challenge.bundle_files()
+    before = challenge.bundle_hash()
+    assert before == reference_bundle_hash(bundle, (*BUNDLE_FILES, "tiles.png"))
+    tiles.write_bytes(b"second")
+    assert load_challenge_dir(bundle).bundle_hash() != before

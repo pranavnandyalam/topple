@@ -5,10 +5,10 @@ import pickle
 import struct
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import FrozenInstanceError
 from fractions import Fraction
-from typing import Any
+from typing import Any, overload
 
 import numpy as np
 import pytest
@@ -218,16 +218,40 @@ def test_validate_action_accepts(action: object) -> None:
     assert len(out) == 2
 
 
+READ_CAP = 16  # far above dim + 1: reading this many items means the islice guard is gone
+
+
 class Endless:
-    """Re-iterable (not an iterator itself) and never runs out."""
+    """Re-iterable (not an iterator itself) and never runs out, up to ``READ_CAP`` items.
+
+    Past the cap it raises instead of serving more: unbounded, a regression that materializes the
+    action (``list(action)``) would eat memory until the machine falls over instead of failing.
+    """
 
     def __init__(self) -> None:
         self.served = 0
 
     def __iter__(self) -> Iterator[float]:
-        while True:
+        while self.served < READ_CAP:
             self.served += 1
             yield 0.0
+        raise AssertionError(f"validate_action read more than {READ_CAP} items")
+
+
+class Huge(Sequence[float]):
+    """Claims 10**12 items (like ``range(10**12)``) but serves at most ``READ_CAP`` of them."""
+
+    def __len__(self) -> int:
+        return 10**12
+
+    @overload
+    def __getitem__(self, index: int) -> float: ...
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[float]: ...
+    def __getitem__(self, index: int | slice) -> float | Sequence[float]:
+        if not isinstance(index, int) or index >= READ_CAP:
+            raise AssertionError(f"validate_action read more than {READ_CAP} items")
+        return 0.0
 
 
 class Raises:
@@ -279,7 +303,7 @@ class BadReal(float):
         frozenset({0.1, 0.2}),
         bytearray(b"\x01\x00"),
         b"\x01\x00",
-        range(10**12),
+        Huge(),
         Endless(),
         Raises("ndim"),
         Raises("iter"),
@@ -298,6 +322,8 @@ def test_validate_action_reads_at_most_one_item_too_many() -> None:
     with pytest.raises(ActionError, match="more than 2"):
         validate_action(endless, dim=2)
     assert endless.served == 3
+    with pytest.raises(ActionError, match="more than 2"):
+        validate_action(Huge(), dim=2)
 
 
 def test_validate_action_never_runs_a_returned_generator() -> None:
