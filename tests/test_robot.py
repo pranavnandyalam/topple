@@ -239,6 +239,16 @@ def test_robot_hash_changes_with_params(params: RobotParams) -> None:
 
 
 BALANCE_V1_ROBOT_HASH = "03f5654f03eff5be5cb7689b3b06356f42c8c4a1b3ed60795d7e8501a767ca59"
+# The params exactly as robot_hash serializes them (contract §3): Python's json.dumps defaults with
+# sorted keys, so ", " and ": " separators and floats in repr form ("30.0", never "30").
+BALANCE_V1_PARAMS_JSON = (
+    '{"contact": {"wheel_friction": 1.0}, "estimation": {"cf_tau_s": 0.5}, '
+    '"motor": {"armature": 0.0001, "frictionloss_nm": 0.02, "omega_noload_rads": 30.0, '
+    '"stall_current_a": 1.5, "tau_stall_nm": 0.3, "torque_limit_nm": 0.3, "v_nom": 7.4}, '
+    '"safety": {"fall_angle_rad": 0.7}, '
+    '"sensing": {"accel_noise_ms2": 0.05, "accel_range_ms2": 39.2, "encoder_cpr": 1320, '
+    '"gyro_noise_rads": 0.01, "gyro_range_rads": 8.73}}'
+)
 LEFT_BODY = '<body name="left_wheel_body" pos="0 0.07 0">'
 RIGHT_BODY = '<body name="right_wheel_body" pos="0 -0.07 0">'
 LEFT_JOINT = '<joint name="left_wheel" type="hinge" axis="0 1 0"/>'
@@ -477,6 +487,14 @@ def test_balance_v1_robot_hash_is_unchanged(params: RobotParams) -> None:
     """balance-v1 references no asset files, so covering them leaves its hash as it was."""
     assert referenced_files(ROBOT_XML) == ()
     assert robot_hash(ROBOT_XML, params) == BALANCE_V1_ROBOT_HASH
+
+
+def test_robot_hash_recipe_is_reproducible_from_the_contract(params: RobotParams) -> None:
+    """§3 written out as a port would: the MJCF bytes, then the params' JSON text exactly as
+    pinned above (a compact or JavaScript serializer would write ``30`` and change the hash)."""
+    assert json.dumps(params.model_dump(), sort_keys=True) == BALANCE_V1_PARAMS_JSON
+    digest = hashlib.sha256(ROBOT_XML.read_bytes() + BALANCE_V1_PARAMS_JSON.encode("ascii"))
+    assert digest.hexdigest() == BALANCE_V1_ROBOT_HASH
 
 
 MESH = "v 0 0 0\nv 0.01 0 0\nv 0 0.01 0\nv 0 0 0.01\nf 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n"

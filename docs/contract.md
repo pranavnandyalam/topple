@@ -96,8 +96,11 @@ world:
 `track_width_m` the distance between the wheel bodies along y; both reach the controller through
 `TaskSpec.robot`.
 
-`robot_hash(robot_xml, params)` = sha256 of the MJCF bytes, then the params as sorted-key JSON,
-then, for every file the MJCF references (`<include>` recursively, meshes, skins and height fields
+`robot_hash(robot_xml, params)` = sha256 of the MJCF bytes, then the params as JSON text exactly as
+Python's `json.dumps(params.model_dump(), sort_keys=True)` writes it (UTF-8; keys sorted at every
+level; separators `", "` and `": "`; floats in Python's shortest round-trip form, so `30.0` is
+written `30.0`, never `30`; balance-v1's text is pinned in `tests/test_robot.py`), then, for every
+file the MJCF references (`<include>` recursively, meshes, skins and height fields
 via `meshdir`, textures via `texturedir`, other `file` attributes relative to the MJCF; `assetdir`
 sets both directories; a sub-model `<asset><model file>` together with every file *it*
 references, recursively, resolved as MuJoCo does against the sub-model's own directory and
@@ -258,8 +261,10 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   carry terminal escapes or line breaks. Loading a submission turns bytecode writing off for the
   rest of the process (`sys.dont_write_bytecode`), so neither its import nor a later import of a
   sibling module (in `make_controller`, `reset` or `act`) writes bytecode next to it. The
-  submission sha256 covers every file as length-framed `(POSIX relpath, size, bytes)` records in
-  POSIX-path string order.
+  submission sha256 is sha256 of the tag `topple.submission/1\n`, then, for every file in
+  POSIX-path string order, `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths; `path`
+  is the UTF-8 POSIX path relative to the submission directory, or the file's name for a
+  single-file submission; `bytes` exactly as on disk, never normalized).
 - **The sha256 covers the code that runs.** The entry file (the `.py` file, or `controller.py`)
   is read once: those bytes are hashed, and those bytes are compiled (as Python compiles a
   module, inheriting no `__future__` flags from the loader) and run as the submission's module.
@@ -323,14 +328,20 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
 | `clean` | full (§5) | full | none |
 | `standard` | full | full | 1–3 per episode |
 
+Every preset, `ideal` included, draws the initial pitch U(−3°, 3°) from the INIT stream (pitch
+rate 0), so one seed starts every preset at the same pitch.
+
 Randomization (`clean`, `standard`), per episode:
 chassis mass ×U(0.9, 1.1) (inertia scaled with it), COM x offset U(−3, 3) mm, wheel–floor friction
 ×U(0.9, 1.1), motor gain common ×U(0.9, 1.1) × per-wheel ×U(0.95, 1.05) (gain only; back-EMF
 fixed), frictionloss ×U(0.5, 1.5), actuator delay ∈ {0, 2, 4, 6, 8, 10} ms, IMU mounting pitch
-offset U(−1°, 1°), gyro bias U(−0.01, 0.01) rad/s per axis. Initial pitch U(−3°, 3°), pitch rate 0.
+offset U(−1°, 1°), gyro bias U(−0.01, 0.01) rad/s per axis.
 
-Pushes (`standard`): count ∈ {1, 2, 3}; first at t ≥ 1.0 s, spacing ≥ 1.5 s, all before
-t = 8.5 s; rectangular pulse of 0.1 s applied at site `push_point` (`mj_applyFT`); direction fixed
+Pushes (`standard`): count ∈ {1, 2, 3}; start times drawn with the first at t ≥ 1.0 s, spacing
+≥ 1.5 s and the last at t ≤ 8.5 s, then rounded to the control grid
+(`start_step = round(t / control_dt)`), so pushes start on steps 100 to 850 inclusive, at least
+150 steps apart (the last lands exactly on 8.50 s for about 0.15% of seeds, public seed 1001
+among them); rectangular pulse of 0.1 s applied at site `push_point` (`mj_applyFT`); direction fixed
 in the world frame at onset: ± along the heading, lateral component ≤ 0.3 of the magnitude;
 the application point (`push_point`'s position) and the Jacobian `mj_applyFT` uses come from
 MuJoCo's data of the previous substep, so like contacts and the IMU (§5, §11) they lag the state
@@ -417,8 +428,12 @@ a change cannot land unnoticed.
   files are exactly: `challenge.yaml`, the scene, the robot params, every `*.xml` in the robot
   MJCF's directory, and every file the scene or robot MJCF references (§3). Other files in the
   directory do not count; a listed file outside the bundle directory is an error.
-- `protocol_hash(preset, seeds, salt)` = sha256 of the canonical JSON (sorted keys, no
-  whitespace) of `{format: "topple.protocol/1", env_algo_version, bundle: bundle_hash,
+- `protocol_hash(preset, seeds, salt)` = sha256 of the canonical JSON (UTF-8; keys sorted at
+  every level; separators `,` and `:` with no whitespace; floats in Python's shortest round-trip
+  form, so `13.0` is written `13.0`, never `13`: Python's
+  `json.dumps(…, sort_keys=True, separators=(",", ":"), allow_nan=False)`; the standard
+  protocol's text is pinned in `tests/test_challenge.py`) of
+  `{format: "topple.protocol/1", env_algo_version, bundle: bundle_hash,
   preset: <the full preset definition: name, sensor model, randomize flag, randomization ranges,
   push config>, score: <ScoreConfig>, seeds: <seed list in order>, salt}`. Seeds default to the
   public list, salt to 0. A private protocol's hash includes its 128-bit secret salt, which keeps

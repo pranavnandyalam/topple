@@ -94,6 +94,16 @@ def test_ideal_has_nominal_model_and_no_pushes() -> None:
     assert abs(s.init_pitch_rad) <= math.radians(3) + 1e-12
 
 
+@pytest.mark.parametrize("seed", [0, 1000, 2**53 - 1])
+def test_every_preset_draws_the_same_initial_pitch(seed: int) -> None:
+    """§10: every preset, ``ideal`` included, draws its initial pitch U(-3°, 3°) from the INIT
+    stream (pitch rate 0), so one seed starts every preset at the same pitch."""
+    drawn = [scenario(seed, preset) for preset in PRESETS]
+    assert len({s.init_pitch_rad for s in drawn}) == 1
+    assert 0.0 < abs(drawn[0].init_pitch_rad) <= math.radians(3.0)
+    assert {s.init_pitch_rate_rads for s in drawn} == {0.0}
+
+
 def test_clean_randomizes_without_pushes() -> None:
     s = scenario(3, "clean")
     assert s.pushes == ()
@@ -126,6 +136,30 @@ def test_standard_ranges(seed: int) -> None:
         assert pushes.impulse_ns[0] - 1e-9 <= impulse <= pushes.impulse_ns[1] + 1e-9
         assert abs(p.lateral_ratio) <= pushes.lateral_fraction_max
         assert p.forward_sign in (-1.0, 1.0)
+
+
+def check_push_grid(seed: int) -> list[int]:
+    """§10 on the 10 ms control grid: the first push at step >= 100 (1.0 s), starts >= 150
+    steps (1.5 s) apart, the last at step <= 850: at or before 8.5 s."""
+    steps = [p.start_step for p in scenario(seed).pushes]
+    assert steps[0] >= 100
+    assert steps[-1] <= 850
+    assert all(b - a >= 150 for a, b in itertools.pairwise(steps))
+    return steps
+
+
+def test_push_starts_stay_on_the_documented_grid() -> None:
+    """Start times are rounded to the control grid, so the last can land exactly on 8.50 s (it
+    does for about 0.15% of seeds, public seed 1001 among them)."""
+    last_on_bound = [seed for seed in range(5000) if check_push_grid(seed)[-1] == 850]
+    assert last_on_bound
+    assert check_push_grid(1001)[-1] == 850
+
+
+@settings(max_examples=300, deadline=None)
+@given(seed=st.integers(0, 2**53 - 1))
+def test_push_starts_stay_on_the_documented_grid_for_any_seed(seed: int) -> None:
+    check_push_grid(seed)
 
 
 def test_push_count_varies_across_seeds() -> None:
