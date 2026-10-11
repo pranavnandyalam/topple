@@ -12,7 +12,6 @@ world-frame force, its tip touching the robot where the force's line of action t
 from __future__ import annotations
 
 import itertools
-import os
 from collections.abc import Generator, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +22,7 @@ import mujoco
 import numpy as np
 import numpy.typing as npt
 
+from topple._atomic import replacement
 from topple.challenge import load_challenge
 from topple.evaluate import wants_epilogue
 from topple.rendering import make_renderer
@@ -244,18 +244,21 @@ def _draw_arrow(
 
 
 def _write(path: Path, fps: int, frames: Iterable[Frame]) -> int:
-    """Encode into a hidden sibling file and move it into place only once it is complete."""
+    """Encode into a new hidden sibling file and move it into place only once it is complete.
+
+    The sibling has a random name and is created exclusively, and the move replaces a symlink at
+    ``path`` instead of writing through it, so links planted in the output directory never
+    redirect the video (``topple._atomic``).
+    """
     suffix = path.suffix.lower()
-    partial = path.with_name(f".{path.stem}.partial{suffix}")
     count = 0
-    try:
-        with _open_writer(partial, suffix, fps) as writer:
-            for frame in frames:
-                writer.append_data(frame)
-                count += 1
-        os.replace(partial, path)
-    finally:
-        partial.unlink(missing_ok=True)  # still there only if encoding failed
+    with (
+        replacement(path, suffix=f".partial{suffix}") as partial,  # ffmpeg needs the suffix
+        _open_writer(partial, suffix, fps) as writer,
+    ):
+        for frame in frames:
+            writer.append_data(frame)
+            count += 1
     return count
 
 

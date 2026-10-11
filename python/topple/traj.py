@@ -26,6 +26,7 @@ from typing import IO, Any, NoReturn
 import numpy as np
 import numpy.typing as npt
 
+from topple._atomic import replacement
 from topple.contract import BALANCE_V1_ACTION, FEATURES
 
 FORMAT = "topple.traj/1"
@@ -133,6 +134,9 @@ class Trajectory:
             )
 
     def save_npz(self, path: Path) -> None:
+        """Write the trajectory to ``path`` atomically (contract §14): through a new temporary
+        file, mode 0644, renamed over ``path``, so a symlink at ``path`` is replaced, never
+        written through, and a failed write leaves ``path`` as it was."""
         meta = {"format": FORMAT, **self.meta}
         arrays = {name: getattr(self, name) for name in _SCHEMA}
         arrays["meta_json"] = np.frombuffer(
@@ -141,8 +145,8 @@ class Trajectory:
         for name, arr in arrays.items():
             if arr.dtype not in _ALLOWED_DTYPES or not arr.flags.c_contiguous:
                 raise ValueError(f"{name}: dtype {arr.dtype} not allowed in {FORMAT}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(path, **arrays)
+        with replacement(path) as tmp, tmp.open("wb") as fh:
+            np.savez_compressed(fh, **arrays)
 
 
 def load_npz(path: Path, *, max_steps: int) -> Trajectory:

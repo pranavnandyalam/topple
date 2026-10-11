@@ -159,6 +159,28 @@ def test_failure_mid_render_leaves_no_file(
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("suffix", [".mp4", ".gif"])
+def test_writing_never_follows_a_planted_symlink(tmp_path: Path, suffix: str) -> None:
+    """A checkout can plant symlinks in the output directory, at the video's name or at the old
+    predictable partial name: the encoder must write neither through to the link's target."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    out = tmp_path / "out"
+    out.mkdir()
+    final = out / f"episode{suffix}"
+    final.symlink_to(victim)
+    (out / f".episode.partial{suffix}").symlink_to(victim)
+    frames = [np.full((48, 64, 3), 90, np.uint8)] * 3
+    assert topple.video._write(final, 25, frames) == 3
+    assert victim.read_text() == "precious"
+    assert final.is_file()
+    assert not final.is_symlink()
+    assert final.stat().st_size > 0
+    assert sorted(p.name for p in out.iterdir()) == sorted(
+        [final.name, f".episode.partial{suffix}"]
+    )
+
+
 def test_rendering_unavailable_creates_no_files(
     fallen: Trajectory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

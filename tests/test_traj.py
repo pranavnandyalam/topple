@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import stat
 import struct
 import tempfile
 import threading
@@ -1054,3 +1055,47 @@ def test_a_zero_dimensional_member_is_refused(tmp_path: Path) -> None:
     write_members(path, members)
     with pytest.raises(ValueError, match=r"scalar\.npz: qpos must be 2-D, got header shape \(\)"):
         load_npz(path, max_steps=1000)
+
+
+# ------------------------------------------------------------------ writing (§14)
+
+
+def test_saving_replaces_a_planted_symlink_instead_of_writing_through_it(tmp_path: Path) -> None:
+    """A checkout can plant ``out/run/traj_000.npz -> ~/.zshrc``: saving must not clobber the
+    link's target."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "traj_000.npz").symlink_to(victim)
+    traj = make_traj()
+    traj.save_npz(out / "traj_000.npz")
+    assert victim.read_text() == "precious"
+    assert not (out / "traj_000.npz").is_symlink()
+    assert load_npz(out / "traj_000.npz", max_steps=5).meta == traj.meta
+    assert [p.name for p in out.iterdir()] == ["traj_000.npz"]  # no temporary file left
+    assert stat.S_IMODE((out / "traj_000.npz").stat().st_mode) == 0o644
+
+
+def test_a_failed_save_leaves_the_old_file_and_no_temporary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "traj_000.npz"
+    make_traj(t=3).save_npz(path)
+    before = path.read_bytes()
+
+    def half_written(file: object, **arrays: object) -> None:
+        file.write(b"PK\x03\x04 half")  # type: ignore[attr-defined]
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(traj_module.np, "savez_compressed", half_written)
+    with pytest.raises(OSError, match="No space left"):
+        make_traj(t=5).save_npz(path)
+    assert path.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["traj_000.npz"]
+
+
+def test_saving_creates_missing_directories(tmp_path: Path) -> None:
+    path = tmp_path / "a" / "b" / "traj_000.npz"
+    make_traj().save_npz(path)
+    assert load_npz(path, max_steps=5).steps == 5

@@ -419,6 +419,12 @@ can be re-simulated open loop and must reproduce exactly on the same platform an
 A trajectory file is untrusted data: nothing in it is ever scored directly; the trusted path
 verifies and re-scores it by replay (§16).
 
+**Writing** (`Trajectory.save_npz(path)`) is atomic: the file is written to a new temporary file
+in the target directory (created exclusively, under a random name), mode 0644 whatever the umask,
+then renamed over `path`. An output directory can come from someone else's checkout, so a symlink
+at `path` is replaced, never written through; a failed write leaves `path` as it was. Replay
+videos are written the same way.
+
 **Loading** (`load_npz(path, *, max_steps)`; `max_steps` is required, so every caller bounds T)
 reads the archive and each member by hand and raises `ValueError`, naming the file, for anything
 else, including unreadable, truncated or missing files and corrupted members:
