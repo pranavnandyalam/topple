@@ -284,18 +284,24 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   with each operation rounded (never a fused multiply-add: numpy's C `uniform` computes the same
   expression, but its macOS arm64 and Linux x86_64 builds disagree in the last bit). Choices (push
   count, push sign, actuator delay) use `Generator.integers`, which only uses raw bits.
-- `Scenario.from_dict` validates what it reads, and `ValueError` rejects anything else: exact key
-  sets of string keys; numbers that fit a float (a huge JSON integer does not) and are finite;
-  integer `start_step`/`n_substeps`; pushes sorted by `start_step` with no two at the same step,
-  `0 ≤ start_step < max_steps` (when the episode length is known), `n_substeps ≥ 1`,
-  `0 ≤ magnitude_n ≤ 50` N, `forward_sign = ±1`, `|lateral_ratio| ≤ 1`; scales in [0.5, 2]
-  (frictionloss [0, 3]), `|com_x_offset_m| ≤ 0.02`, `0 ≤ actuator_delay_s ≤ 0.010`,
-  `|imu_pitch_offset_rad| ≤ 0.1`, `|gyro_bias| ≤ 0.1` rad/s per axis. Every preset draws well
-  inside these bounds; `reset(options={"scenario": dict})` goes through this check. In-process
-  `Scenario` objects and the `pushes`/`init_pitch_rad`/`init_pitch_rate` reset options are trusted
-  test hooks and skip the bounds (robustness tests use absurd pushes), but every reset path still
-  requires finite initial pitch and rate and pushes sorted by `start_step` with no two at one step
-  (two at one step could not both run).
+- `Scenario.from_dict(data, *, clock=None)` validates what it reads, and `ValueError` rejects
+  anything else: exact key sets of string keys; numbers that fit a float (a huge JSON integer
+  does not) and are finite; integer `start_step`/`n_substeps`, exact in a float (|n| ≤ 2**53);
+  pushes sorted by `start_step` with no two at the same step, `start_step ≥ 0`,
+  `n_substeps ≥ 1`, `0 ≤ magnitude_n ≤ 50` N, `forward_sign = ±1`, `|lateral_ratio| ≤ 1`; scales
+  in [0.5, 2] (frictionloss [0, 3]), `|com_x_offset_m| ≤ 0.02`, `0 ≤ actuator_delay_s ≤ 0.010`,
+  `|imu_pitch_offset_rad| ≤ 0.1`, `|gyro_bias| ≤ 0.1` rad/s per axis. With the env's
+  `EpisodeClock` (`timestep`, `frame_skip`, `max_steps`: `BalanceEnv.clock`) every push must also
+  fit the episode: `start_step < max_steps`; `n_substeps ≤ max_steps · frame_skip`; impulse
+  `magnitude_n · n_substeps · timestep ≤ 5` N·s (the force cap held for a standard 0.1 s pulse);
+  and each push ends before the next begins
+  (`start_step · frame_skip + n_substeps ≤ next.start_step · frame_skip`). Every preset draws
+  well inside these bounds; `reset(options={"scenario": dict})` goes through this check with the
+  env's clock. In-process `Scenario` objects and the `pushes`/`init_pitch_rad`/`init_pitch_rate`
+  reset options are trusted test hooks and skip the bounds (robustness tests use absurd pushes),
+  but every reset path still requires finite initial pitch and rate and pushes sorted by
+  `start_step` that never overlap: the env runs one push at a time, so two at one step, or one
+  starting while another is active, would silently cut one short.
 - `reset(seed=None)` (training): `episode_seed = int(self.np_random.integers(2**53))`, returned in
   `info["episode_seed"]` so any training failure can be replayed.
 

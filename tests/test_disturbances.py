@@ -12,10 +12,14 @@ from hypothesis import strategies as st
 
 from topple.disturbances import (
     MAX_PUSH_FORCE_N,
+    MAX_PUSH_IMPULSE_NS,
     MAX_PUSHES,
     PRESETS,
+    EpisodeClock,
+    Push,
     PushConfig,
     Scenario,
+    check_push_schedule,
     make_scenario,
     push_force_world,
     validate_scenario,
@@ -25,6 +29,9 @@ from topple.rng import Stream, stream_rng
 TIMESTEP = 0.002
 CONTROL_DT = 0.01
 EPISODE_S = 10.0
+FRAME_SKIP = 5
+MAX_STEPS = round(EPISODE_S / CONTROL_DT)
+CLOCK = EpisodeClock(timestep=TIMESTEP, frame_skip=FRAME_SKIP, max_steps=MAX_STEPS)
 
 
 def scenario(seed: int, preset: str = "standard") -> Scenario:
@@ -126,8 +133,6 @@ def test_scenario_rejects_unknown_preset_name() -> None:
 
 # ------------------------------------------------------------------ Scenario.from_dict validation
 
-MAX_STEPS = round(EPISODE_S / CONTROL_DT)
-
 
 @settings(max_examples=60, deadline=None)
 @given(
@@ -136,7 +141,7 @@ MAX_STEPS = round(EPISODE_S / CONTROL_DT)
 )
 def test_every_drawn_scenario_round_trips_and_validates(seed: int, preset: str) -> None:
     s = scenario(seed, preset)
-    assert Scenario.from_dict(json.loads(json.dumps(s.to_dict())), max_steps=MAX_STEPS) == s
+    assert Scenario.from_dict(json.loads(json.dumps(s.to_dict())), clock=CLOCK) == s
 
 
 def test_from_dict_accepts_json_integers_for_real_fields() -> None:
@@ -179,6 +184,18 @@ def duplicate_push(data: dict[str, Any]) -> None:
     data["pushes"][1]["start_step"] = data["pushes"][0]["start_step"]
 
 
+def overlap_pushes(data: dict[str, Any]) -> None:
+    """Start the second push 3 control steps (15 substeps) into the first one's 50 substeps."""
+    data["pushes"][1]["start_step"] = data["pushes"][0]["start_step"] + 3
+
+
+def push_fields(index: int, **values: Any) -> Callable[[dict[str, Any]], None]:
+    def apply(data: dict[str, Any]) -> None:
+        data["pushes"][index].update(values)
+
+    return apply
+
+
 def mixed_type_keys(*path: Any) -> Callable[[dict[str, Any]], None]:
     """Add unknown keys of mixed types, which cannot be sorted against each other."""
 
@@ -210,6 +227,14 @@ BAD_SCENARIOS: dict[str, Callable[[dict[str, Any]], None]] = {
     "pushes not a list": setter("pushes", value={"0": 1}),
     "pushes unsorted": swap_pushes,
     "pushes share a step": duplicate_push,
+    "pushes overlap": overlap_pushes,
+    "push outlasts the episode": push_fields(
+        0, magnitude_n=0.0, n_substeps=MAX_STEPS * FRAME_SKIP + 1
+    ),
+    "push impulse above the cap": push_fields(0, magnitude_n=MAX_PUSH_FORCE_N, n_substeps=51),
+    "push substeps not exact": setter("pushes", 0, "n_substeps", value=2**53 + 1),
+    "push substeps huge int": setter("pushes", 0, "n_substeps", value=10**5000),
+    "push step huge int": setter("pushes", 1, "start_step", value=10**5000),
     "push before the episode": setter("pushes", 0, "start_step", value=-1),
     "push after the episode": setter("pushes", 1, "start_step", value=MAX_STEPS),
     "push step not int": setter("pushes", 0, "start_step", value=150.5),
@@ -255,10 +280,10 @@ BAD_SCENARIOS: dict[str, Callable[[dict[str, Any]], None]] = {
 @pytest.mark.parametrize("mutate", BAD_SCENARIOS.values(), ids=BAD_SCENARIOS.keys())
 def test_from_dict_rejects_bad_scenarios(mutate: Callable[[dict[str, Any]], None]) -> None:
     data = copy.deepcopy(with_two_pushes())
-    Scenario.from_dict(copy.deepcopy(data), max_steps=MAX_STEPS)  # the unmutated one is fine
+    Scenario.from_dict(copy.deepcopy(data), clock=CLOCK)  # the unmutated one is fine
     mutate(data)
     with pytest.raises(ValueError, match="scenario"):
-        Scenario.from_dict(data, max_steps=MAX_STEPS)
+        Scenario.from_dict(data, clock=CLOCK)
 
 
 JSON_LEAVES = (
@@ -304,7 +329,7 @@ def test_from_dict_raises_only_value_error(path: tuple[Any, ...], value: Any) ->
     data = with_two_pushes()
     setter(*path, value=value)(data)
     try:
-        Scenario.from_dict(data, max_steps=MAX_STEPS)
+        Scenario.from_dict(data, clock=CLOCK)
     except ValueError as exc:
         message = str(exc)
     else:
@@ -343,18 +368,117 @@ def test_from_dict_rejects_non_mappings(data: Any) -> None:
         Scenario.from_dict(data)
 
 
-def test_push_steps_are_only_bounded_above_when_the_episode_length_is_known() -> None:
+def test_push_steps_are_only_bounded_above_when_the_clock_is_known() -> None:
     data = with_two_pushes()
     data["pushes"][1]["start_step"] = MAX_STEPS + 5
     assert Scenario.from_dict(data).pushes[1].start_step == MAX_STEPS + 5
     with pytest.raises(ValueError, match="scenario"):
-        Scenario.from_dict(data, max_steps=MAX_STEPS)
+        Scenario.from_dict(data, clock=CLOCK)
+
+
+# ------------------------------------------------------------------ push schedules (F1, F18)
+
+
+def two_pushes(first: Push, second: Push) -> dict[str, Any]:
+    data = with_two_pushes()
+    data["pushes"] = [vars(first).copy(), vars(second).copy()]
+    return data
+
+
+def test_overlapping_pushes_are_rejected() -> None:
+    """A push that starts while another is active would cut it short (the env runs one push at
+    a time): (100, 50 substeps) then (103, 50) would deliver 65 of the 100 substeps stated."""
+    data = two_pushes(Push(100, 50, 3.0, 1.0, 0.0), Push(103, 50, 3.0, 1.0, 0.0))
+    with pytest.raises(ValueError, match=r"invalid scenario: .*overlap"):
+        Scenario.from_dict(data, clock=CLOCK)
+    with pytest.raises(ValueError, match="overlap"):
+        check_push_schedule(Scenario.from_dict(data).pushes, frame_skip=FRAME_SKIP)
+
+
+def test_back_to_back_pushes_are_accepted() -> None:
+    """A push may start on the substep after the previous one ends: 15 substeps from step 100
+    end exactly where step 103 begins."""
+    first, second = Push(100, 15, 3.0, 1.0, 0.0), Push(103, 50, 3.0, -1.0, 0.0)
+    parsed = Scenario.from_dict(two_pushes(first, second), clock=CLOCK)
+    assert parsed.pushes == (first, second)
+    check_push_schedule(parsed.pushes, frame_skip=FRAME_SKIP)
+    with pytest.raises(ValueError, match="overlap"):
+        check_push_schedule((replace(first, n_substeps=16), second), frame_skip=FRAME_SKIP)
+
+
+def test_overlap_needs_the_frame_skip_to_be_seen() -> None:
+    """Steps and substeps only compare through the frame skip: without it only the order and
+    the one-push-per-step rule can be checked."""
+    pushes = (Push(100, 50, 3.0, 1.0, 0.0), Push(103, 50, 3.0, 1.0, 0.0))
+    check_push_schedule(pushes)
+    with pytest.raises(ValueError, match="overlap"):
+        check_push_schedule(pushes, frame_skip=FRAME_SKIP)
+    with pytest.raises(ValueError, match="sorted by start_step"):
+        check_push_schedule(pushes[::-1], frame_skip=FRAME_SKIP)
+
+
+def test_the_impulse_cap_is_the_force_cap_held_for_a_standard_pulse() -> None:
+    cfg = PushConfig()
+    assert pytest.approx(MAX_PUSH_FORCE_N * cfg.duration_s) == MAX_PUSH_IMPULSE_NS
+    assert 10 * cfg.impulse_ns[1] <= MAX_PUSH_IMPULSE_NS  # far above every calibrated push
+    at_cap = push_fields(0, magnitude_n=MAX_PUSH_FORCE_N, n_substeps=50)
+    data = with_two_pushes()
+    at_cap(data)
+    assert Scenario.from_dict(data, clock=CLOCK).pushes[0].n_substeps == 50
+
+
+def test_a_sustained_push_is_bounded_by_its_impulse() -> None:
+    """50 N held for the whole episode is 500 N·s, a thousand times a calibrated push."""
+    data = with_two_pushes()
+    data["pushes"] = data["pushes"][:1]
+    push_fields(0, magnitude_n=MAX_PUSH_FORCE_N, n_substeps=MAX_STEPS * FRAME_SKIP)(data)
+    with pytest.raises(ValueError, match="impulse"):
+        Scenario.from_dict(data, clock=CLOCK)
+    push_fields(0, magnitude_n=0.0)(data)  # a zero-force push may last the whole episode
+    assert Scenario.from_dict(data, clock=CLOCK).pushes[0].n_substeps == MAX_STEPS * FRAME_SKIP
+
+
+@pytest.mark.parametrize("field", ["start_step", "n_substeps"])
+def test_push_integers_must_be_exact_in_a_json_double(field: str) -> None:
+    """Even without a clock: an integer JSON cannot carry exactly (or at all, beyond 4300
+    digits) would make the scenario unwritable."""
+    data = with_two_pushes()
+    data["pushes"][1][field] = 2**53
+    Scenario.from_dict(data)
+    for value in (2**53 + 1, 10**5000):
+        data["pushes"][1][field] = value
+        with pytest.raises(ValueError, match=rf"pushes\[1\]\.{field} .*2\*\*53"):
+            Scenario.from_dict(data)
+
+
+def test_accepted_scenarios_are_writable() -> None:
+    data = with_two_pushes()
+    push_fields(1, n_substeps=MAX_STEPS * FRAME_SKIP, magnitude_n=0.0)(data)
+    parsed = Scenario.from_dict(data, clock=CLOCK)
+    assert Scenario.from_dict(json.loads(json.dumps(parsed.to_dict())), clock=CLOCK) == parsed
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"timestep": 0.0},
+        {"timestep": math.nan},
+        {"timestep": math.inf},
+        {"frame_skip": 0},
+        {"max_steps": 0},
+        {"frame_skip": 5.0},
+        {"max_steps": True},
+    ],
+)
+def test_an_episode_clock_must_be_well_formed(fields: dict[str, Any]) -> None:
+    with pytest.raises(ValueError, match="clock"):
+        EpisodeClock(**{**vars(CLOCK), **fields})
 
 
 def test_presets_stay_inside_the_scenario_bounds() -> None:
     """The randomization ranges and push config can only produce scenarios from_dict accepts."""
     for seed in range(200):
-        Scenario.from_dict(scenario(seed).to_dict(), max_steps=MAX_STEPS)
+        Scenario.from_dict(scenario(seed).to_dict(), clock=CLOCK)
     assert PushConfig().max_force_n == MAX_PUSH_FORCE_N
 
 

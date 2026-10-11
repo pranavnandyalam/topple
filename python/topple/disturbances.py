@@ -31,6 +31,31 @@ MAX_COM_X_OFFSET_M = 0.02
 MAX_IMU_PITCH_OFFSET_RAD = 0.1
 MAX_GYRO_BIAS_RADS = 0.1
 MAX_LATERAL_RATIO = 1.0
+# The force cap held for a standard 0.1 s pulse: 11x the strongest calibrated push (0.45 N·s).
+MAX_PUSH_IMPULSE_NS = 5.0
+MAX_EXACT_INT = 2**53  # a scenario's integers must be exact in a JSON double, like seeds
+
+
+@dataclass(frozen=True)
+class EpisodeClock:
+    """What a scenario's step counts mean in the env that runs it (contract §4, §9).
+
+    Pushes start at a control step and last a number of physics substeps, so only with the
+    physics ``timestep``, the substeps per control step (``frame_skip``) and the episode length
+    can a push be checked against the episode: inside it, never overlapping another push, and
+    within ``MAX_PUSH_IMPULSE_NS``. ``BalanceEnv.clock`` is the env's own.
+    """
+
+    timestep: float
+    frame_skip: int
+    max_steps: int
+
+    def __post_init__(self) -> None:
+        counts = (self.frame_skip, self.max_steps)
+        if any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in counts):
+            raise ValueError(f"episode clock needs integer frame_skip and max_steps >= 1: {self}")
+        if not (math.isfinite(self.timestep) and self.timestep > 0):
+            raise ValueError(f"episode clock needs a finite positive timestep: {self}")
 
 
 class _Frozen(BaseModel):
@@ -134,17 +159,18 @@ class Scenario:
         }
 
     @classmethod
-    def from_dict(cls, data: Any, *, max_steps: int | None = None) -> Scenario:
+    def from_dict(cls, data: Any, *, clock: EpisodeClock | None = None) -> Scenario:
         """Parse and validate a scenario from JSON data; any problem raises ``ValueError``.
 
-        Checks key sets (string keys only), types, that every number fits a float and is
-        finite, and the bounds above; pushes must be sorted by ``start_step`` with no two at the
-        same step. With ``max_steps``, every push must also start inside the episode
-        (``0 <= start_step < max_steps``).
+        Checks key sets (string keys only), types, that every number fits a float (integers
+        exactly) and is finite, and the bounds above; pushes must be sorted by ``start_step``
+        with no two at the same step. With the env's ``clock`` (``BalanceEnv.reset`` passes
+        it), every push must also start inside the episode and never outlast it, deliver at most
+        ``MAX_PUSH_IMPULSE_NS``, and end before the next one starts.
         """
         try:
             scenario = _parse_scenario(data)
-            validate_scenario(scenario, max_steps=max_steps)
+            validate_scenario(scenario, clock=clock)
         except (TypeError, OverflowError) as exc:  # a case the checks above missed: still bad data
             raise ValueError(f"{_INVALID}{type(exc).__name__}: {exc}") from exc
         except ValueError as exc:
@@ -192,6 +218,8 @@ def _real(name: str, value: object) -> float:
 def _int(name: str, value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer, got {value!r}")
+    if abs(value) > MAX_EXACT_INT:  # never formatted: str() refuses ints beyond 4300 digits
+        raise ValueError(f"{name} does not fit a float exactly (|n| > 2**53)")
     return value
 
 
@@ -259,30 +287,46 @@ def _check_range(name: str, value: float, low: float, high: float) -> None:
         raise ValueError(f"{name} = {value} is outside [{low}, {high}]")
 
 
-def _check_pushes(pushes: tuple[Push, ...], max_steps: int | None) -> None:
+def _check_pushes(pushes: tuple[Push, ...], clock: EpisodeClock | None) -> None:
+    last_step = math.inf if clock is None else clock.max_steps - 1
+    most_substeps = math.inf if clock is None else clock.max_steps * clock.frame_skip
     for i, push in enumerate(pushes):
-        upper = (max_steps - 1) if max_steps is not None else math.inf
-        _check_range(f"pushes[{i}].start_step", push.start_step, 0, upper)
-        _check_range(f"pushes[{i}].n_substeps", push.n_substeps, 1, math.inf)
+        _check_range(f"pushes[{i}].start_step", push.start_step, 0, last_step)
+        _check_range(f"pushes[{i}].n_substeps", push.n_substeps, 1, most_substeps)
         _check_range(f"pushes[{i}].magnitude_n", push.magnitude_n, 0.0, MAX_PUSH_FORCE_N)
         if push.forward_sign not in (1.0, -1.0):
             raise ValueError(f"pushes[{i}].forward_sign must be +1 or -1")
         _check_range(
             f"pushes[{i}].lateral_ratio", push.lateral_ratio, -MAX_LATERAL_RATIO, MAX_LATERAL_RATIO
         )
-    check_push_schedule(pushes)
+        if clock is not None:
+            impulse = push.magnitude_n * push.n_substeps * clock.timestep
+            _check_range(f"pushes[{i}] impulse_ns", impulse, 0.0, MAX_PUSH_IMPULSE_NS)
+    check_push_schedule(pushes, frame_skip=None if clock is None else clock.frame_skip)
 
 
-def check_push_schedule(pushes: Sequence[Push]) -> None:
-    """Raise ``ValueError`` unless pushes are sorted by ``start_step`` with no two at one step.
+def check_push_schedule(pushes: Sequence[Push], *, frame_skip: int | None = None) -> None:
+    """Raise ``ValueError`` unless every push can run in full, exactly as written.
 
-    Two pushes at one step cannot both run (one would silently replace the other), and an
-    unsorted list would not survive the scenario's JSON round trip, so every path into the env
-    enforces this, including in-process ``Scenario`` objects that skip the bounds checks.
+    The env runs one push at a time: a push starting at the step of another, or while another
+    is still active, would silently cut that one short. So pushes must be sorted by
+    ``start_step`` with no two at one step (an unsorted list would not survive the scenario's
+    JSON round trip either) and, with ``frame_skip`` (substeps per control step) known, each
+    must end before the next begins. Every path into the env enforces this, including
+    in-process ``Scenario`` objects that skip the bounds checks.
     """
     steps = [p.start_step for p in pushes]
     if any(b <= a for a, b in itertools.pairwise(steps)):
         raise ValueError(f"pushes must be sorted by start_step with no repeats, got {steps}")
+    if frame_skip is None:
+        return
+    for i, (a, b) in enumerate(itertools.pairwise(pushes)):
+        if a.start_step * frame_skip + a.n_substeps > b.start_step * frame_skip:
+            raise ValueError(
+                f"pushes[{i + 1}] (start_step {b.start_step}) begins before pushes[{i}] "
+                f"(start_step {a.start_step}, {a.n_substeps} substeps) ends: overlapping pushes "
+                "would cut each other short"
+            )
 
 
 def _check_model(model: ModelOverrides) -> None:
@@ -304,14 +348,15 @@ def _check_sensors(sensors: SensorOffsets) -> None:
         _check_range(f"sensors.gyro_bias_rads[{i}]", bias, -MAX_GYRO_BIAS_RADS, MAX_GYRO_BIAS_RADS)
 
 
-def validate_scenario(scenario: Scenario, *, max_steps: int | None = None) -> None:
-    """Raise ``ValueError`` unless ``scenario`` is inside the contract's sane bounds (§9)."""
+def validate_scenario(scenario: Scenario, *, clock: EpisodeClock | None = None) -> None:
+    """Raise ``ValueError`` unless ``scenario`` is inside the contract's sane bounds (§9);
+    with the env's ``clock``, its pushes must also fit the episode."""
     if not (
         math.isfinite(scenario.init_pitch_rad) and math.isfinite(scenario.init_pitch_rate_rads)
     ):
         raise ValueError(f"{_INVALID}initial pitch and pitch rate must be finite")
     try:
-        _check_pushes(scenario.pushes, max_steps)
+        _check_pushes(scenario.pushes, clock)
         _check_model(scenario.model)
         _check_sensors(scenario.sensors)
     except ValueError as exc:

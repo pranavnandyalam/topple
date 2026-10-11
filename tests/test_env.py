@@ -536,23 +536,51 @@ def test_reset_rejects_pushes_that_are_not_push_objects(pushes: Any) -> None:
     [
         [Push(5, 50, 3.0, 1.0, 0.0), Push(5, 50, 9.0, 1.0, 0.0)],
         [Push(40, 50, 3.0, 1.0, 0.0), Push(5, 50, 3.0, 1.0, 0.0)],
+        [Push(100, 50, 3.0, 1.0, 0.0), Push(103, 50, 3.0, 1.0, 0.0)],
     ],
-    ids=["same step", "unsorted"],
+    ids=["same step", "unsorted", "overlapping"],
 )
-@pytest.mark.parametrize("via", ["pushes option", "scenario object"])
+@pytest.mark.parametrize("via", ["pushes option", "scenario object", "scenario dict"])
 def test_reset_rejects_push_schedules_that_cannot_run_as_written(
     pushes: list[Push], via: str
 ) -> None:
-    """Two pushes at one step would silently drop one, and an unsorted list would not survive
-    the scenario's JSON round trip: every reset path refuses both."""
+    """Two pushes at one step, or a push starting before the previous one has ended, would
+    silently cut one short (the env runs one push at a time), and an unsorted list would not
+    survive the scenario's JSON round trip: every reset path refuses all three."""
     env = BalanceEnv("ideal")
-    options: dict[str, Any] = (
-        {"pushes": pushes}
-        if via == "pushes option"
-        else {"scenario": replace(scenario_for(0, "ideal"), pushes=tuple(pushes))}
-    )
+    scenario = replace(scenario_for(0, "ideal"), pushes=tuple(pushes))
+    options: dict[str, Any] = {
+        "pushes option": {"pushes": pushes},
+        "scenario object": {"scenario": scenario},
+        "scenario dict": {"scenario": scenario.to_dict()},
+    }[via]
     with pytest.raises(ValueError, match="start_step"):
         env.reset(seed=0, options=options)
+
+
+def test_back_to_back_pushes_both_run_in_full(monkeypatch: pytest.MonkeyPatch) -> None:
+    """15 substeps from step 100 end exactly where step 103 begins: both pushes deliver every
+    substep they state, so the episode gets their full impulse, one after the other."""
+    first = Push(100, 15, 3.0, forward_sign=1.0, lateral_ratio=0.0)
+    second = Push(103, 50, 2.0, forward_sign=-1.0, lateral_ratio=0.0)
+    env = BalanceEnv("ideal", record=True)
+    applied: list[float] = []
+    real_apply = mujoco.mj_applyFT
+
+    def spy(m: Any, d: Any, force: Any, torque: Any, point: Any, body: int, target: Any) -> None:
+        applied.append(float(np.linalg.norm(force)))
+        real_apply(m, d, force, torque, point, body, target)
+
+    monkeypatch.setattr(mujoco, "mj_applyFT", spy)
+    pushed = rollout(env, seed=0, options={"pushes": [first, second]}, max_steps=130)
+    assert pushed.steps == 130
+    assert not pushed.terminated
+    assert applied == pytest.approx([3.0] * 15 + [2.0] * 50)
+    rows = env.trajectory().push_force
+    active = np.flatnonzero(np.any(rows != 0.0, axis=1)).tolist()
+    assert active == list(range(100, 113))
+    assert np.hypot(*rows[100:103, :2].T).tolist() == pytest.approx([3.0] * 3)
+    assert np.hypot(*rows[103:113, :2].T).tolist() == pytest.approx([2.0] * 10)
 
 
 def test_seed_range_follows_the_contract() -> None:

@@ -18,6 +18,7 @@ from topple.challenge import Challenge, load_challenge
 from topple.contract import FEATURES, BalancerObs, clip_action, validate_action
 from topple.disturbances import (
     PRESETS,
+    EpisodeClock,
     Preset,
     Push,
     Scenario,
@@ -157,6 +158,10 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         if abs(self.frame_skip * timestep - self.control_dt) > 1e-12:
             raise ValueError("control_dt must be an integer multiple of the physics timestep")
         self.max_steps = self.task_spec.max_steps
+        # What a scenario's step counts mean here: from_dict checks pushes against it (§9).
+        self.clock = EpisodeClock(
+            timestep=timestep, frame_skip=self.frame_skip, max_steps=self.max_steps
+        )
         self._preset: Preset = PRESETS[preset]
         self._pending_preset: Preset | None = None
         self.reward_config = reward or RewardConfig()
@@ -250,7 +255,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             scenario = (
                 given
                 if isinstance(given, Scenario)
-                else Scenario.from_dict(given, max_steps=self.max_steps)
+                else Scenario.from_dict(given, clock=self.clock)
             )
         else:
             episode_seed = seed if seed is not None else int(self.np_random.integers(MAX_SEED))
@@ -274,7 +279,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             math.isfinite(scenario.init_pitch_rad) and math.isfinite(scenario.init_pitch_rate_rads)
         ):
             raise ValueError("initial pitch and pitch rate must be finite")
-        check_push_schedule(scenario.pushes)
+        check_push_schedule(scenario.pushes, frame_skip=self.frame_skip)
 
         self._scenario = scenario
         self._sensors_ideal = PRESETS[scenario.preset].sensors == "ideal"
