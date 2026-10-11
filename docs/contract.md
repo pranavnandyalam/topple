@@ -264,14 +264,18 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   same `Type: message` detail, and the CLI exits 2 with that message, never a traceback. A load
   that fails leaves no submission module behind in `sys.modules`.
 - Submission kinds: a `.py` file, or a directory with `controller.py` plus assets located via
-  `Path(__file__).parent` (ONNX policies arrive in Phase 2). A directory may hold at most 50
-  regular files in at most 50 subdirectories (at any depth) and 20 MiB in total, enforced while
-  it is walked and read, so a huge tree is refused at once; symlinks, special files,
-  `__pycache__`, `.pyc` files and names (the submission's own or any file's) that are not valid
-  UTF-8 are refused, and so is a file or directory that cannot be read or even examined, the
-  submission's own path included (a name too long for the file system, a directory without
-  search permission on the way): a `LoadError` naming it, never an `OSError`, so the CLI exits
-  2 with one line. Untrusted names in load errors are quoted with `repr`, so they cannot
+  `Path(__file__).parent` (ONNX policies arrive in Phase 2). The entry file is named exactly
+  `controller.py` on every file system: a case-insensitive one (macOS, Windows) also finds
+  `Controller.py` under that name, and such a directory is refused there as on Linux. A
+  directory may hold at most 50 regular files in at most 50 subdirectories (at any depth) and
+  20 MiB in total, enforced while it is walked and read, so a huge tree is refused at once;
+  symlinks, special files, `__pycache__` directories and `.pyc` files in any letter case (a
+  case-insensitive file system opens `__PYCACHE__/x.cpython-312.PYC` as the cache of `x.py`),
+  and names (the submission's own or any file's) that are not valid UTF-8 are refused, and so
+  is a file or directory that cannot be read or even examined, the submission's own path
+  included (a name too long for the file system, a directory without search permission on the
+  way): a `LoadError` naming it, never an `OSError`, so the CLI exits 2 with one line.
+  Untrusted names in load errors are quoted with `repr`, so they cannot
   carry terminal escapes or line breaks. Loading a submission turns bytecode writing off for the
   rest of the process (`sys.dont_write_bytecode`), so neither its import nor a later import of a
   sibling module (in `make_controller`, `reset` or `act`) writes bytecode next to it. The

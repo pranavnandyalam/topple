@@ -366,6 +366,17 @@ def test_directory_without_entry(tmp_path: Path) -> None:
         load_submission(tmp_path / "empty")
 
 
+def test_the_entry_file_must_be_named_exactly_controller_py(tmp_path: Path) -> None:
+    """A case-insensitive file system (macOS, Windows) finds ``Controller.py`` under the name
+    ``controller.py``; the submission is refused there as on Linux, with the same message."""
+    root = tmp_path / "bot"
+    write(root, "Controller.py", GOOD)
+    with pytest.raises(
+        LoadError, match=r"^expected a \.py file or a directory containing controller\.py$"
+    ):
+        load_submission(root)
+
+
 def test_too_many_files(tmp_path: Path) -> None:
     root = tmp_path / "big"
     write(root, "controller.py", GOOD)
@@ -466,6 +477,21 @@ def test_compiled_python_is_refused(tmp_path: Path, junk: str) -> None:
     write(root, "controller.py", GOOD)
     write(root, junk, "")
     with pytest.raises(LoadError, match=r"__pycache__|\.pyc"):
+        load_submission(root)
+
+
+@pytest.mark.parametrize(
+    "junk", ["__PYCACHE__/helper.cpython-312.PYC", "__PyCache__/x.txt", "old.PYC", "lib/x.Pyc"]
+)
+def test_compiled_python_is_refused_in_any_letter_case(tmp_path: Path, junk: str) -> None:
+    """A case-insensitive file system (macOS, Windows) opens ``__PYCACHE__/helper...PYC`` when
+    Python looks for ``__pycache__/helper...pyc``: an unchecked-hash .pyc there runs instead of
+    the readable ``helper.py``."""
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    write(root, "helper.py", "X = 1\n")
+    write(root, junk, "")
+    with pytest.raises(LoadError, match="remove compiled Python"):
         load_submission(root)
 
 

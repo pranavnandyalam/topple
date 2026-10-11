@@ -25,6 +25,7 @@ from typing import Any
 from topple.contract import Controller, TaskSpec, class_name, describe_exception
 
 ENTRY_FILE = "controller.py"
+_NO_ENTRY = f"expected a .py file or a directory containing {ENTRY_FILE}"
 FACTORY = "make_controller"
 MAX_FILES = 50
 MAX_DIRECTORIES = 50
@@ -53,17 +54,20 @@ def _rel(path: Path, root: Path) -> str:
 def _check_entry(entry: os.DirEntry[str], rel: str) -> bool:
     """True for a directory to descend into, False for a regular file; else ``LoadError``.
 
+    Compiled Python is refused in any letter case: a case-insensitive file system (macOS,
+    Windows) opens ``__PYCACHE__/x.cpython-312.PYC`` when Python looks for the cache of ``x.py``.
     Names are quoted with ``repr``: they are untrusted and can hold terminal escapes.
     """
     if entry.is_symlink():
         raise LoadError(f"symlinks are not allowed in a submission: {rel!r}")
+    name = entry.name.casefold()
     if entry.is_dir(follow_symlinks=False):
-        if entry.name == "__pycache__":
+        if name == "__pycache__":
             raise LoadError(f"remove compiled Python from the submission: {rel!r}")
         return True
     if not entry.is_file(follow_symlinks=False):
         raise LoadError(f"{rel!r} is not a regular file")
-    if entry.name.endswith(".pyc"):
+    if name.endswith(".pyc"):
         raise LoadError(f"remove compiled Python (.pyc) from the submission: {rel!r}")
     return False
 
@@ -142,9 +146,9 @@ def _utf8_name(rel: str) -> bytes:
 def submission_sha256(path: Path) -> str:
     """sha256 over length-framed (POSIX relpath, size, bytes) records of every file.
 
-    Refuses symlinks, special files, ``__pycache__``, ``.pyc``, file names that are not valid
-    UTF-8 and files or directories that cannot be read; enforces ``MAX_FILES``,
-    ``MAX_DIRECTORIES`` and ``MAX_BYTES`` (the latter while reading).
+    Refuses symlinks, special files, ``__pycache__`` and ``.pyc`` (in any letter case), file
+    names that are not valid UTF-8 and files or directories that cannot be read; enforces
+    ``MAX_FILES``, ``MAX_DIRECTORIES`` and ``MAX_BYTES`` (the latter while reading).
     """
     return _digest(path)[0]
 
@@ -280,8 +284,10 @@ def load_submission(path: Path) -> Submission:
     _utf8_name(path.name)  # the name becomes the controller id
     path, entry = _locate(path)
     sha, source = _digest(path, entry)
-    if source is None:  # cannot happen: the entry is always one of the hashed files
-        raise LoadError(f"{entry.name} was not hashed")
+    if source is None:
+        # No hashed file is named exactly ENTRY_FILE: a case-insensitive file system (macOS,
+        # Windows) lets ``Controller.py`` pass ``_locate``'s probe, where Linux refuses it.
+        raise LoadError(_NO_ENTRY)
     module = _import(entry, sha, source)
     try:
         factory = _factory(module, entry)
@@ -312,7 +318,7 @@ def _locate(path: Path) -> tuple[Path, Path]:
             raise LoadError(f"{path} does not exist")
         entry = path / ENTRY_FILE if path.is_dir() else path
         if entry.suffix != ".py" or not entry.is_file():
-            raise LoadError(f"expected a .py file or a directory containing {ENTRY_FILE}")
+            raise LoadError(_NO_ENTRY)
     except OSError as exc:
         raise _unreadable(exc, path) from exc
     return path, entry
