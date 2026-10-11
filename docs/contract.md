@@ -407,7 +407,11 @@ controller acted on and row T is the final (possibly terminal) state:
   `survived` = the episode was truncated (`termination.reason == "timeout"` and `T == max_steps`)
 - `rms_tilt_rad`: root mean square of the true tilt angle (between body z and world z, from the
   root quaternion) over the alive rows 0..T−1 only; the terminal row T never counts (row 0 alone
-  when T = 0). `max_tilt_rad` is the maximum over all rows 0..T
+  when T = 0). `max_tilt_rad` is the maximum over all rows 0..T. The tilt of a row with
+  quaternion `(w, x, y, z)` is `acos(clip(1 − 2(x² + y²), −1, 1))`, the `acos` being the C
+  library's scalar one, as in the env's fall check: a vectorized arccos (numpy's on AVX-512
+  CPUs) can differ in the last bit, which would make a score depend on the machine within one
+  platform
 - `drift_m` = planar (xy) distance of the root from row 0 at the final row T; `max_drift_m` = its
   maximum over all rows
 - `energy_j`, over control steps k and wheels i:

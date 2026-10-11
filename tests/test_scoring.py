@@ -56,6 +56,29 @@ def synthetic(
     )
 
 
+def test_tilt_takes_its_arccos_from_the_c_library(monkeypatch: pytest.MonkeyPatch) -> None:
+    """numpy picks its float64 arccos at run time (an SVML routine on AVX-512 CPUs, the C library
+    elsewhere) and the two can differ in the last bit, so two linux-x86_64 machines could score
+    one trajectory differently. The tilt uses ``math.acos`` per row, as the env's fall check
+    does (``robot.quat_tilt``), whatever the leading shape."""
+
+    def dispatched(*args: object, **kwargs: object) -> None:
+        raise AssertionError("np.arccos depends on numpy's CPU dispatch")
+
+    monkeypatch.setattr(np, "arccos", dispatched)
+    rng = np.random.default_rng(0)
+    quat = rng.normal(size=(2, 25, 4))
+    quat /= np.linalg.norm(quat, axis=-1, keepdims=True)
+    tilt = tilt_from_quat(quat)
+    assert tilt.shape == (2, 25)
+    assert tilt.dtype == np.float64
+    expected = [
+        math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * (x * x + y * y))))
+        for x, y in zip(quat[..., 1].ravel().tolist(), quat[..., 2].ravel().tolist(), strict=True)
+    ]
+    assert tilt.ravel().tobytes() == np.array(expected).tobytes()  # bit for bit
+
+
 def test_tilt_from_quat() -> None:
     q = np.array([quat_pitch(0.3), quat_pitch(-0.5), [1.0, 0.0, 0.0, 0.0]])
     np.testing.assert_allclose(tilt_from_quat(q), [0.3, 0.5, 0.0], atol=1e-12)

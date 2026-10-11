@@ -39,11 +39,17 @@ class EpisodeMetrics:
 
 
 def tilt_from_quat(quat: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
-    """Angle between body z and world z for (..., 4) wxyz quaternions."""
+    """Angle between body z and world z for (..., 4) wxyz quaternions.
+
+    The arccos is the C library's (``math.acos``, as in the env's fall check), never numpy's:
+    numpy picks its float64 arccos at run time (an SVML routine on AVX-512 CPUs, the C library
+    elsewhere) and the two can differ in the last bit, so a score would depend on which
+    machine of one platform computed it (contract §12). The rest is exact IEEE arithmetic.
+    """
     x, y = quat[..., 1], quat[..., 2]
     cos_tilt = np.clip(1.0 - 2.0 * (x * x + y * y), -1.0, 1.0)
-    tilt: npt.NDArray[np.float64] = np.arccos(cos_tilt)
-    return tilt
+    tilt = np.array([math.acos(c) for c in cos_tilt.ravel().tolist()], dtype=np.float64)
+    return tilt.reshape(cos_tilt.shape)
 
 
 def battery_energy_j(
