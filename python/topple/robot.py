@@ -340,13 +340,24 @@ def _tire_geom(model: mujoco.MjModel, joint_name: str) -> int:
     return tires[0]
 
 
+def _tire_centre(model: mujoco.MjModel, tire: int) -> npt.NDArray[np.float64]:
+    """A tire's centre in the chassis frame: its wheel body's ``pos`` plus the tire's ``pos``
+    rotated by the body's ``quat`` (a wheel body is a direct child of the chassis)."""
+    body = int(model.geom_bodyid[tire])
+    rot = np.zeros(9)
+    mujoco.mju_quat2Mat(rot, model.body_quat[body])
+    offset = rot.reshape(3, 3) @ np.asarray(model.geom_pos[tire], dtype=np.float64)
+    centre: npt.NDArray[np.float64] = np.asarray(model.body_pos[body], dtype=np.float64) + offset
+    return centre
+
+
 def bind_robot(model: mujoco.MjModel) -> RobotBinding:
     joints = [model.joint(name) for name in WHEEL_JOINTS]
-    bodies = [int(model.jnt_bodyid[j.id]) for j in joints]
     signs = tuple(1.0 if _axis_in_chassis(model, j.id)[1] > 0 else -1.0 for j in joints)
     tires = [_tire_geom(model, name) for name in WHEEL_JOINTS]
     radius = float(model.geom_size[tires[0]][0])  # validate_robot checks both tires agree
-    track = abs(float(model.body_pos[bodies[0]][1] - model.body_pos[bodies[1]][1]))
+    # Where the tires roll, not where their bodies' origins happen to be (contract §3).
+    track = abs(float(_tire_centre(model, tires[0])[1] - _tire_centre(model, tires[1])[1]))
     root = model.joint(ROOT_JOINT)
     return RobotBinding(
         chassis_body=model.body(CHASSIS).id,
@@ -470,15 +481,22 @@ def _tire_problems(model: mujoco.MjModel, name: str, joint: int) -> list[str]:
 TIRE_RADIUS_TOLERANCE_M = 1e-9
 
 
-def _tire_radius_problems(model: mujoco.MjModel) -> list[str]:
-    """Both tires must have one radius: ``wheel_radius_m`` (and odometry) assume a single one."""
-    radii: list[float] = []
+def _tires(model: mujoco.MjModel) -> tuple[int, int] | None:
+    """The (left, right) tires, or None while a wheel joint or its single collision geom is
+    missing (``_wheel_problems`` reports that)."""
+    tires: list[int] = []
     for name in WHEEL_JOINTS:
         jid = _lookup(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        tires = _collision_geoms(model, int(model.jnt_bodyid[jid])) if jid >= 0 else []
-        if len(tires) != 1:
-            return []  # already reported by _wheel_problems
-        radii.append(float(model.geom_size[tires[0]][0]))
+        found = _collision_geoms(model, int(model.jnt_bodyid[jid])) if jid >= 0 else []
+        if len(found) != 1:
+            return None
+        tires.append(found[0])
+    return tires[0], tires[1]
+
+
+def _tire_radius_problems(model: mujoco.MjModel, tires: tuple[int, int]) -> list[str]:
+    """Both tires must have one radius: ``wheel_radius_m`` (and odometry) assume a single one."""
+    radii = [float(model.geom_size[tire][0]) for tire in tires]
     if abs(radii[0] - radii[1]) > TIRE_RADIUS_TOLERANCE_M:
         left, right = WHEEL_JOINTS
         return [
@@ -486,6 +504,41 @@ def _tire_radius_problems(model: mujoco.MjModel) -> list[str]:
             f"got {radii[0]:g} and {radii[1]:g} m"
         ]
     return []
+
+
+def _axle_problems(model: mujoco.MjModel, chassis: int, tires: tuple[int, int]) -> list[str]:
+    """The axle is the chassis y axis and the chassis origin its midpoint (contract §2, §3).
+
+    A reset tilts the robot about the chassis origin and turns each wheel so its tire does not
+    slip: only tires centred on the chassis y axis then spawn on the floor and roll in place. The
+    left tire must be on the left, the right on the right. Checked only while both wheel bodies
+    are direct children of the chassis, so the centres are in its frame.
+    """
+    if any(model.body_parentid[model.geom_bodyid[tire]] != chassis for tire in tires):
+        return []  # already reported by _wheel_problems
+    centres = [_tire_centre(model, tire) for tire in tires]
+    problems: list[str] = []
+    for name, side, centre in zip(WHEEL_JOINTS, (1.0, -1.0), centres, strict=True):
+        off_axle = math.hypot(float(centre[0]), float(centre[2]))
+        if off_axle > TIRE_CENTRE_TOLERANCE_M:
+            problems.append(
+                f"tire of '{name}' must be centred on the chassis y axis (the axle through the "
+                f"chassis origin): its centre is {off_axle:g} m off it, so a reset would spawn "
+                "the robot off the floor or slipping"
+            )
+        if float(centre[1]) * side <= 0:
+            where = "left (y > 0)" if side > 0 else "right (y < 0)"
+            problems.append(
+                f"tire of '{name}' must be on the {where} of the chassis, "
+                f"got its centre at y = {float(centre[1]):g} m"
+            )
+    left_y, right_y = float(centres[0][1]), float(centres[1][1])
+    if abs(left_y + right_y) > TIRE_CENTRE_TOLERANCE_M:
+        problems.append(
+            "the chassis origin must be the axle midpoint: the tires' centres are at "
+            f"y = {left_y:g} and {right_y:g} m"
+        )
+    return problems
 
 
 def _wheel_problems(model: mujoco.MjModel, chassis: int, name: str, side: float) -> list[str]:
@@ -511,8 +564,26 @@ def _wheel_problems(model: mujoco.MjModel, chassis: int, name: str, side: float)
     return problems + _tire_problems(model, name, jid)
 
 
+def _imu_frame_problems(model: mujoco.MjModel, site: int) -> list[str]:
+    """The IMU site's axes must be the chassis's: MuJoCo's gyro and accelerometer read in the
+    site's frame, and the estimator takes their readings as chassis-frame ones that only the
+    scenario's mount offset rotates (contract §5). Each site axis must lie along the same
+    chassis axis within ``AXIS_TOLERANCE`` (1 - cos of the angle between them)."""
+    rot = np.zeros(9)
+    mujoco.mju_quat2Mat(rot, model.site_quat[site])
+    if all(1.0 - float(cos) <= AXIS_TOLERANCE for cos in np.diag(rot.reshape(3, 3))):
+        return []
+    w, x, y, z = (float(q) for q in model.site_quat[site])
+    turn = 2.0 * math.atan2(math.hypot(x, y, z), abs(w))
+    return [
+        f"site '{IMU_SITE}' must not be rotated relative to body '{CHASSIS}' (it is turned "
+        f"{turn:.3g} rad): the IMU reads in the site's frame, which the estimator takes as the "
+        "chassis frame"
+    ]
+
+
 def _interface_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
-    """Sites on the chassis, the injected motors and IMU sensors."""
+    """Sites on the chassis (the IMU's aligned with it), the injected motors and IMU sensors."""
     problems: list[str] = []
     for name in (IMU_SITE, PUSH_SITE):
         sid = _lookup(model, mujoco.mjtObj.mjOBJ_SITE, name)
@@ -520,6 +591,8 @@ def _interface_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
             problems.append(f"site '{name}' is missing")
         elif model.site_bodyid[sid] != chassis:
             problems.append(f"site '{name}' must be on body '{CHASSIS}'")
+        elif name == IMU_SITE:
+            problems += _imu_frame_problems(model, sid)
     for name in MOTORS:
         if _lookup(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name) < 0:
             problems.append(f"actuator '{name}' is missing")
@@ -609,7 +682,9 @@ def validate_robot(
     problems = _root_problems(model, chassis)
     for name, side in zip(WHEEL_JOINTS, (1.0, -1.0), strict=True):
         problems += _wheel_problems(model, chassis, name, side)
-    problems += _tire_radius_problems(model)
+    tires = _tires(model)
+    if tires is not None:
+        problems += _tire_radius_problems(model, tires) + _axle_problems(model, chassis, tires)
     problems += _interface_problems(model, chassis)
     problems += _world_problems(model, chassis, scene_geoms)
     return problems

@@ -976,6 +976,36 @@ def test_encoders_quantize_and_differentiate_wheel_angles() -> None:
     assert np.abs(obs[:, 2]).max() > 0.01
 
 
+def test_odometry_turns_with_the_track_width_the_tires_roll_on(tmp_path: Path) -> None:
+    """§3, §5 step 6: a robot whose wheel bodies sit at the motor flanges (y = ±0.05 m), with
+    its tires 2 cm further out along the axle, is the stock robot. Its odometry must use the
+    0.14 m the tires roll on: with the bodies' 0.10 m it once read 1.80 rad for a 1.23 rad
+    turn."""
+    tire = '<geom name="{side}_tire" type="cylinder" size="0.034 0.013" zaxis="0 1 0"'
+    flange = robot_variant(
+        tmp_path,
+        "flange",
+        (
+            '<body name="left_wheel_body" pos="0 0.07 0">',
+            '<body name="left_wheel_body" pos="0 0.05 0">',
+        ),
+        (
+            '<body name="right_wheel_body" pos="0 -0.07 0">',
+            '<body name="right_wheel_body" pos="0 -0.05 0">',
+        ),
+        (tire.format(side="left"), tire.format(side="left") + ' pos="0 0.02 0"'),
+        (tire.format(side="right"), tire.format(side="right") + ' pos="0 -0.02 0"'),
+    )
+    stock, moved = BalanceEnv("clean"), BalanceEnv("clean", robot_xml=flange)
+    assert moved.task_spec.robot.track_width_m == pytest.approx(0.14, abs=1e-12)
+    a = rollout(stock, spinning_pid(0.3), seed=1, max_steps=300)
+    b = rollout(moved, spinning_pid(0.3), seed=1, max_steps=300)
+    assert (a.steps, b.steps) == (300, 300)
+    yaw_stock, yaw_moved = (np.unwrap(np.array(ep.obs)[:, 2].astype(np.float64)) for ep in (a, b))
+    assert yaw_stock[-1] > 2.0 * math.pi  # it really turned: left, more than a full turn
+    np.testing.assert_allclose(yaw_moved, yaw_stock, rtol=0, atol=0.01)
+
+
 @pytest.mark.parametrize("seed", [1, 2])
 def test_full_sensor_pitch_estimate_tracks_the_truth(seed: int) -> None:
     env = BalanceEnv("clean")

@@ -171,7 +171,7 @@ def test_unstable_pole_magnitude(params: RobotParams) -> None:
 def test_binding(model: mujoco.MjModel) -> None:
     b = bind_robot(model)
     assert b.wheel_radius_m == pytest.approx(0.034)
-    assert b.track_width_m == pytest.approx(0.14)
+    assert b.track_width_m == 0.14  # bit for bit: the tire centres are the wheel bodies' here
     assert b.wheel_sign == (1.0, 1.0)
     assert b.chassis_body == model.body("chassis").id
     assert set(b.wheel_geoms) == {model.geom("left_tire").id, model.geom("right_tire").id}
@@ -285,6 +285,28 @@ ROTATED_LEFT_WHEEL = [
 ]
 LEFT_TIRE_SIZED = LEFT_TIRE + ' size="0.034 0.013"'
 RIGHT_TIRE_SIZED = RIGHT_TIRE + ' size="0.034 0.013"'
+LEFT_TIRE_ALONG_Y = LEFT_TIRE_SIZED + ' zaxis="0 1 0"'
+RIGHT_TIRE_ALONG_Y = RIGHT_TIRE_SIZED + ' zaxis="0 1 0"'
+IMU_SITE = '<site name="imu" pos="0 0 0.10"'
+IMU_SITE_ELEMENT = '<site name="imu" pos="0 0 0.10" size="0.006" rgba="1 0.8 0 1"/>'
+PUSH_SITE = '<site name="push_point" pos="0 0 0.08"'
+PUSH_SITE_ELEMENT = '<site name="push_point" pos="0 0 0.08" size="0.006" rgba="1 0.2 0.2 1"/>'
+# A CAD-style wheel body at the motor flange (y = ±0.05 m) with its tire 2 cm further out along
+# the axle: the tires still roll 0.14 m apart, as on the stock robot.
+FLANGE_WHEELS = [
+    (LEFT_BODY, '<body name="left_wheel_body" pos="0 0.05 0">'),
+    (LEFT_TIRE_ALONG_Y, LEFT_TIRE_ALONG_Y + ' pos="0 0.02 0"'),
+    (RIGHT_BODY, '<body name="right_wheel_body" pos="0 -0.05 0">'),
+    (RIGHT_TIRE_ALONG_Y, RIGHT_TIRE_ALONG_Y + ' pos="0 -0.02 0"'),
+]
+# The same, but the left wheel body is turned so its own z axis is the axle: the tire's offset
+# is along the body's z, which only the body's rotation turns into chassis +y.
+ROTATED_FLANGE_WHEELS = [
+    (LEFT_BODY, '<body name="left_wheel_body" pos="0 0.05 0" zaxis="0 1 0">'),
+    (LEFT_JOINT, LEFT_JOINT.replace('axis="0 1 0"', 'axis="0 0 1"')),
+    (LEFT_TIRE_ALONG_Y, LEFT_TIRE_SIZED + ' pos="0 0 0.02"'),
+    *FLANGE_WHEELS[2:],
+]
 
 
 def free_root(attrs: str) -> str:
@@ -451,6 +473,62 @@ VIOLATIONS = {
         ],
         "tire of 'right_wheel' must lie along its hinge axis",
     ),
+    # MuJoCo's IMU sensors read in the site's frame, which the estimator takes as the chassis's.
+    "imu board turned a quarter turn": (
+        [(IMU_SITE, IMU_SITE + ' euler="0 0 1.5707963267948966"')],
+        "site 'imu' must not be rotated relative to body 'chassis'",
+    ),
+    "imu board pitched by 2 mrad": (
+        [(IMU_SITE, IMU_SITE + ' euler="0 0.002 0"')],
+        "site 'imu' must not be rotated relative to body 'chassis'",
+    ),
+    "imu board on a wheel": (
+        [(IMU_SITE_ELEMENT, ""), (LEFT_JOINT, LEFT_JOINT + '<site name="imu" pos="0 0 0.02"/>')],
+        "site 'imu' must be on body 'chassis'",
+    ),
+    "push point on a wheel": (
+        [
+            (PUSH_SITE_ELEMENT, ""),
+            (LEFT_JOINT, LEFT_JOINT + '<site name="push_point" pos="0 0 0.02"/>'),
+        ],
+        "site 'push_point' must be on body 'chassis'",
+    ),
+    # The env tilts the robot about the chassis origin at reset: only an axle through it keeps
+    # the tires on the floor and rolling without slip (contract §2, §3).
+    "axle below the chassis origin": (
+        [
+            (LEFT_BODY, '<body name="left_wheel_body" pos="0 0.07 -0.01">'),
+            (RIGHT_BODY, '<body name="right_wheel_body" pos="0 -0.07 -0.01">'),
+        ],
+        "tire of 'left_wheel' must be centred on the chassis y axis",
+    ),
+    "axle ahead of the chassis origin": (
+        [
+            (LEFT_BODY, '<body name="left_wheel_body" pos="0.01 0.07 0">'),
+            (RIGHT_BODY, '<body name="right_wheel_body" pos="0.01 -0.07 0">'),
+        ],
+        "tire of 'right_wheel' must be centred on the chassis y axis",
+    ),
+    "hinge and tire below a wheel body on the axle": (
+        [
+            (LEFT_JOINT, LEFT_JOINT.replace("/>", ' pos="0 0 -0.01"/>')),
+            (LEFT_TIRE_ALONG_Y, LEFT_TIRE_ALONG_Y + ' pos="0 0 -0.01"'),
+        ],
+        "tire of 'left_wheel' must be centred on the chassis y axis",
+    ),
+    "chassis origin off the axle midpoint": (
+        [(LEFT_BODY, '<body name="left_wheel_body" pos="0 0.08 0">')],
+        "the chassis origin must be the axle midpoint",
+    ),
+    "tires crossed under their wheel bodies": (
+        [
+            (LEFT_BODY, '<body name="left_wheel_body" pos="0 0.01 0">'),
+            (LEFT_TIRE_ALONG_Y, LEFT_TIRE_ALONG_Y + ' pos="0 -0.08 0"'),
+            (RIGHT_BODY, '<body name="right_wheel_body" pos="0 -0.01 0">'),
+            (RIGHT_TIRE_ALONG_Y, RIGHT_TIRE_ALONG_Y + ' pos="0 0.08 0"'),
+        ],
+        "tire of 'left_wheel' must be on the left (y > 0)",
+    ),
 }
 
 
@@ -472,6 +550,22 @@ def test_visual_geoms_on_a_wheel_are_allowed_and_do_not_set_the_radius(
     b = bind_robot(m)
     assert b.wheel_radius_m == pytest.approx(0.034)
     assert set(b.wheel_geoms) == {m.geom("left_tire").id, m.geom("right_tire").id}
+
+
+@pytest.mark.parametrize(
+    "edits", [FLANGE_WHEELS, ROTATED_FLANGE_WHEELS], ids=["flange", "rotated flange"]
+)
+def test_track_width_is_the_distance_between_the_tire_centres(
+    params: RobotParams, tmp_path: Path, edits: list[tuple[str, str]]
+) -> None:
+    """§3: the track width is measured between the tires' centres in the chassis frame, where
+    they roll, not between the wheel bodies' origins (0.10 m here): odometry (§5 step 6) and
+    ``TaskSpec.robot`` need the lever arm the tires have."""
+    m = model_from(params, tmp_path, *edits)
+    assert validate_robot(m) == []
+    b = bind_robot(m)
+    assert b.track_width_m == pytest.approx(0.14, abs=1e-12)
+    assert b.wheel_radius_m == pytest.approx(0.034)
 
 
 def test_bind_robot_refuses_ambiguous_tires(params: RobotParams, tmp_path: Path) -> None:
@@ -829,6 +923,10 @@ def test_validate_reports_a_missing_chassis() -> None:
             "direct child body",
         ),
         ([('<site name="imu"', '<site name="imu_board"')], "site 'imu' is missing"),
+        (
+            [(LEFT_JOINT, LEFT_JOINT.replace('name="left_wheel"', 'name="lw"'))],
+            "joint 'left_wheel' is missing",
+        ),
     ],
 )
 def test_validate_reports_wheel_and_site_problems(
@@ -903,6 +1001,10 @@ def test_validate_reports_wheel_and_site_problems(
         ],
         [("</worldbody>", "</worldbody>" + ROBOT_FLEX)],
         [('<site name="imu"', SOFT_BLOCK + '<site name="imu"')],
+        [(IMU_SITE, IMU_SITE + ' euler="0 0.001 0"')],
+        [(PUSH_SITE, PUSH_SITE + ' euler="0 0 1"')],
+        FLANGE_WHEELS,
+        ROTATED_FLANGE_WHEELS,
     ],
     ids=[
         "flipped cylinder axis",
@@ -918,6 +1020,10 @@ def test_validate_reports_wheel_and_site_problems(
         "pulley between robot sites",
         "flex between robot bodies",
         "interpolated flex on the robot",
+        "imu board within the axis tolerance",
+        "rotated push point (only its position counts)",
+        "tires offset along the axle from their wheel bodies",
+        "rotated wheel body with its tire offset along the axle",
     ],
 )
 def test_validate_accepts_variants_that_can_still_fall(
@@ -974,3 +1080,28 @@ def test_the_env_refuses_a_robot_that_cannot_fall_or_misstates_its_radius(
     path.write_text(xml)
     with pytest.raises(ValueError, match=r"balancer\.robot\.v1"):
         BalanceEnv("ideal", robot_xml=path)
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("imu board turned a quarter turn", "site 'imu' must not be rotated"),
+        ("axle below the chassis origin", "must be centred on the chassis y axis"),
+        ("chassis origin off the axle midpoint", "axle midpoint"),
+    ],
+)
+def test_the_env_refuses_a_robot_it_would_sense_or_spawn_wrongly(
+    tmp_path: Path, case: str, message: str
+) -> None:
+    """Each of these once ran. A board turned a quarter turn on its site fed the estimator the
+    chassis's x axis as its y: from 0.1 rad and 20 idle steps the observed pitch read 0.07 while
+    the robot lay at 0.21 and fell at 1.3 rad/s, and the shipped PID survived 0 of 10 clean
+    seeds. With the chassis frame 8 cm above the axle, a reset at 0.5 rad spawned the tires
+    9.8 mm above the floor and 38 mm off in x."""
+    xml = ROBOT_XML.read_text()
+    for old, new in VIOLATIONS[case][0]:
+        xml = xml.replace(old, new, 1)
+    path = tmp_path / "variant.xml"
+    path.write_text(xml)
+    with pytest.raises(ValueError, match=rf"balancer\.robot\.v1.*{message}"):
+        BalanceEnv("clean", robot_xml=path)

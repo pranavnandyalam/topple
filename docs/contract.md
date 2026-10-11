@@ -54,7 +54,7 @@ A robot MJCF (body tree only; no `<option>`, floor or lights) must contain, by e
 | hinge joints | `left_wheel`, `right_wheel` | unlimited, axes ±y in the chassis frame |
 | wheel bodies | the bodies of the two hinges | direct children of `chassis`; left at y > 0, right at y < 0 |
 | tire geoms | the one collision geom of each wheel body | cylinder, sphere or capsule, centred on the hinge axis; size[0] is the wheel radius, equal on both tires; a cylinder's or capsule's axis (its local z) lies along the hinge axis |
-| site | `imu` | child of `chassis`; where the IMU board is mounted |
+| site | `imu` | child of `chassis`, not rotated relative to it; where the IMU board is mounted |
 | site | `push_point` | child of `chassis`; where pushes are applied |
 
 A collision geom is one with `contype` or `conaffinity` nonzero. Wheel bodies may also carry
@@ -74,8 +74,8 @@ The env **builds** the simulated robot from the MJCF plus a `RobotParams` file (
 
 `validate_robot(model) -> list[str]` reports every violation of the composed model; robot-ci, CAD
 export (Phase 8), evolved bodies (Phase 10) and generated robots (Phase 12) all go through it.
-Besides the table above it checks that the robot can fall freely and that nothing else shares the
-world:
+Besides the table above it checks that the robot can fall freely, that nothing else shares the
+world, and the geometry the env relies on:
 
 - `root` is a free joint on `chassis` with zero `damping`, `armature` and `frictionloss` on all
   six of its DOFs and zero `stiffness`, polynomial terms included (`damping`/`stiffness` given as
@@ -91,9 +91,22 @@ world:
   is parallel (or antiparallel) to that hinge axis, within 1e-6 in |cos| of the angle between
   them. Together they make `size[0]` the radius the tire rolls on: an off-centre tire would roll
   as a cam.
+- the axle is the chassis y axis and the chassis origin is its midpoint (§2). A tire's centre in
+  the chassis frame is its wheel body's `pos` plus the tire's `pos` rotated by the body's `quat`;
+  each has x and z within 1e-6 m of 0, the left one lies at y > 0 and the right one at y < 0,
+  and their y coordinates sum to 0 within 1e-6 m. A reset tilts the chassis about its origin by
+  the initial pitch and turns each wheel, relative to the chassis, at minus the initial pitch
+  rate (forward positive, §2; §9): only on this axle do the tires then spawn touching the floor
+  (§5) and start rolling without slip.
+- the `imu` site is not rotated relative to the chassis: each of its axes lies along the same
+  chassis axis, within 1e-6 in 1 − cos of the angle between them. MuJoCo's gyro and
+  accelerometer read in the site's frame, which §5 takes as the chassis frame; the board's mount
+  error is the scenario's `imu_pitch_offset` (§9), never a rotation in the MJCF. Only the
+  `push_point` site's position counts.
 
 `wheel_radius_m` is the tire geom's radius (both tires must agree to within 1e-9 m) and
-`track_width_m` the distance between the wheel bodies along y; both reach the controller through
+`track_width_m` the distance along y between the two tires' centres in the chassis frame (where
+the tires roll, wherever their wheel bodies' origins are); both reach the controller through
 `TaskSpec.robot`.
 
 `robot_hash(robot_xml, params)` = sha256 of the MJCF bytes, then the params as JSON text exactly as
