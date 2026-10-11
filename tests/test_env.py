@@ -35,7 +35,7 @@ from topple.disturbances import (
 from topple.envs import BALANCE_V1, BalanceEnv, RewardConfig
 from topple.estimation import encoder_counts, odometry_yaw, wheel_angle_from_counts, wrap_angle
 from topple.rng import MAX_SEED
-from topple.robot import challenge_dir
+from topple.robot import challenge_dir, robot_hash
 from topple.traj import load_npz
 
 Obs = npt.NDArray[np.float32]
@@ -1149,8 +1149,26 @@ def test_trajectory_records_exactly_what_the_controller_saw() -> None:
     assert meta["obs_features"] == list(FEATURES)
     assert meta["wheel_sign"] == [1.0, 1.0]
     assert meta["joint_qpos"] == {"root": 0, "wheels": [7, 8]}
-    assert len(meta["robot_hash"]) == 64
+    assert meta["robot_hash"] == robot_hash(env.robot_xml, env.params)
     assert meta["versions"]["mujoco"] == mujoco.__version__
+
+
+def test_a_robot_variant_records_its_own_hash(tmp_path: Path) -> None:
+    """``meta.robot_hash`` is the hash of the robot actually simulated: videos refuse to draw a
+    variant's states on the stock robot (fix spec I) and verification binds uploads by it."""
+    from topple.video import render_trajectory
+
+    left = wheel_axis("left", "0 1 0")
+    path = robot_variant(tmp_path, "ref", (left, left.replace("/>", ' ref="0.5"/>')))
+    env = BalanceEnv("ideal", robot_xml=path, record=True)
+    rollout(env, lambda o, i: (0.0, 0.0), seed=0, max_steps=10)
+    traj = env.trajectory({"episode_index": 0})
+    stock = env.challenge
+    assert traj.meta["robot_hash"] == robot_hash(path, env.params)
+    assert traj.meta["robot_hash"] != robot_hash(stock.robot_xml, stock.params)
+    with pytest.raises(ValueError, match=r"robot_hash .* refusing to draw the wrong robot"):
+        render_trajectory(traj, tmp_path / "variant.gif")
+    assert not (tmp_path / "variant.gif").exists()
 
 
 def test_epilogue_keeps_simulating_with_zero_command() -> None:

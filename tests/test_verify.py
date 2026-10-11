@@ -494,6 +494,34 @@ def test_errors_of_the_run_itself_are_not_verification_failures(tmp_path: Path) 
     assert (verdict.ok, verdict.failed) == (True, 0)
 
 
+def test_verification_replays_on_the_protocols_own_challenge_object(tmp_path: Path) -> None:
+    """Fix spec I: hashing and scoring stay on one bundle. A protocol built from a custom bundle
+    (E_ref 0.001) is replayed and re-scored with that very bundle, never with the installed one
+    reloaded by id, which would score the upload with another bundle's ScoreConfig under this
+    bundle's protocol_hash."""
+    import shutil
+
+    from topple.challenge import load_challenge_dir
+    from topple.robot import challenge_dir
+
+    root = tmp_path / "balance-v1"
+    shutil.copytree(challenge_dir("balance-v1"), root)
+    yaml_path = root / "challenge.yaml"
+    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.0", "e_ref_j: 0.001"))
+    stock = public("clean", 1)
+    custom = replace(stock, challenge=load_challenge_dir(root))
+    honest = run_honest(custom, pid, tmp_path / "run")
+    stock_results = evaluate(stock, pid, INFO)
+    assert honest.results.episodes is not None
+    assert stock_results.episodes is not None
+    assert honest.results.episodes[0].score < stock_results.episodes[0].score  # custom E_ref
+    assert honest.results.protocol_hash != stock_results.protocol_hash
+    assert_reproduces(verify_episode(honest.uploads[0], custom, 0), honest.results.episodes[0])
+    again = rescore(custom, honest.uploads, INFO, "inprocess")
+    assert again.episodes == honest.results.episodes
+    assert again.protocol_hash == honest.results.protocol_hash
+
+
 # ------------------------------------------------------------------ robustness
 
 
