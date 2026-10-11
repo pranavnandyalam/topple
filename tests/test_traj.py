@@ -2,12 +2,13 @@ import io
 import json
 import os
 import re
+import struct
 import tempfile
 import threading
 import time
 import tracemalloc
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import numpy as np
@@ -708,4 +709,348 @@ def test_array_members_must_be_two_dimensional(tmp_path: Path, name: str, arr: n
     path = tmp_path / "ndim.npz"
     write_members(path, members)
     with pytest.raises(ValueError, match=rf"ndim\.npz: {name} must be 2-D"):
+        load_npz(path, max_steps=1000)
+
+
+# ------------------------------------------------------------------ hostile archives (§14)
+
+
+def peak_traced(action: Callable[[], object]) -> int:
+    """Peak bytes Python allocated while running ``action``, which must refuse its file with a
+    ``ValueError`` naming it."""
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=r"\.npz: "):
+            action()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return peak
+
+
+def write_streamed(
+    path: Path, members: dict[str, bytes], name: str, chunks: Iterable[bytes], method: int
+) -> None:
+    """``members`` stored, plus ``name`` compressed with ``method`` from ``chunks`` as they come,
+    so a bomb never sits whole in the test's memory."""
+    with zipfile.ZipFile(path, "w") as zf:
+        for member, data in members.items():
+            zf.writestr(member, data)
+        info = zipfile.ZipInfo(name)
+        info.compress_type = method
+        with zf.open(info, "w") as fh:
+            for chunk in chunks:
+                fh.write(chunk)
+
+
+def central_entry(raw: bytes | bytearray, name: str) -> int:
+    """Offset of ``name``'s entry in the zip central directory of ``raw``."""
+    at = raw.find(b"PK\x01\x02")
+    while at >= 0:
+        length = int.from_bytes(raw[at + 28 : at + 30], "little")
+        if raw[at + 46 : at + 46 + length] == name.encode():
+            return at
+        at = raw.find(b"PK\x01\x02", at + 4)
+    raise AssertionError(f"{name} is not in the central directory")
+
+
+def declare_size(path: Path, name: str, size: int) -> None:
+    """Make the central directory lie about ``name``'s uncompressed size."""
+    raw = bytearray(path.read_bytes())
+    at = central_entry(raw, name)
+    raw[at + 24 : at + 28] = size.to_bytes(4, "little")
+    path.write_bytes(bytes(raw))
+
+
+def npy_with_header(header: str, data: bytes = b"", *, version: int = 1) -> bytes:
+    """An npy member with a hand-written header (numpy would refuse to write a hostile one)."""
+    raw = header.encode("latin1")
+    length = struct.pack("<H", len(raw)) if version == 1 else struct.pack("<I", len(raw))
+    return b"\x93NUMPY" + bytes([version, 0]) + length + raw + data
+
+
+@pytest.mark.parametrize("method", [zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA], ids=["bzip2", "lzma"])
+def test_only_stored_and_deflated_members_are_read(tmp_path: Path, method: int) -> None:
+    """bzip2 and lzma decompress a whole compressed chunk at once, with no output limit: such a
+    member is refused before anything is read, as soon as the member list is checked."""
+    path = tmp_path / "packed.npz"
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, data in honest_members().items():
+            zf.writestr(name, data, compress_type=method if name == "qpos.npy" else None)
+    message = rf"packed\.npz: qpos\.npy: compression method {method} is not allowed"
+    with pytest.raises(ValueError, match=message):
+        load_npz(path, max_steps=1000)
+    with pytest.raises(ValueError, match=message):
+        read_meta(path)
+
+
+def test_a_bzip2_bomb_with_a_lying_size_is_never_decompressed(tmp_path: Path) -> None:
+    """The review's bomb: 32 MiB of zeros in a few hundred bytes of bzip2 whose directory entry
+    declares 100 bytes. Decompressing even its first chunk would allocate all 32 MiB."""
+    members = honest_members()
+    del members["qpos.npy"]
+    path = tmp_path / "bomb.npz"
+    write_streamed(path, members, "qpos.npy", [bytes(1 << 20)] * 32, zipfile.ZIP_BZIP2)
+    declare_size(path, "qpos.npy", 100)
+    assert path.stat().st_size < 20_000
+    assert peak_traced(lambda: load_npz(path, max_steps=1000)) < 2_000_000
+    with pytest.raises(ValueError, match=r"bomb\.npz: qpos\.npy: compression method 12"):
+        load_npz(path, max_steps=1000)
+
+
+def test_a_huge_npy_header_length_is_refused_before_the_header_is_read(tmp_path: Path) -> None:
+    """An npy 2.0 header length is 4 bytes the uploader picks: asking the zip stream for that
+    many bytes at once would make deflate expand 64 KB of spaces into 64 MiB, even though the
+    directory declares only 1 MiB for the member."""
+    members = honest_members()
+    del members["qpos.npy"]
+    path = tmp_path / "header.npz"
+    length = 64 << 20
+    head = b"\x93NUMPY\x02\x00" + struct.pack("<I", length)
+    write_streamed(
+        path, members, "qpos.npy", [head, *[b" " * (1 << 20)] * 64], zipfile.ZIP_DEFLATED
+    )
+    declare_size(path, "qpos.npy", 1 << 20)  # within the 16 MiB member cap
+    assert path.stat().st_size < 200_000
+    assert peak_traced(lambda: load_npz(path, max_steps=1000)) < 2_000_000
+    cap = traj_module.MAX_NPY_HEADER_BYTES
+    with pytest.raises(ValueError, match=rf"qpos: npy header has {length} bytes, more than {cap}"):
+        load_npz(path, max_steps=1000)
+
+
+def test_a_lying_deflated_size_reads_only_what_it_declares(tmp_path: Path) -> None:
+    """A deflated member that holds far more than its directory entry declares: reading stops at
+    the declared size (then the CRC fails), and no read asks the stream for more than a small
+    chunk, so the 32 MiB behind it are never inflated."""
+    members = honest_members()
+    qpos = members.pop("qpos.npy")
+    path = tmp_path / "liar.npz"
+    write_streamed(path, members, "qpos.npy", [qpos, *[bytes(1 << 20)] * 32], zipfile.ZIP_DEFLATED)
+    declare_size(path, "qpos.npy", len(qpos))
+    assert peak_traced(lambda: load_npz(path, max_steps=1000)) < 2_000_000
+
+
+MINUS_CHAIN = "{'descr': '|u1', 'fortran_order': False, 'shape': (" + "-" * 9000 + "1,), }"
+"""Under numpy's own 10,000-character header limit, but ``ast.literal_eval`` gives up on it with
+``MemoryError: Parser stack overflowed``."""
+
+
+@pytest.mark.parametrize(
+    ("member", "read"),
+    [
+        ("meta_json.npy", read_meta),
+        ("meta_json.npy", lambda path: load_npz(path, max_steps=1000)),
+        ("qpos.npy", lambda path: load_npz(path, max_steps=1000)),
+    ],
+    ids=["read_meta", "load_npz meta", "load_npz qpos"],
+)
+def test_a_header_too_complex_to_parse_is_a_value_error(
+    tmp_path: Path, member: str, read: Callable[[Path], object]
+) -> None:
+    members = honest_members()
+    members[member] = npy_with_header(MINUS_CHAIN)
+    path = tmp_path / "minus.npz"
+    write_members(path, members)
+    with pytest.raises(ValueError, match=r"minus\.npz: (meta_json|qpos): npy header has"):
+        read(path)
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "{'descr': '<f8', 'fortran_order': False, 'shape': (--6, 9), }",
+        "{'descr': '<f8', 'fortran_order': False, 'shape': (-" + "-" * 3000 + "6, 9), }",
+        "{'descr': '<f8', 'fortran_order': 0, 'shape': (6, 9), }",
+        "{'descr': ['<f8'], 'fortran_order': False, 'shape': (6, 9), }",
+        "{'descr': '<f8', 'fortran_order': False, 'shape': 6, }",
+        "{'descr': '<f8', 'fortran_order': False, 'shape': (6), }",
+        "{'descr': '<f8', 'fortran_order': False, 'shape': (0x6, 9), }",
+        "{'descr': '<f8', 'fortran_order': False, 'shape': (6, 9,,), }",
+        "{'descr': '<f8', 'fortran_order': False, 'shape': ((6,), 9), }",
+        "{'descr': '<f8', 'fortran_order': False, 'shape': (6, 9), 'extra': 1, }",
+        "{'descr': '<f8', 'fortran_order': False, 'shape': (6, 9), } junk",
+        "{'fortran_order': False, 'descr': '<f8', 'shape': (6, 9), }",
+        "{'descr': '<f8', 'fortran_order': False}",
+        "",
+    ],
+    ids=[
+        "double minus",
+        "long minus chain",
+        "flag not a bool",
+        "descr not a string",
+        "shape not a tuple",
+        "parenthesized int",
+        "hex dimension",
+        "empty dimension",
+        "nested tuple",
+        "extra key",
+        "trailing junk",
+        "keys out of order",
+        "missing key",
+        "empty",
+    ],
+)
+def test_a_malformed_npy_header_is_refused_without_evaluating_it(
+    tmp_path: Path, header: str
+) -> None:
+    """The loader parses the header text itself and never hands it to a Python parser."""
+    members = honest_members()
+    members["qpos.npy"] = npy_with_header(header, np.zeros((6, 9)).tobytes())
+    path = tmp_path / "header.npz"
+    write_members(path, members)
+    with pytest.raises(ValueError, match=r"header\.npz: qpos: malformed npy header"):
+        load_npz(path, max_steps=1000)
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "{'descr': '<f8', 'fortran_order': False, 'shape': (6, 9), }" + " " * 69 + "\n",
+        "{'descr':'<f8','fortran_order':False,'shape':(6,9)}",
+        "{ 'descr' : '<f8' , 'fortran_order' : False , 'shape' : ( 6 , 9 , ) }\n",
+    ],
+    ids=["numpy", "compact", "spaced"],
+)
+@pytest.mark.parametrize("version", [1, 2])
+def test_npy_headers_written_by_other_tools_load(tmp_path: Path, header: str, version: int) -> None:
+    traj = make_traj(t=5, nq=9)
+    members = honest_members(traj)
+    members["qpos.npy"] = npy_with_header(header, traj.qpos.tobytes(), version=version)
+    path = tmp_path / "other.npz"
+    write_members(path, members)
+    np.testing.assert_array_equal(load_npz(path, max_steps=5).qpos, traj.qpos)
+
+
+def test_an_npy_header_must_not_be_cut_short(tmp_path: Path) -> None:
+    members = honest_members()
+    members["qpos.npy"] = npy_with_header("{'descr': '<f8'")[:-4]
+    path = tmp_path / "short.npz"
+    write_members(path, members)
+    with pytest.raises(ValueError, match=r"short\.npz: qpos: truncated npy header"):
+        load_npz(path, max_steps=1000)
+    members["qpos.npy"] = b"\x93NUMPY\x01\x00\x10"  # one byte of a two-byte header length
+    write_members(path, members)
+    with pytest.raises(ValueError, match=r"short\.npz: qpos: truncated npy header"):
+        load_npz(path, max_steps=1000)
+    members["qpos.npy"] = b"\x93NUMP"
+    write_members(path, members)
+    with pytest.raises(ValueError, match=r"short\.npz: qpos: not an npy member"):
+        load_npz(path, max_steps=1000)
+
+
+def test_an_encrypted_member_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "locked.npz"
+    write_members(path, honest_members())
+    raw = bytearray(path.read_bytes())
+    at = central_entry(raw, "obs.npy")
+    raw[at + 8] |= 0x01  # general purpose flag bit 0: encrypted
+    path.write_bytes(bytes(raw))
+    with pytest.raises(ValueError, match=r"locked\.npz: obs\.npy: encrypted members"):
+        load_npz(path, max_steps=1000)
+
+
+def test_a_file_over_the_size_cap_is_refused_unread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "t.npz"
+    make_traj().save_npz(path)
+    size = path.stat().st_size
+    monkeypatch.setattr(traj_module, "MAX_FILE_BYTES", size - 1)
+    message = rf"t\.npz: the file has {size} bytes, more than {size - 1}"
+    with pytest.raises(ValueError, match=message):
+        load_npz(path, max_steps=5)
+    with pytest.raises(ValueError, match=message):
+        read_meta(path)
+    monkeypatch.setattr(traj_module, "MAX_FILE_BYTES", size)
+    assert load_npz(path, max_steps=5).steps == 5
+
+
+def test_the_real_size_cap_refuses_a_huge_sparse_file(tmp_path: Path) -> None:
+    path = tmp_path / "huge.npz"
+    path.write_bytes(b"")
+    os.truncate(path, traj_module.MAX_FILE_BYTES + 1)  # sparse: costs no disk space
+    with pytest.raises(ValueError, match=r"huge\.npz: the file has \d+ bytes, more than"):
+        load_npz(path, max_steps=1000)
+
+
+@pytest.mark.parametrize(
+    "read",
+    [lambda path: load_npz(path, max_steps=1000), read_meta],
+    ids=["load_npz", "read_meta"],
+)
+def test_a_directory_of_many_entries_is_refused_before_it_is_parsed(
+    tmp_path: Path, read: Callable[[Path], object]
+) -> None:
+    """``zipfile`` builds one object per directory entry before the member list can be checked
+    (about 7 bytes of memory per byte of directory): the directory's size is checked first."""
+    path = tmp_path / "entries.npz"
+    with zipfile.ZipFile(path, "w") as zf:
+        for i in range(20_000):
+            zf.writestr(str(i), b"")
+    assert peak_traced(lambda: read(path)) < 1_000_000
+    cap = traj_module.MAX_DIRECTORY_BYTES
+    message = rf"entries\.npz: the zip central directory has \d+ bytes, more than {cap}"
+    with pytest.raises(ValueError, match=message):
+        read(path)
+
+
+def test_the_end_record_must_end_the_file(tmp_path: Path) -> None:
+    """No archive comment, so ``zipfile`` reads exactly the record that was checked."""
+    path = tmp_path / "comment.npz"
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, data in honest_members().items():
+            zf.writestr(name, data)
+        zf.comment = b"hello"
+    with pytest.raises(ValueError, match=r"comment\.npz: .*end-of-central-directory"):
+        load_npz(path, max_steps=1000)
+
+
+def test_zip64_end_records_are_refused(tmp_path: Path) -> None:
+    """A zip64 locator just before the end record would make ``zipfile`` read the directory size
+    from the zip64 record instead of the one that was checked."""
+    path = tmp_path / "z64.npz"
+    write_members(path, honest_members())
+    raw = path.read_bytes()
+    body, end = raw[:-22], raw[-22:]
+    _, _, _, _, entries, cd_size, cd_offset, _ = struct.unpack("<4s4H2LH", end)
+    record = struct.pack(
+        "<4sQ2H2L2Q2Q", b"PK\x06\x06", 44, 45, 45, 0, 0, entries, entries, cd_size, cd_offset
+    )
+    locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, len(body), 1)
+    path.write_bytes(body + record + locator + end)
+    with pytest.raises(ValueError, match=r"z64\.npz: zip64 archives are not allowed"):
+        load_npz(path, max_steps=1000)
+
+
+def test_unexpected_member_names_are_quoted_briefly(tmp_path: Path) -> None:
+    path = tmp_path / "names.npz"
+    with zipfile.ZipFile(path, "w") as zf:
+        for i in range(40):
+            zf.writestr(f"\x1b[2J{'x' * 100}{i}", b"")
+    with pytest.raises(ValueError, match="unexpected members") as caught:
+        load_npz(path, max_steps=1000)
+    message = str(caught.value)
+    assert len(message) < 600
+    assert "\x1b" not in message  # names are shown escaped
+    assert "and 46 more" in message
+
+
+def test_a_multi_disk_archive_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "disks.npz"
+    write_members(path, honest_members())
+    raw = bytearray(path.read_bytes())
+    raw[-18:-16] = (1).to_bytes(2, "little")  # end record: number of this disk
+    path.write_bytes(bytes(raw))
+    with pytest.raises(ValueError, match=r"disks\.npz: multi-disk zip archives are not allowed"):
+        load_npz(path, max_steps=1000)
+
+
+def test_a_zero_dimensional_member_is_refused(tmp_path: Path) -> None:
+    members = honest_members()
+    members["qpos.npy"] = npy_with_header(
+        "{'descr': '<f8', 'fortran_order': False, 'shape': (), }", np.zeros(1).tobytes()
+    )
+    path = tmp_path / "scalar.npz"
+    write_members(path, members)
+    with pytest.raises(ValueError, match=r"scalar\.npz: qpos must be 2-D, got header shape \(\)"):
         load_npz(path, max_steps=1000)

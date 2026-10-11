@@ -704,6 +704,65 @@ def _edited_file(out: Path, name: str, **changes: object) -> Path:
     return out / name
 
 
+def _with_member(src: Path, dst: Path, member: str, data: bytes) -> Path:
+    """A copy of the trajectory ``src`` whose zip member ``member`` holds ``data`` instead."""
+    import zipfile
+
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
+        for info in zin.infolist():
+            zout.writestr(info.filename, data if info.filename == member else zin.read(info))
+    return dst
+
+
+# Under numpy's own 10,000-character header limit, but ``ast.literal_eval`` gives up on it with
+# ``MemoryError: Parser stack overflowed``.
+_MINUS_HEADER = (
+    "{'descr': '|u1', 'fortran_order': False, 'shape': (" + "-" * 9000 + "1,), }"
+).encode("latin1")
+_MINUS_NPY = b"\x93NUMPY\x01\x00" + len(_MINUS_HEADER).to_bytes(2, "little") + _MINUS_HEADER
+
+
+@pytest.mark.parametrize("member", ["meta_json.npy", "qpos.npy"])
+@pytest.mark.parametrize("command", ["verify", "score"])
+def test_a_header_too_complex_to_parse_exits_2(tmp_path: Path, command: str, member: str) -> None:
+    """Such a header used to escape the loader as MemoryError: a traceback and exit 1, the code
+    that means "verification failed" (§16)."""
+    out = _run(tmp_path, "-p", "balance-v1/clean")
+    path = _with_member(out / "traj_000.npz", out / "minus.npz", member, _MINUS_NPY)
+    result = runner.invoke(app, [command, str(path)])
+    assert result.exit_code == 2, result.output
+    assert f"minus.npz: {member.removesuffix('.npy')}: npy header has" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("command", ["verify", "score"])
+def test_a_file_whose_meta_reads_but_whose_arrays_do_not_load_exits_2(
+    tmp_path: Path, command: str
+) -> None:
+    """Forgery L through the CLI: the metadata binds the file to an episode, then loading it
+    refuses its 1001 steps. A clean exit 2, never a traceback with exit 1."""
+    import numpy as np
+
+    from topple.traj import load_npz
+
+    out = _run(tmp_path, "-p", "balance-v1/clean")
+    traj = load_npz(out / "traj_000.npz", max_steps=1000)
+    assert traj.steps == 1000
+
+    def longer(arr: np.ndarray) -> np.ndarray:
+        return np.vstack([arr, arr[-1:]])
+
+    per_step = ("qpos", "qvel", "obs", "action", "ctrl", "enc_counts", "gyro", "accel")
+    changes = {name: longer(getattr(traj, name)) for name in (*per_step, "push_force")}
+    from dataclasses import replace
+
+    replace(traj, **changes).save_npz(out / "long.npz")
+    result = runner.invoke(app, [command, str(out / "long.npz")])
+    assert result.exit_code == 2, result.output
+    assert "long.npz: qpos: trajectory has 1001 steps, more than 1000" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_a_file_that_names_no_episode_exits_2(tmp_path: Path) -> None:
     out = _run(tmp_path, "-p", "balance-v1/clean")
     path = _edited_file(out, "anon.npz", episode_index=None, scenario=None)

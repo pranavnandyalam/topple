@@ -420,14 +420,26 @@ A trajectory file is untrusted data: nothing in it is ever scored directly; the 
 verifies and re-scores it by replay (§16).
 
 **Loading** (`load_npz(path, *, max_steps)`; `max_steps` is required, so every caller bounds T)
-reads each member by hand and raises `ValueError`, naming the file, for anything else, including
-unreadable, truncated or missing files and corrupted members:
+reads the archive and each member by hand and raises `ValueError`, naming the file, for anything
+else, including unreadable, truncated or missing files and corrupted members:
 
-- a regular file (symlinks are followed); a FIFO, device or directory is refused without
+- a regular file (symlinks are followed) of at most `MAX_FILE_BYTES = 33554432` bytes (32 MiB;
+  an honest balance-v1 file is about 0.2 MB); a FIFO, device or directory is refused without
   blocking on it or reading from it;
-- exactly the 11 members above, no duplicates, each at most 16 MiB uncompressed;
-- each an `.npy` of format 1.0 or 2.0, C order, the exact dtype of the table (no object arrays),
-  whose header shape needs exactly the bytes the member holds (a header can never make the
+- a zip archive whose end-of-central-directory record ends the file (no archive comment, no
+  zip64 records, one disk) and whose central directory is at most `MAX_DIRECTORY_BYTES = 16384`
+  bytes (an honest one is under 1 KiB), checked before the directory is parsed: a file listing
+  thousands of entries is refused at the cost of reading its last 42 bytes;
+- exactly the 11 members above, no duplicates, each stored or deflated (no other compression
+  method, no encryption) and at most 16 MiB uncompressed as its directory entry declares.
+  Members are read at most 64 KiB at a time, so neither a size that lies nor a large read can
+  make decompression produce more than the read asked for;
+- each an `.npy` of format 1.0 or 2.0 whose header is at most `MAX_NPY_HEADER_BYTES = 4096`
+  bytes, checked before the header is read. The header text is parsed by the loader, never
+  evaluated: exactly `{'descr': <str>, 'fortran_order': <bool>, 'shape': <tuple of ints>}` in
+  that key order, as numpy writes it (whitespace and a trailing comma are free; anything else
+  is malformed). The array is C-ordered with the exact dtype of the table (no object arrays),
+  and its header shape needs exactly the bytes the member holds (a header can never make the
   loader allocate more than the file contains);
 - the size limits, checked on each member's header before any of its data is read (a few KB of
   compressed zeros can never make the loader allocate more than an honest file needs):
