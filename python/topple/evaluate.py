@@ -15,7 +15,7 @@ import platform
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import mujoco
 import numpy as np
@@ -53,15 +53,67 @@ ControllerFactory = Callable[[TaskSpec], Controller[Any]]
 EPILOGUE_S = 1.0
 SIM_UNSTABLE_DETAIL = "physics became unstable"
 FALL_REASONS = frozenset({"fell", "floor_contact"})
+MIN_PRIVATE_SALT = 2**64
+"""Smallest salt of a private protocol: its salt is a 128-bit secret (contract §8, §9), so a
+smaller one is almost certainly forgotten or hand-typed, and a controller could brute-force it."""
+MAX_PRIVATE_SALT = 2**128 - 1
+RunnerErrorCode = Literal["timeout", "crash", "protocol", "output_limit", "load_error"]
+"""Run error codes (contract §15) that only the runner, not the harness, can know about."""
+RUNNER_ERROR_CODES: frozenset[str] = frozenset(get_args(RunnerErrorCode))
+
+
+class RunnerError(Exception):
+    """Raised by a harness-owned controller proxy (the Phase 3 runner) for a failure of its own
+    (no reply in time, a crashed subprocess, a malformed or oversized reply, a submission that
+    would not load): the episode ends with ``code`` (contract §15) instead of ``exception``.
+
+    Only this exact class, holding the code and detail it was built with, names a code; a
+    subclass, or an instance whose attributes were changed, is an ordinary exception. An
+    in-process controller could raise it too, which only picks another zero-scoring code.
+    """
+
+    def __init__(self, code: RunnerErrorCode, detail: str) -> None:
+        _check_runner_error(code, detail)
+        super().__init__(code, detail)
+        self.code: str = code
+        self.detail: str = detail
+
+
+def _check_runner_error(code: object, detail: object) -> None:
+    if type(code) is not str or code not in RUNNER_ERROR_CODES:
+        raise ValueError(
+            f"a runner error code is one of {sorted(RUNNER_ERROR_CODES)}, got {code!r}"
+        )
+    if type(detail) is not str:
+        raise TypeError(f"a runner error detail must be a str, got {type(detail).__name__}")
 
 
 @dataclass(frozen=True)
 class EvalProtocol:
+    """A protocol: challenge, preset, seeds and salt (contract §8, §9, §13).
+
+    A public protocol's salt is 0; a private one's is a secret in
+    ``[MIN_PRIVATE_SALT, MAX_PRIVATE_SALT]``. Anything else raises ``ValueError``.
+    """
+
     challenge: Challenge
     preset: str
     seeds: tuple[int, ...]
     seed_set: Literal["public", "private"] = "public"
     salt: int = 0
+
+    def __post_init__(self) -> None:
+        if self.seed_set not in ("public", "private"):
+            raise ValueError(f"seed_set must be 'public' or 'private', got {self.seed_set!r}")
+        if type(self.salt) is not int:
+            raise ValueError(f"the salt must be an int, got {type(self.salt).__name__}")
+        if self.seed_set == "public" and self.salt != 0:
+            raise ValueError("a public protocol's salt is 0: its seeds are public anyway")
+        if self.seed_set == "private" and not (MIN_PRIVATE_SALT <= self.salt <= MAX_PRIVATE_SALT):
+            raise ValueError(
+                "a private protocol's salt is a secret in [2**64, 2**128) "
+                "(e.g. 2**64 + secrets.randbelow(2**128 - 2**64))"
+            )
 
     @property
     def id(self) -> str:
@@ -101,6 +153,36 @@ def _error(code: str, step: int, detail: str) -> ErrorInfo:
     return ErrorInfo.model_validate({"code": code, "step": step, "detail": detail})
 
 
+def _controller_error(exc: BaseException, step: int) -> ErrorInfo:
+    """The error that ``exc``, raised by the controller's factory, ``reset`` or ``act``, earns:
+    a ``RunnerError``'s own code, else ``exception``. Never raises (but ``KeyboardInterrupt``)."""
+    reported = _runner_report(exc)
+    if reported is None:
+        return _error("exception", step, describe_exception(exc))
+    code, detail = reported
+    return _error(code, step, detail)
+
+
+def _runner_report(exc: BaseException) -> tuple[str, str] | None:
+    """``(code, detail)`` of a genuine ``RunnerError``, else None.
+
+    ``type(exc)`` is the real class (``exc.__class__`` is never read), so a subclass is not one;
+    the code and detail must still be exact ``str`` objects a runner error may hold, and reading
+    them (an attribute deleted or set to anything) can fail without failing the harness.
+    """
+    if type(exc) is not RunnerError:
+        return None
+    try:
+        code, detail = exc.code, exc.detail
+    except KeyboardInterrupt:
+        raise
+    except BaseException:
+        return None
+    if type(code) is str and code in RUNNER_ERROR_CODES and type(detail) is str:
+        return code, detail
+    return None
+
+
 def _start_controller(
     env: BalanceEnv, factory: ControllerFactory, seed: int, salt: int
 ) -> tuple[Controller[Any], None] | tuple[None, ErrorInfo]:
@@ -115,7 +197,7 @@ def _start_controller(
     except KeyboardInterrupt:
         raise
     except BaseException as exc:  # SystemExit, GeneratorExit, ...: all the controller's fault
-        return None, _error("exception", 0, describe_exception(exc))
+        return None, _controller_error(exc, 0)
     return controller, None
 
 
@@ -128,7 +210,7 @@ def _next_action(
     except KeyboardInterrupt:
         raise
     except BaseException as exc:
-        return _error("exception", step, describe_exception(exc))
+        return _controller_error(exc, step)
     try:
         return validate_action(raw, BALANCE_V1_ACTION.dim)
     except ActionError as exc:

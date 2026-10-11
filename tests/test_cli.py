@@ -987,7 +987,7 @@ def test_score_never_prints_a_private_seed(tmp_path: Path, monkeypatch: pytest.M
     public_protocol = cli._protocol
 
     def private(protocol_id: str) -> object:
-        return replace(public_protocol(protocol_id), seed_set="private", salt=99)
+        return replace(public_protocol(protocol_id), seed_set="private", salt=2**127 + 99)
 
     monkeypatch.setattr(cli, "_protocol", private)
     result = runner.invoke(app, ["score", str(out / "traj_000.npz"), "--index", "0"])

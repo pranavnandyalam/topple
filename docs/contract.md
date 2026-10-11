@@ -212,7 +212,9 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
 - `make_controller` is called once per episode; instances must not share mutable module state.
 - `rng_seed` is a controller-private seed derived from the episode seed (§9); the episode seed
   itself never crosses the controller boundary. With a private protocol's secret salt it carries
-  no usable information about the episode.
+  no usable information about the episode. `EvalProtocol` enforces the salts: a public
+  protocol's salt is 0 and a private protocol's is an `int` in `[2**64, 2**128)`; anything else
+  (a forgotten salt of 0, a hand-typed `99`, a bool) raises `ValueError`.
 - **Public seeds are identifiable.** Public protocols use salt 0, so `rng_seed` (and equally the
   initial observation) identifies which public episode is running: a controller can recognize a
   public seed and replay a memorized answer. Scores on public seeds are therefore provisional.
@@ -481,7 +483,11 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
 
 - **Error codes.** A run records `exception`, `invalid_action`, `timeout`, `crash`, `protocol`,
   `output_limit`, `load_error` or `sim_unstable`. Only trusted verification (§16) assigns
-  `incomplete`, `not_reproducible` and `missing`. Every error scores 0.
+  `incomplete`, `not_reproducible` and `missing`. Every error scores 0. `timeout`, `crash`,
+  `protocol`, `output_limit` and `load_error` are the runner's (Phase 3): its controller proxy
+  raises `topple.evaluate.RunnerError(code, detail)` from `make_controller`, `reset` or `act`,
+  and the episode ends with that code at that step. Only that exact class, holding the code and
+  detail it was built with, names a code; anything else raised there is `exception` (§8).
 - **`complete`** is true only when every one of the protocol's N episodes is present and none is
   `missing`. A single-seed `topple run` and a single-file `topple verify --out` write false.
 - **`isolation`** (`inprocess`/`subprocess`/`container`) records how the controller ran. It does

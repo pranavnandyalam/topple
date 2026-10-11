@@ -42,6 +42,7 @@ from verify_support import (
 )
 
 FACTORIES = {"pid": pid, "lqr": lqr, "random": wide_random}
+PRIVATE_SALT = 2**127 + 1  # a private protocol's 128-bit secret
 
 
 @pytest.fixture(scope="module")
@@ -438,7 +439,7 @@ def test_rescore_counts_missing_episodes_as_zero(
 
 def test_rescore_of_a_private_protocol_is_redacted(honest_runs: dict[str, Honest]) -> None:
     run = honest_runs["pid"]
-    private = replace(run.protocol, seed_set="private", salt=99)
+    private = replace(run.protocol, seed_set="private", salt=PRIVATE_SALT)
     again = rescore(private, run.uploads, INFO, "container")
     assert again.episodes is None
     assert again.seed_set == "private"
@@ -453,7 +454,7 @@ def test_a_private_rescore_counts_forged_and_missing_episodes(
 ) -> None:
     run = honest_runs["lqr"]
     assert run.results.episodes is not None
-    private = replace(run.protocol, seed_set="private", salt=99)
+    private = replace(run.protocol, seed_set="private", salt=PRIVATE_SALT)
     upload = run.uploads[0]
     forged = replace(upload, push_force=upload.push_force + 1.0)
     again = rescore(private, {0: forged, 1: run.uploads[1]}, INFO, "container")
@@ -463,9 +464,6 @@ def test_a_private_rescore_counts_forged_and_missing_episodes(
     assert again.aggregate.episodes == 3
     assert again.aggregate.score == pytest.approx(run.results.episodes[1].score / 3, abs=1e-12)
     assert again.aggregate.success_rate == run.results.episodes[1].success / 3
-
-
-PRIVATE_SALT = 2**127 + 1
 
 
 def test_verify_run_counts_failures_before_the_results_are_redacted(

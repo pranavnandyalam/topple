@@ -16,8 +16,10 @@ from topple.contract import BalancerObs, TaskSpec, controller_obs
 from topple.controllers.pid import PIDController
 from topple.envs.balance import BalanceEnv
 from topple.evaluate import (
+    RUNNER_ERROR_CODES,
     EpisodeRun,
     EvalProtocol,
+    RunnerError,
     evaluate,
     run_episode,
     summarize,
@@ -86,6 +88,9 @@ def protocol(preset: str = "clean", n: int = 3) -> EvalProtocol:
     return replace(base, seeds=tuple(range(n)))
 
 
+SALT = 2**127 + 99  # a private protocol's 128-bit secret
+
+
 def test_protocol_from_id_and_alias() -> None:
     p = EvalProtocol.from_id("eval_v1")
     assert p.id == "balance-v1/standard"
@@ -109,7 +114,7 @@ def test_protocol_hash_covers_the_seed_list_and_the_salt() -> None:
     others = {
         replace(p, seeds=p.seeds[:-1]).protocol_hash(),
         replace(p, seeds=(p.seeds[1], p.seeds[0], p.seeds[2])).protocol_hash(),
-        replace(p, salt=1).protocol_hash(),
+        replace(p, seed_set="private", salt=2**64).protocol_hash(),
         replace(p, seed_set="private", salt=2**127 + 1).protocol_hash(),
     }
     assert expected not in others
@@ -117,10 +122,44 @@ def test_protocol_hash_covers_the_seed_list_and_the_salt() -> None:
 
 
 def test_results_carry_the_protocols_full_hash() -> None:
-    p = replace(protocol("ideal", 1), seed_set="private", salt=99)
+    p = replace(protocol("ideal", 1), seed_set="private", salt=SALT)
     results = evaluate(p, pid, INFO)
-    assert results.protocol_hash == p.challenge.protocol_hash(p.preset, seeds=p.seeds, salt=99)
-    assert results.protocol_hash != replace(p, salt=0).protocol_hash()
+    assert results.protocol_hash == p.challenge.protocol_hash(p.preset, seeds=p.seeds, salt=SALT)
+    assert results.protocol_hash != replace(p, seed_set="public", salt=0).protocol_hash()
+
+
+@pytest.mark.parametrize(
+    ("seed_set", "salt"),
+    [
+        ("private", 0),
+        ("private", 99),
+        ("private", 2**64 - 1),
+        ("private", 2**128),
+        ("private", -(2**100)),
+        ("private", True),
+        ("private", float(2**100)),
+        ("public", 1),
+        ("public", 2**127),
+        ("public", False),
+    ],
+)
+def test_a_protocol_needs_the_salt_its_seed_set_calls_for(seed_set: str, salt: object) -> None:
+    """§8, §9: public seeds use salt 0; private ones a 128-bit secret. A private protocol whose
+    salt was forgotten (0) or hand-typed (99) would let a controller recognize its episodes."""
+    with pytest.raises(ValueError, match="salt"):
+        replace(protocol("ideal", 1), seed_set=seed_set, salt=salt)  # type: ignore[arg-type]
+
+
+def test_salts_in_range_are_accepted() -> None:
+    p = protocol("ideal", 1)
+    assert p.salt == 0
+    for salt in (2**64, SALT, 2**128 - 1):
+        assert replace(p, seed_set="private", salt=salt).salt == salt
+
+
+def test_the_seed_set_is_public_or_private() -> None:
+    with pytest.raises(ValueError, match="seed_set"):
+        replace(protocol("ideal", 1), seed_set="secret")  # type: ignore[arg-type]
 
 
 def test_pid_on_clean_scores_high(tmp_path: Path) -> None:
@@ -215,7 +254,7 @@ def test_results_reject_nan_and_extra_fields() -> None:
 
 
 def test_private_seed_set_redacts_episodes() -> None:
-    p = replace(protocol("ideal", 2), seed_set="private", salt=12345)
+    p = replace(protocol("ideal", 2), seed_set="private", salt=SALT)
     results = evaluate(p, pid, INFO)
     assert results.seed_set == "private"
     assert results.episodes is None
@@ -580,7 +619,7 @@ def test_private_seeds_use_the_salt() -> None:
 
 
 def test_private_seeds_never_save_trajectories(tmp_path: Path) -> None:
-    p = replace(protocol("ideal", 2), seed_set="private", salt=99)
+    p = replace(protocol("ideal", 2), seed_set="private", salt=SALT)
     results = evaluate(p, pid, INFO, traj_dir=tmp_path / "traj")
     assert not (tmp_path / "traj").exists() or not any((tmp_path / "traj").iterdir())
     assert results.episodes is None
@@ -720,3 +759,106 @@ def test_evaluate_runs_on_the_protocols_challenge_object(tmp_path: Path) -> None
     assert b.episodes is not None
     assert b.episodes[0].score < a.episodes[0].score  # scored with the custom E_ref
     assert b.protocol_hash != a.protocol_hash
+
+
+# ------------------------------------------------------------------ runner errors (§15)
+
+
+class RaisesAt:
+    """A controller (or proxy) that raises ``error`` from ``where``: factory, reset or act."""
+
+    def __init__(self, where: str, error: BaseException, at_step: int = 5) -> None:
+        self.where, self.error, self.at_step, self.k = where, error, at_step, 0
+        if where == "factory":
+            raise error
+
+    def reset(self, rng_seed: int) -> None:
+        if self.where == "reset":
+            raise self.error
+
+    def act(self, obs: BalancerObs) -> tuple[float, float]:
+        self.k += 1
+        if self.where == "act" and self.k > self.at_step:
+            raise self.error
+        return PIDController().act(obs)
+
+
+@pytest.mark.parametrize("code", sorted(RUNNER_ERROR_CODES))
+@pytest.mark.parametrize(("where", "step"), [("factory", 0), ("reset", 0), ("act", 5)])
+def test_a_runner_error_ends_the_episode_with_its_code(code: str, where: str, step: int) -> None:
+    """Phase 3's controller proxy reports its own failures (a reply that never came, a crashed
+    subprocess, a malformed or oversized reply) with the §15 code, not as ``exception``."""
+    error = RunnerError(code, "no reply within 20 ms")  # type: ignore[arg-type]
+    env = BalanceEnv("ideal", record=True)
+    run = run_episode(env, lambda spec: RaisesAt(where, error), seed=0, index=0)
+    assert run.result.error == ErrorInfo(code=code, step=step, detail="no reply within 20 ms")
+    assert run.result.score == 0.0
+    assert not run.result.success
+    assert run.trajectory.steps == step
+    assert run.trajectory.epilogue_qpos.shape[0] == 100  # a controller error shows what follows
+
+
+def test_runner_error_codes_are_the_runners_only() -> None:
+    expected = {"timeout", "crash", "protocol", "output_limit", "load_error"}
+    assert expected == RUNNER_ERROR_CODES
+    for code in ("exception", "invalid_action", "sim_unstable", "missing", "incomplete", "x"):
+        with pytest.raises(ValueError, match="runner error code"):
+            RunnerError(code, "detail")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="detail"):
+        RunnerError("timeout", 5)  # type: ignore[arg-type]
+
+
+class HostileStr(str):
+    __slots__ = ()
+
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("compared")
+
+    def __hash__(self) -> int:
+        raise RuntimeError("hashed")
+
+
+def subclassed() -> BaseException:
+    class MineError(RunnerError):
+        pass
+
+    return MineError("timeout", "from a subclass")
+
+
+def tampered_code() -> BaseException:
+    error = RunnerError("timeout", "tampered")
+    error.code = HostileStr("timeout")  # type: ignore[assignment]
+    return error
+
+
+def tampered_detail() -> BaseException:
+    error = RunnerError("crash", "tampered")
+    error.detail = HostileStr("x")
+    return error
+
+
+def deleted_code() -> BaseException:
+    error = RunnerError("protocol", "deleted")
+    del error.code
+    return error
+
+
+@pytest.mark.parametrize(
+    ("make", "detail"),
+    [
+        (subclassed, "MineError: ('timeout', 'from a subclass')"),
+        (tampered_code, "RunnerError: ('timeout', 'tampered')"),
+        (tampered_detail, "RunnerError: ('crash', 'tampered')"),
+        (deleted_code, "RunnerError: ('protocol', 'deleted')"),
+    ],
+    ids=["subclass", "tampered code", "tampered detail", "deleted code"],
+)
+def test_only_the_harness_runner_error_names_a_code(
+    make: Callable[[], BaseException], detail: str
+) -> None:
+    """Anything but ``RunnerError`` itself, holding the code and detail it was built with, is an
+    ordinary ``exception``: in-process code cannot smuggle a hostile value into the record."""
+    run = run_episode(
+        BalanceEnv("ideal", record=True), lambda spec: RaisesAt("act", make()), seed=0, index=0
+    )
+    assert run.result.error == ErrorInfo(code="exception", step=5, detail=detail)
