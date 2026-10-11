@@ -491,7 +491,8 @@ verifies and re-scores it by replay (§16).
 in the target directory (created exclusively, under a random name), mode 0644 whatever the umask,
 then renamed over `path`. An output directory can come from someone else's checkout, so a symlink
 at `path` is replaced, never written through; a failed write leaves `path` as it was. Replay
-videos are written the same way.
+videos, and the image `topple smoke` writes (`smoke.png` in the current directory by default),
+are written the same way.
 
 **Loading** (`load_npz(path, *, max_steps)`; `max_steps` is required, so every caller bounds T)
 reads the archive and each member by hand and raises `ValueError`, naming the file, for anything

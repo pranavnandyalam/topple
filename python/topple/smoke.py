@@ -13,6 +13,7 @@ from pathlib import Path
 import imageio.v3 as iio
 import mujoco
 
+from topple._atomic import replacement
 from topple.rendering import RenderingUnavailableError, make_renderer
 
 SMOKE_XML = """
@@ -66,8 +67,10 @@ def run_smoke(
     finally:
         renderer.close()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    iio.imwrite(out_path, pixels)
+    # The default output is ``smoke.png`` in the current directory, which can be a checkout of
+    # someone else's branch: never write through a symlink planted there (contract §14).
+    with replacement(out_path, suffix=out_path.suffix) as tmp:  # imageio needs the suffix
+        iio.imwrite(tmp, pixels)
     return SmokeResult(
         image_path=out_path,
         steps=steps,
