@@ -11,6 +11,7 @@ import itertools
 import math
 import numbers
 import struct
+import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -131,6 +132,20 @@ def controller_obs(obs_arr: Sequence[float] | npt.NDArray[Any], t: float) -> Bal
     return BalancerObs.from_array(arr, t)
 
 
+_TYPE_NAME = type.__dict__["__name__"]  # type's own descriptor: a metaclass cannot shadow it
+
+
+def class_name(value: object) -> str:
+    """The real name of ``value``'s class as an exact ``str``, running none of its code.
+
+    ``type(value)`` never consults ``value.__class__``; ``type``'s own ``__name__`` descriptor
+    bypasses a metaclass ``__name__`` property; and ``str.__str__`` copies a ``str`` subclass to
+    an exact ``str``, so the result's methods are ``str``'s own. Untrusted objects and their
+    exceptions are only ever named through this (contract §8).
+    """
+    return str.__str__(_TYPE_NAME.__get__(type(value), type))
+
+
 class ActionError(ValueError):
     """The controller returned something that is not a valid action."""
 
@@ -160,21 +175,28 @@ def validate_action(action: object, dim: int) -> tuple[float, ...]:
     ``dim + 1`` items are read, so an endless container cannot hang the harness. Any ``Exception``
     raised by the object while it is inspected, iterated or converted becomes ``ActionError``;
     ``BaseException``s that are not ``Exception`` (``KeyboardInterrupt``, ``SystemExit``)
-    propagate. Does not clip.
+    propagate. Classes are named only through ``class_name``, so no metaclass or ``str``
+    subclass code runs while a message is built. Does not clip.
     """
     try:
         return _read_action(action, dim)
     except ActionError:
         raise
     except Exception as exc:
-        raise ActionError(f"action could not be read: {type(exc).__name__}") from exc
+        raise ActionError(_unreadable(exc)) from exc
+
+
+def _unreadable(exc: Exception) -> str:
+    """The message for an action whose own code raised ``exc``; never raises an ``Exception``."""
+    try:
+        return "action could not be read: " + class_name(exc)
+    except Exception:  # e.g. MemoryError while copying the name
+        return "action could not be read"
 
 
 def _read_action(action: object, dim: int) -> tuple[float, ...]:
     if isinstance(action, (str, bytes, bytearray, Mapping, Set)) or action is None:
-        raise ActionError(
-            f"action must be a sequence of {dim} numbers, got {type(action).__name__}"
-        )
+        raise ActionError(f"action must be a sequence of {dim} numbers, got {class_name(action)}")
     if isinstance(action, Iterator):
         raise ActionError(
             f"action must be a sequence of {dim} numbers, not a one-shot generator or iterator"
@@ -183,9 +205,7 @@ def _read_action(action: object, dim: int) -> tuple[float, ...]:
     if ndim is not None and ndim != 1:
         raise ActionError(f"action must be 1-dimensional, got ndim={ndim}")
     if not isinstance(action, Iterable):
-        raise ActionError(
-            f"action must be a sequence of {dim} numbers, got {type(action).__name__}"
-        )
+        raise ActionError(f"action must be a sequence of {dim} numbers, got {class_name(action)}")
     items = list(itertools.islice(action, dim + 1))
     if len(items) > dim:
         raise ActionError(f"action must have exactly {dim} values, got more than {dim}")
@@ -195,10 +215,10 @@ def _read_action(action: object, dim: int) -> tuple[float, ...]:
 
 
 def _action_value(index: int, item: object) -> float:
-    if isinstance(item, bool) or type(item).__name__ == "bool_":
+    if isinstance(item, bool) or _is_numpy_bool(item):
         raise ActionError(f"action[{index}] is a bool, expected a number")
     if not isinstance(item, numbers.Real):
-        raise ActionError(f"action[{index}] must be a real number, got {type(item).__name__}")
+        raise ActionError(f"action[{index}] must be a real number, got {class_name(item)}")
     try:
         value = float(item)
     except (OverflowError, TypeError, ValueError) as exc:
@@ -208,6 +228,13 @@ def _action_value(index: int, item: object) -> float:
     if not math.isfinite(value):
         raise ActionError(f"action[{index}] is not finite: {value}")
     return value
+
+
+def _is_numpy_bool(item: object) -> bool:
+    """Whether ``item`` is a ``numpy.bool_``, without importing numpy (if numpy was never
+    imported, nothing can be one). Checked by type, never by a name a class could borrow."""
+    np = sys.modules.get("numpy")
+    return np is not None and isinstance(item, np.bool_)
 
 
 def clip_action(

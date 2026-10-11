@@ -364,11 +364,20 @@ CLASSLESS = Deferred(ClasslessError, "ClasslessError()")
 
 
 class FormatBomb(str):
+    """A ``str`` subclass whose own methods raise, or concatenate to something that is not a
+    ``str`` (Python tries a subclass's reflected ``__radd__`` first, so ``": " + bomb`` runs it)."""
+
     def __format__(self, spec: str) -> str:
         raise RuntimeError("cannot format myself")
 
     def __str__(self) -> str:
         raise RuntimeError("cannot str myself")
+
+    def __add__(self, other: object) -> Any:
+        return {"not": "a str"}
+
+    def __radd__(self, other: object) -> Any:
+        return {"not": "a str"}
 
 
 class FormatBombError(Exception):
@@ -386,6 +395,9 @@ def _renamed_error() -> type[Exception]:
 
     RenamedError.__name__ = FormatBomb("Renamed")
     return RenamedError
+
+
+RENAMED = Deferred(lambda: _renamed_error()(), "RenamedError()")
 
 
 def lazy_action() -> Iterator[float]:
@@ -414,10 +426,14 @@ MISBEHAVIOUR: dict[str, tuple[Any, str]] = {
     "exception with a broken __str__": (BadStrError(), "exception"),
     "exception type whose __name__ raises": (NAMELESS, "exception"),
     "__str__ returns a str subclass that cannot be formatted": (FormatBombError(), "exception"),
-    "exception type named by a hostile str subclass": (_renamed_error()(), "exception"),
+    "exception type named by a hostile str subclass": (RENAMED, "exception"),
     "exception whose __class__ raises": (CLASSLESS, "exception"),
     "action iteration raises SystemExit": (IterRaises(SystemExit(1)), "exception"),
     "action iteration raises ValueError": (IterRaises(ValueError("bad")), "invalid_action"),
+    "action iteration raises an exception whose class name raises": (
+        Deferred(lambda: IterRaises(NamelessError()), "IterRaises(NamelessError())"),
+        "invalid_action",
+    ),
     "generator": (lazy_action(), "invalid_action"),
     "huge int": ([10**400, 0.0], "invalid_action"),
     "endless iterable": (Endless(), "invalid_action"),
@@ -438,12 +454,30 @@ def test_misbehaving_controllers_never_crash_the_harness(payload: Any, code: str
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [Endless(), Huge(), Deferred(lambda: IterRaises(NamelessError()), "IterRaises(Nameless)")],
+    ids=["endless iterable", "huge sequence", "iteration raises a nameless exception"],
+)
+def test_invalid_actions_are_described_by_what_was_wrong(payload: Any) -> None:
+    """The detail tells an over-long action (one item too many read) from one that could not be
+    read at all: a regression that reads past ``READ_CAP`` changes the detail, not just memory."""
+    run = run_contained(lambda spec: Explodes(5, materialize(payload)))
+    assert run.result.error is not None
+    expected = (
+        "ActionError: action could not be read: NamelessError"
+        if isinstance(payload, Deferred)
+        else "ActionError: action must have exactly 2 values, got more than 2"
+    )
+    assert (run.result.error.code, run.result.error.detail) == ("invalid_action", expected)
+
+
+@pytest.mark.parametrize(
     ("exc", "detail"),
     [
         (BadStrError(), "BadStrError: <str() failed>"),
         (NAMELESS, "NamelessError: "),
         (FormatBombError(), "FormatBombError: boom"),
-        (_renamed_error()("why"), "Renamed: why"),
+        (Deferred(lambda: _renamed_error()("why"), "RenamedError('why')"), "Renamed: why"),
         (CLASSLESS, "ClasslessError: "),
     ],
     ids=[

@@ -29,6 +29,7 @@ from topple.contract import (
     ActionError,
     Controller,
     TaskSpec,
+    class_name,
     controller_obs,
     validate_action,
 )
@@ -96,18 +97,17 @@ def wants_epilogue(termination_reason: str, has_error: bool) -> bool:
 
 
 UNDESCRIBABLE = "<exception could not be described>"
-_TYPE_NAME = type.__dict__["__name__"]  # the real class name; a metaclass property cannot hide it
 
 
 def _exception_detail(exc: BaseException) -> str:
     """``Type: message`` as plain ``str``s, whatever the exception's own code does.
 
-    The class name comes from ``type``'s own descriptor and both parts are copied to exact
+    The class name comes from ``contract.class_name`` and the message is copied to an exact
     ``str`` with ``str.__str__``, so no method the controller defined (a metaclass ``__name__``,
-    a ``str`` subclass's ``__format__`` or ``__str__``) runs while the detail is assembled. Only
-    the exception's ``__str__`` runs, and its failure is reported, not raised.
+    a ``str`` subclass's ``__format__``, ``__str__`` or ``__radd__``) runs while the detail is
+    assembled. Only the exception's ``__str__`` runs, and its failure is reported, not raised.
     """
-    name = str.__str__(_TYPE_NAME.__get__(type(exc), type))
+    name = class_name(exc)
     try:
         message = str(exc)
     except KeyboardInterrupt:

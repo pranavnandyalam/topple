@@ -10,6 +10,7 @@ import mujoco
 import numpy as np
 import pytest
 
+from topple.envs.balance import BalanceEnv
 from topple.robot import (
     RobotParams,
     bind_robot,
@@ -244,6 +245,16 @@ LEFT_JOINT = '<joint name="left_wheel" type="hinge" axis="0 1 0"/>'
 LEFT_TIRE = '<geom name="left_tire" type="cylinder"'
 RIGHT_TIRE = '<geom name="right_tire" type="cylinder"'
 WORLD_END = "  </worldbody>"
+FREE_ROOT = '<freejoint name="root"/>'
+TETHER = (
+    '<tendon><spatial limited="true" range="0 0.37">'
+    '<site site="anchor"/><site site="imu"/></spatial></tendon>'
+)
+
+
+def free_root(attrs: str) -> str:
+    """The root as an explicit free joint carrying ``attrs`` (``<freejoint>`` takes none)."""
+    return f'<joint name="root" type="free" {attrs}/>'
 
 
 def model_from(params: RobotParams, tmp_path: Path, *edits: tuple[str, str]) -> mujoco.MjModel:
@@ -328,6 +339,49 @@ VIOLATIONS = {
     "tires of different radii": (
         [(RIGHT_TIRE + ' size="0.034 0.013"', RIGHT_TIRE + ' size="0.030 0.013"')],
         "same radius",
+    ),
+    "tires a tenth of a millimetre apart": (
+        [(RIGHT_TIRE + ' size="0.034 0.013"', RIGHT_TIRE + ' size="0.0341 0.013"')],
+        "same radius",
+    ),
+    "damped root": ([(FREE_ROOT, free_root('damping="1000"'))], "'root' has damping 1000"),
+    "root with armature": ([(FREE_ROOT, free_root('armature="100"'))], "'root' has armature 100"),
+    "root with friction loss": (
+        [(FREE_ROOT, free_root('frictionloss="5"'))],
+        "'root' has frictionloss 5",
+    ),
+    "sprung root": ([(FREE_ROOT, free_root('stiffness="10"'))], "'root' has stiffness 10"),
+    "root with nonlinear damping": (
+        [(FREE_ROOT, free_root('damping="0 0 1000"'))],
+        "'root' has damping 1000",
+    ),
+    "root with a nonlinear spring": (
+        [(FREE_ROOT, free_root('stiffness="0 10"'))],
+        "'root' has stiffness 10",
+    ),
+    "world site": (
+        [(WORLD_END, '<site name="anchor" pos="0 0 0.5"/>\n' + WORLD_END)],
+        "world site 'anchor'",
+    ),
+    "tethered by a tendon": (
+        [
+            (WORLD_END, '<site name="anchor" pos="0 0 0.5"/>\n' + WORLD_END),
+            ("</worldbody>", "</worldbody>" + TETHER),
+        ],
+        "tendon '#0' is tied to the world",
+    ),
+    "vertical cylinder tire": (
+        [(LEFT_TIRE + ' size="0.034 0.013" zaxis="0 1 0"', LEFT_TIRE + ' size="0.034 0.013"')],
+        "tire of 'left_wheel' must lie along its hinge axis",
+    ),
+    "tilted capsule tire": (
+        [
+            (
+                RIGHT_TIRE + ' size="0.034 0.013" zaxis="0 1 0"',
+                '<geom name="right_tire" type="capsule" size="0.034 0.013" zaxis="0 1 0.01"',
+            )
+        ],
+        "tire of 'right_wheel' must lie along its hinge axis",
     ),
 }
 
@@ -608,3 +662,99 @@ def test_validate_reports_wheel_and_site_problems(
     path.write_text(xml)
     model = mujoco.MjModel.from_xml_path(str(path))  # raw: build_model would refuse some
     assert any(message in p for p in validate_robot(model)), validate_robot(model)
+
+
+@pytest.mark.parametrize(
+    "edits",
+    [
+        [
+            (
+                LEFT_TIRE + ' size="0.034 0.013" zaxis="0 1 0"',
+                LEFT_TIRE + ' size="0.034 0.013" zaxis="0 -1 0"',
+            ),
+        ],
+        [
+            (
+                LEFT_TIRE + ' size="0.034 0.013" zaxis="0 1 0"',
+                '<geom name="left_tire" type="sphere" size="0.034"',
+            ),
+            (
+                RIGHT_TIRE + ' size="0.034 0.013" zaxis="0 1 0"',
+                '<geom name="right_tire" type="sphere" size="0.034"',
+            ),
+        ],
+        [
+            (
+                LEFT_TIRE + ' size="0.034 0.013"',
+                '<geom name="left_tire" type="capsule" size="0.034 0.013"',
+            ),
+            (
+                RIGHT_TIRE + ' size="0.034 0.013"',
+                '<geom name="right_tire" type="capsule" size="0.034 0.013"',
+            ),
+        ],
+        [(RIGHT_TIRE + ' size="0.034 0.013"', RIGHT_TIRE + ' size="0.0340000000001 0.013"')],
+        [(FREE_ROOT, free_root('damping="0" armature="0" frictionloss="0" stiffness="0"'))],
+        [
+            (
+                '<site name="imu"',
+                '<site name="anchor" pos="0 0 0.02"/><site name="imu"',
+            ),
+            ("</worldbody>", "</worldbody>" + TETHER),
+        ],
+    ],
+    ids=[
+        "flipped cylinder axis",
+        "sphere tires",
+        "capsule tires",
+        "radii within tolerance",
+        "explicit zero root properties",
+        "tendon between robot sites",
+    ],
+)
+def test_validate_accepts_variants_that_can_still_fall(
+    params: RobotParams, tmp_path: Path, edits: list[tuple[str, str]]
+) -> None:
+    assert validate_robot(model_from(params, tmp_path, *edits)) == []
+
+
+def test_validate_reports_a_tendon_wrapped_around_a_scene_geom(
+    params: RobotParams, tmp_path: Path
+) -> None:
+    """A tendon between robot sites that wraps a world geom still ties the robot to the world."""
+    scene = tmp_path / "scene.xml"
+    scene.write_text(
+        SCENE_XML.read_text().replace(
+            '<geom name="floor"',
+            '<geom name="post" type="sphere" size="0.02" pos="0 0 0.5" contype="0"'
+            ' conaffinity="0"/>\n    <geom name="floor"',
+        )
+    )
+    xml = ROBOT_XML.read_text().replace(
+        "</worldbody>",
+        '</worldbody><tendon><spatial limited="true" range="0 0.5"><site site="imu"/>'
+        '<geom geom="post"/><site site="push_point"/></spatial></tendon>',
+    )
+    robot = tmp_path / "robot.xml"
+    robot.write_text(xml)
+    model = build_model(robot, scene, params)
+    problems = validate_robot(model, scene_geoms=frozenset({"floor", "post"}))
+    assert len(problems) == 1, problems
+    assert problems[0].startswith("tendon '#0' is tied to the world"), problems
+
+
+@pytest.mark.parametrize(
+    "case", ["damped root", "root with armature", "tethered by a tendon", "vertical cylinder tire"]
+)
+def test_the_env_refuses_a_robot_that_cannot_fall_or_misstates_its_radius(
+    tmp_path: Path, case: str
+) -> None:
+    """Each of these once ran: a damped or tethered robot survived 1000 idle steps from 0.3 rad,
+    and a vertical tire reported a radius it does not roll on."""
+    xml = ROBOT_XML.read_text()
+    for old, new in VIOLATIONS[case][0]:
+        xml = xml.replace(old, new, 1)
+    path = tmp_path / "variant.xml"
+    path.write_text(xml)
+    with pytest.raises(ValueError, match=r"balancer\.robot\.v1"):
+        BalanceEnv("ideal", robot_xml=path)

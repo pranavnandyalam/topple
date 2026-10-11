@@ -5,7 +5,7 @@ import pickle
 import struct
 import subprocess
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import FrozenInstanceError
 from fractions import Fraction
 from typing import Any, overload
@@ -15,6 +15,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+import topple.contract as contract_module
 from topple.contract import (
     BALANCE_V1_ACTION,
     FEATURES,
@@ -26,6 +27,7 @@ from topple.contract import (
     Observation,
     RobotGeometry,
     TaskSpec,
+    class_name,
     clip_action,
     controller_obs,
     validate_action,
@@ -359,6 +361,134 @@ def test_validate_action_chains_the_original_error() -> None:
     with pytest.raises(ActionError) as caught:
         validate_action([10**400, 0.0], dim=2)
     assert isinstance(caught.value.__cause__, OverflowError)
+
+
+class _HostileNameMeta(type):
+    """A metaclass whose ``__name__`` property shadows ``type.__name__`` and raises."""
+
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]
+        raise RuntimeError("no name for you")
+
+
+class NamelessError(Exception, metaclass=_HostileNameMeta):
+    pass
+
+
+class Opaque(metaclass=_HostileNameMeta):
+    """Not a container, and its class will not say its name."""
+
+
+class NamelessFloat(float, metaclass=_HostileNameMeta):
+    """A perfectly good real number whose class will not say its name."""
+
+
+class CompareBomb(str):
+    """A ``str`` subclass whose comparison and formatting raise."""
+
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("cannot compare myself")
+
+    __hash__ = str.__hash__
+
+    def __format__(self, spec: str) -> str:
+        raise RuntimeError("cannot format myself")
+
+
+class RenamedReal(float):
+    """A real number whose class is named ``bool_`` (numpy's bool) by a hostile ``str``."""
+
+
+RenamedReal.__name__ = CompareBomb("bool_")
+
+
+class ClasslessList(list[float]):
+    """A list whose ``__class__`` raises: ``isinstance`` consults it after the real type."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:  # type: ignore[override]
+        raise ZeroDivisionError("no class for you")
+
+
+def read_action(build: Callable[[], object]) -> tuple[float, ...] | str:
+    """``validate_action(build(), 2)``: the floats, or ``"ActionError: <message>"``.
+
+    Anything else that escapes fails the test outside the ``except`` block, so pytest never has
+    to render a hostile exception (or a hostile argument) itself.
+    """
+    try:
+        return validate_action(build(), dim=2)
+    except ActionError as exc:
+        return "ActionError: " + str.__str__(exc.args[0])
+    except BaseException:
+        pass
+    pytest.fail("validate_action raised something other than ActionError")
+
+
+@pytest.mark.parametrize(
+    ("build", "expected"),
+    [
+        (
+            lambda: Interrupts(NamelessError()),
+            "ActionError: action could not be read: NamelessError",
+        ),
+        (lambda: Opaque(), "ActionError: action must be a sequence of 2 numbers, got Opaque"),
+        (lambda: [NamelessFloat(0.5), 0.0], (0.5, 0.0)),
+        (lambda: [RenamedReal(0.5), 0.0], (0.5, 0.0)),
+        (
+            lambda: RenamedReal(0.5),
+            "ActionError: action must be a sequence of 2 numbers, got bool_",
+        ),
+        (
+            lambda: ClasslessList([0.1, 0.2]),
+            "ActionError: action could not be read: ZeroDivisionError",
+        ),
+    ],
+    ids=[
+        "exception whose class name raises",
+        "object whose class name raises",
+        "real number whose class name raises",
+        "real number named bool_ by a hostile str",
+        "non-container named by a hostile str",
+        "container whose __class__ raises",
+    ],
+)
+def test_validate_action_names_classes_without_running_their_code(
+    build: Callable[[], object], expected: object
+) -> None:
+    """The harness reads real class names and never runs metaclass or ``str``-subclass code; a
+    float subclass is never mistaken for numpy's bool by its name."""
+    assert read_action(build) == expected
+
+
+def test_an_unnameable_failure_still_becomes_an_action_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_memory(value: object) -> str:
+        raise MemoryError
+
+    monkeypatch.setattr(contract_module, "class_name", no_memory)
+    assert read_action(lambda: Interrupts(RuntimeError())) == (
+        "ActionError: action could not be read"
+    )
+
+
+@pytest.mark.parametrize(
+    ("build", "name"),
+    [
+        (lambda: 1.5, "float"),
+        (lambda: Opaque(), "Opaque"),
+        (lambda: NamelessError(), "NamelessError"),
+        (lambda: RenamedReal(), "bool_"),
+    ],
+    ids=["float", "hostile metaclass", "hostile exception metaclass", "str subclass name"],
+)
+def test_class_name_is_the_real_name_as_an_exact_str(
+    build: Callable[[], object], name: str
+) -> None:
+    got = class_name(build())
+    assert type(got) is str
+    assert str.__eq__(got, name)
 
 
 scalars = st.one_of(

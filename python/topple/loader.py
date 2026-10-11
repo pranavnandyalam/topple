@@ -18,13 +18,14 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from topple.contract import Controller, TaskSpec
+from topple.contract import Controller, TaskSpec, class_name
 
 ENTRY_FILE = "controller.py"
 FACTORY = "make_controller"
 MAX_FILES = 50
 MAX_BYTES = 20 * 1024 * 1024
 SHA_TAG = b"topple.submission/1\n"
+CONTROLLER_METHODS = ("reset", "act")  # the members of the Controller protocol (contract §8)
 
 
 class LoadError(Exception):
@@ -154,14 +155,21 @@ def _wrap_factory(raw: Callable[..., Any], entry: Path) -> Callable[[TaskSpec], 
     takes_spec = len(params) == 1 or bool(inspect.signature(raw).parameters)
 
     def factory(spec: TaskSpec) -> Controller[Any]:
-        controller = raw(spec) if takes_spec else raw()
-        if not isinstance(controller, Controller):
+        controller: Controller[Any] = raw(spec) if takes_spec else raw()
+        if not _has_controller_methods(controller):
             raise LoadError(
-                f"{FACTORY}() returned {type(controller).__name__}, which lacks reset()/act()"
+                f"{FACTORY}() returned {class_name(controller)}, which lacks reset()/act()"
             )
         return controller
 
     return factory
+
+
+def _has_controller_methods(obj: object) -> bool:
+    """Whether ``obj`` has ``reset`` and ``act``, looked up as ``isinstance(obj, Controller)``
+    would (``inspect.getattr_static``: the instance dict and the class, nothing dynamic), but
+    without reading ``obj.__class__``: the harness never asks a controller its class (§8)."""
+    return all(inspect.getattr_static(obj, name, None) is not None for name in CONTROLLER_METHODS)
 
 
 def load_submission(path: Path) -> Submission:

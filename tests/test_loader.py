@@ -9,6 +9,7 @@ import pytest
 import topple.loader as loader_module
 from topple.contract import FEATURES, Controller, TaskSpec
 from topple.envs.balance import BalanceEnv
+from topple.evaluate import run_episode
 from topple.loader import LoadError, load_submission, submission_sha256
 
 SPEC: TaskSpec = BalanceEnv("ideal").task_spec
@@ -116,6 +117,75 @@ def test_factory_returning_non_controller(tmp_path: Path) -> None:
         sub.factory(SPEC)
 
 
+CLASSLESS = """
+class C:
+    @property
+    def __class__(self):
+        raise RuntimeError("hostile class")
+
+    def reset(self, rng_seed):
+        pass
+
+    def act(self, obs):
+        return (0.0, 0.0)
+
+
+def make_controller(spec):
+    return C()
+"""
+
+
+def test_a_loaded_controller_is_never_asked_its_class(tmp_path: Path) -> None:
+    """Contract §8: the loader's factory, like the harness, never reads ``__class__``, so a
+    controller behaves the same loaded from a file as passed in directly."""
+    sub = load_submission(write(tmp_path, "classless.py", CLASSLESS))
+    run = run_episode(BalanceEnv("ideal", record=True), sub.factory, seed=0, index=0)
+    assert run.result.error is None
+    assert run.trajectory.meta["termination"]["reason"] == "fell"
+
+
+NAMELESS = """
+class Meta(type):
+    @property
+    def __name__(cls):
+        raise RuntimeError("no name for you")
+
+
+class C(metaclass=Meta):
+    pass
+
+
+def make_controller(spec):
+    return C()
+"""
+
+
+def test_a_non_controller_is_named_by_its_real_class_name(tmp_path: Path) -> None:
+    sub = load_submission(write(tmp_path, "nameless.py", NAMELESS))
+    with pytest.raises(LoadError, match=r"returned C, which lacks reset\(\)/act\(\)"):
+        sub.factory(SPEC)
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [
+        "types.SimpleNamespace(reset=lambda seed: None, act=lambda obs: (0.0, 0.0))",
+        "types.SimpleNamespace(reset=lambda seed: None)",
+    ],
+    ids=["instance attributes", "act missing"],
+)
+def test_controller_methods_may_live_on_the_instance(tmp_path: Path, returned: str) -> None:
+    """Methods are looked up as ``isinstance(x, Controller)`` would (statically, instance dict
+    included), only without reading ``__class__``."""
+    text = f"import types\n\ndef make_controller(spec):\n    return {returned}\n"
+    sub = load_submission(write(tmp_path, "ns.py", text))
+    if "act=" in returned:
+        assert isinstance(sub.factory(SPEC), Controller)
+    else:
+        with pytest.raises(LoadError, match="lacks reset"):
+            sub.factory(SPEC)
+
+
 def test_missing_path(tmp_path: Path) -> None:
     with pytest.raises(LoadError, match="does not exist"):
         load_submission(tmp_path / "nope.py")
@@ -197,9 +267,14 @@ def test_empty_pycache_directory_is_refused(tmp_path: Path) -> None:
         load_submission(root)
 
 
-def test_loading_writes_no_bytecode_so_it_can_load_again(tmp_path: Path) -> None:
+def test_loading_writes_no_bytecode_so_it_can_load_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "bot"
     write(root, "controller.py", GOOD)
+    # Start from Python's default: an earlier load in this worker (or PYTHONDONTWRITEBYTECODE)
+    # would otherwise have turned bytecode off already and hidden a regression.
+    monkeypatch.setattr(sys, "dont_write_bytecode", False)
     first = load_submission(root)
     assert sorted(p.name for p in root.iterdir()) == ["controller.py"]
     assert load_submission(root).sha256 == first.sha256

@@ -42,6 +42,11 @@ TIRE_TYPES = frozenset(
         mujoco.mjtGeom.mjGEOM_CAPSULE,
     )
 )
+# Tires with an axis (their local z): size[0] is the rolling radius only when z is the hinge axis.
+AXIAL_TIRE_TYPES = frozenset(
+    int(t) for t in (mujoco.mjtGeom.mjGEOM_CYLINDER, mujoco.mjtGeom.mjGEOM_CAPSULE)
+)
+AXIS_TOLERANCE = 1e-6  # |cos| of the angle between two axes that count as parallel, minus 1
 _FILE_ATTRS = ("file", "fileright", "fileleft", "fileup", "filedown", "filefront", "fileback")
 _MESH_DIR_TAGS = frozenset({"mesh", "skin", "hfield"})  # MuJoCo resolves these via meshdir
 
@@ -343,7 +348,7 @@ def _name(model: mujoco.MjModel, kind: mujoco.mjtObj, index: int) -> str:
 
 
 def _root_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
-    """The robot must be free to fall: a free root joint, no welds, no gravity compensation."""
+    """The robot must be free to fall: a free, unresisted root joint, no welds, no gravcomp."""
     problems: list[str] = []
     root = _lookup(model, mujoco.mjtObj.mjOBJ_JOINT, ROOT_JOINT)
     if (
@@ -352,6 +357,8 @@ def _root_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
         or model.jnt_bodyid[root] != chassis
     ):
         problems.append(f"free joint '{ROOT_JOINT}' on body '{CHASSIS}' is missing")
+    else:
+        problems += _root_resistance_problems(model, root)
     if model.neq > 0:
         problems.append(f"equality constraints are not allowed, found {model.neq}")
     for body in range(1, model.nbody):
@@ -361,12 +368,60 @@ def _root_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
     return problems
 
 
-def _tire_problems(model: mujoco.MjModel, name: str, body: int) -> list[str]:
-    tires = _collision_geoms(model, body)
+def _largest(*values: npt.ArrayLike) -> float:
+    return max(float(np.max(np.abs(np.asarray(v, dtype=np.float64)))) for v in values)
+
+
+def _root_resistance_problems(model: mujoco.MjModel, root: int) -> list[str]:
+    """Nothing may resist the root's motion: damping (linear or polynomial), armature or friction
+    loss on its six DOFs, or a spring (linear or polynomial) on the joint, would hold the robot up
+    or slow its fall."""
+    dofs = slice(int(model.jnt_dofadr[root]), int(model.jnt_dofadr[root]) + 6)
+    resistance = {
+        "damping": _largest(model.dof_damping[dofs], model.dof_dampingpoly[dofs]),
+        "armature": _largest(model.dof_armature[dofs]),
+        "frictionloss": _largest(model.dof_frictionloss[dofs]),
+        "stiffness": _largest(model.jnt_stiffness[root], model.jnt_stiffnesspoly[root]),
+    }
+    return [
+        f"free joint '{ROOT_JOINT}' has {prop} {value:g}; it must be 0 so the robot falls freely"
+        for prop, value in resistance.items()
+        if value != 0.0
+    ]
+
+
+def _geom_axis(model: mujoco.MjModel, geom: int) -> npt.NDArray[np.float64]:
+    """The geom's local z axis in its body's frame (a cylinder's or capsule's axis)."""
+    rot = np.zeros(9)
+    mujoco.mju_quat2Mat(rot, model.geom_quat[geom])
+    axis: npt.NDArray[np.float64] = rot.reshape(3, 3)[:, 2]
+    return axis
+
+
+def _parallel(a: npt.ArrayLike, b: npt.ArrayLike) -> bool:
+    """Whether two (nonzero) axes are parallel or antiparallel, within ``AXIS_TOLERANCE``."""
+    u = np.asarray(a, dtype=np.float64)
+    v = np.asarray(b, dtype=np.float64)
+    cos = float(np.dot(u, v)) / (float(np.linalg.norm(u)) * float(np.linalg.norm(v)))
+    return abs(abs(cos) - 1.0) <= AXIS_TOLERANCE
+
+
+def _tire_problems(model: mujoco.MjModel, name: str, joint: int) -> list[str]:
+    """The wheel body's one collision geom is a tire that rolls on radius ``size[0]``."""
+    tires = _collision_geoms(model, int(model.jnt_bodyid[joint]))
     if len(tires) != 1:
         return [f"wheel body of '{name}' must have exactly one collision geom, got {len(tires)}"]
-    if int(model.geom_type[tires[0]]) not in TIRE_TYPES:
+    kind = int(model.geom_type[tires[0]])
+    if kind not in TIRE_TYPES:
         return [f"tire of '{name}' must be a cylinder, sphere or capsule"]
+    # jnt_axis and the geom frame are both in the wheel body's frame.
+    if kind in AXIAL_TIRE_TYPES and not _parallel(
+        _geom_axis(model, tires[0]), model.jnt_axis[joint]
+    ):
+        return [
+            f"tire of '{name}' must lie along its hinge axis: a cylinder or capsule tire rolls "
+            "on radius size[0] only when its z axis is the hinge axis"
+        ]
     return []
 
 
@@ -411,7 +466,7 @@ def _wheel_problems(model: mujoco.MjModel, chassis: int, name: str, side: float)
     if abs(abs(float(axis[1])) - 1.0) > 1e-6:
         got = axis.round(3).tolist()
         problems.append(f"joint '{name}' axis must be +-y in the chassis frame, got {got}")
-    return problems + _tire_problems(model, name, body)
+    return problems + _tire_problems(model, name, jid)
 
 
 def _interface_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
@@ -445,6 +500,34 @@ def _world_problems(model: mujoco.MjModel, chassis: int, scene_geoms: frozenset[
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom) or ""
         if model.geom_bodyid[geom] == 0 and name not in scene_geoms:
             problems.append(f"world geom '{name or f'#{geom}'}' is not allowed; the scene owns it")
+    for site in range(model.nsite):
+        if model.site_bodyid[site] == 0:
+            name = _name(model, mujoco.mjtObj.mjOBJ_SITE, site)
+            problems.append(f"world site '{name}' is not allowed; it could anchor the robot")
+    return problems + _tendon_problems(model, chassis)
+
+
+def _wrap_body(model: mujoco.MjModel, wrap: int) -> int | None:
+    """The body a tendon wrap object is fixed to, or ``None`` (joints, pulleys)."""
+    kind = int(model.wrap_type[wrap])
+    obj = int(model.wrap_objid[wrap])
+    if kind == mujoco.mjtWrap.mjWRAP_SITE:
+        return int(model.site_bodyid[obj])
+    if kind in (mujoco.mjtWrap.mjWRAP_SPHERE, mujoco.mjtWrap.mjWRAP_CYLINDER):
+        return int(model.geom_bodyid[obj])
+    return None  # a joint (fixed tendon) belongs to a robot body; a pulley has no object
+
+
+def _tendon_problems(model: mujoco.MjModel, chassis: int) -> list[str]:
+    """A tendon may only connect parts of the robot: one routed through a world site or geom
+    is a tether that can hold the robot up."""
+    problems: list[str] = []
+    for tendon in range(model.ntendon):
+        start = int(model.tendon_adr[tendon])
+        bodies = (_wrap_body(model, w) for w in range(start, start + int(model.tendon_num[tendon])))
+        if any(b is not None and model.body_rootid[b] != chassis for b in bodies):
+            name = _name(model, mujoco.mjtObj.mjOBJ_TENDON, tendon)
+            problems.append(f"tendon '{name}' is tied to the world; tendons must stay on the robot")
     return problems
 
 

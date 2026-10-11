@@ -46,7 +46,7 @@ A robot MJCF (body tree only; no `<option>`, floor or lights) must contain, by e
 | body + free joint | `chassis`, free joint `root` | root of the robot, a child of the world |
 | hinge joints | `left_wheel`, `right_wheel` | unlimited, axes ±y in the chassis frame |
 | wheel bodies | the bodies of the two hinges | direct children of `chassis`; left at y > 0, right at y < 0 |
-| tire geoms | the one collision geom of each wheel body | cylinder, sphere or capsule; size[0] is the wheel radius, equal on both tires |
+| tire geoms | the one collision geom of each wheel body | cylinder, sphere or capsule; size[0] is the wheel radius, equal on both tires; a cylinder's or capsule's axis (its local z) lies along the hinge axis |
 | site | `imu` | child of `chassis`; where the IMU board is mounted |
 | site | `push_point` | child of `chassis`; where pushes are applied |
 
@@ -70,10 +70,16 @@ export (Phase 8), evolved bodies (Phase 10) and generated robots (Phase 12) all 
 Besides the table above it checks that the robot can fall freely and that nothing else shares the
 world:
 
-- `root` is a free joint on `chassis`; no equality constraints; no body uses `gravcomp`;
+- `root` is a free joint on `chassis` with zero `damping`, `armature` and `frictionloss` on all
+  six of its DOFs and zero `stiffness`, polynomial terms included (`damping`/`stiffness` given as
+  several coefficients); no equality constraints; no body uses `gravcomp`;
 - both motors and both IMU sensors exist and there are exactly 2 actuators;
-- every body other than the world belongs to the robot (its root body is `chassis`), and the world
-  body has no geoms except the scene's own (`floor`).
+- every body other than the world belongs to the robot (its root body is `chassis`), the world
+  body has no geoms except the scene's own (`floor`) and no sites, and no tendon passes through
+  a site or wraps a geom that is not on the robot (a tendon tied to the world is a tether).
+- each cylinder or capsule tire's axis is parallel (or antiparallel) to its wheel's hinge axis,
+  within 1e-6 in |cos| of the angle between them, so `size[0]` is the radius it rolls on; a
+  sphere needs no check.
 
 `wheel_radius_m` is the tire geom's radius (both tires must agree to within 1e-9 m) and
 `track_width_m` the distance between the wheel bodies along y; both reach the controller through
@@ -210,7 +216,13 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   This holds even for exceptions whose own machinery is hostile (a failing `__str__`, a metaclass
   `__name__` that raises, a `str` subclass as message or name, a raising `__class__`): the error
   detail is `Type: message` built from the real class name and exact `str` copies, and the
-  harness never asks the controller object or its exceptions what class they are.
+  harness never asks the controller object or its exceptions what class they are. That
+  includes the loader: a loaded `make_controller`'s result must have `reset` and `act`, found by
+  the same static lookup a runtime protocol check uses (instance dict, then class) but without
+  reading `__class__`; otherwise the episode ends with `exception` at step 0. A returned action
+  *is* inspected with `isinstance` (§7), so an action whose `__class__` raises is
+  `invalid_action`. Every message, `invalid_action` details included, names a class only by its
+  real name, so no metaclass or `str`-subclass code runs while it is built.
   In-process runs are for trusted code; isolation from hostile code is the runner's job (Phase 3).
 - Submission kinds: a `.py` file, or a directory with `controller.py` plus assets located via
   `Path(__file__).parent` (ONNX policies arrive in Phase 2). A directory may hold at most 50
