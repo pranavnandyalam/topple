@@ -22,6 +22,7 @@ from topple.disturbances import (
     Preset,
     Push,
     Scenario,
+    check_initial_state,
     check_push_schedule,
     make_scenario,
     push_force_world,
@@ -276,16 +277,21 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             scenario = replace(scenario, pushes=pushes)
         if "init_pitch_rate" in opts:
             scenario = replace(scenario, init_pitch_rate_rads=float(opts["init_pitch_rate"]))
-        if not (
-            math.isfinite(scenario.init_pitch_rad) and math.isfinite(scenario.init_pitch_rate_rads)
-        ):
-            raise ValueError("initial pitch and pitch rate must be finite")
+        # Bounded on every path, trusted hooks included, so the record can hold the state (§9).
+        check_initial_state(scenario.init_pitch_rad, scenario.init_pitch_rate_rads)
         check_push_schedule(scenario.pushes, frame_skip=self.frame_skip)
 
         self._scenario = scenario
         self._sensors_ideal = PRESETS[scenario.preset].sensors == "ideal"
         self._apply_model_overrides(scenario)
         self._set_initial_state(scenario.init_pitch_rad, scenario.init_pitch_rate_rads)
+        if not self._finite_state():
+            # Never start a record with a non-finite row; the episode in progress is over.
+            self._done, self._scenario = True, None
+            raise ValueError(
+                "MuJoCo cannot compute this initial state: its accelerations or sensor readings "
+                "are not finite after mj_forward"
+            )
         self._init_episode_state(scenario)
         obs = self._observe(last_action=(0.0, 0.0))
         if self.record:
@@ -574,6 +580,11 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             return True
         return not (np.isfinite(d.qpos).all() and np.isfinite(d.qvel).all())
 
+    def _finite_state(self) -> bool:
+        """Whether MuJoCo's state and everything derived from it are finite (after a reset)."""
+        d = self.data
+        return all(np.isfinite(a).all() for a in (d.qpos, d.qvel, d.qacc, d.sensordata))
+
     def _roll_back(self) -> None:
         """Undo the substep that blew up, so observations, rewards and records stay finite."""
         d = self.data
@@ -666,12 +677,14 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         return float(math.hypot(xy[0] - self._xy0[0], xy[1] - self._xy0[1]))
 
     def _reward(self, u: tuple[float, ...]) -> tuple[float, dict[str, float]]:
+        # Each cost saturates before it is squared, so no state can overflow it (the values are
+        # the same as squaring first and then capping at 1).
         w, true = self.reward_config, self._true_state()
         costs = {
-            "tilt": min((true.pitch / 0.2) ** 2, 1.0),
-            "rate": min((true.pitch_rate / 3.0) ** 2, 1.0),
-            "drift": min(self._drift() ** 2, 1.0),
-            "yaw_rate": min((true.yaw_rate / 2.0) ** 2, 1.0),
+            "tilt": min(abs(true.pitch) / 0.2, 1.0) ** 2,
+            "rate": min(abs(true.pitch_rate) / 3.0, 1.0) ** 2,
+            "drift": min(self._drift(), 1.0) ** 2,
+            "yaw_rate": min(abs(true.yaw_rate) / 2.0, 1.0) ** 2,
             "effort": (u[0] ** 2 + u[1] ** 2) / 2.0,
             "smooth": min(
                 ((u[0] - self._prev_u[0]) ** 2 + (u[1] - self._prev_u[1]) ** 2) / 2.0 / 0.25, 1.0

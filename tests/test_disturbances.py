@@ -11,6 +11,8 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from topple.disturbances import (
+    MAX_INIT_PITCH_RAD,
+    MAX_INIT_PITCH_RATE_RADS,
     MAX_PUSH_FORCE_N,
     MAX_PUSH_IMPULSE_NS,
     MAX_PUSHES,
@@ -19,6 +21,7 @@ from topple.disturbances import (
     Push,
     PushConfig,
     Scenario,
+    check_initial_state,
     check_push_schedule,
     make_scenario,
     push_force_world,
@@ -279,6 +282,11 @@ BAD_SCENARIOS: dict[str, Callable[[dict[str, Any]], None]] = {
     "pitch str": setter("init_pitch_rad", value="0.1"),
     "pitch bool": setter("init_pitch_rad", value=True),
     "pitch rate nan": setter("init_pitch_rate_rads", value=math.nan),
+    "pitch beyond pi": setter("init_pitch_rad", value=3.2),
+    "pitch beyond -pi": setter("init_pitch_rad", value=-3.2),
+    "pitch rate above the bound": setter("init_pitch_rate_rads", value=100.5),
+    "pitch rate below the bound": setter("init_pitch_rate_rads", value=-1e100),
+    "pitch rate the reward squares to overflow": setter("init_pitch_rate_rads", value=1e200),
     "preset unhashable": setter("preset", value=["standard"]),
     "seed unhashable": setter("seed", value=[1]),
     "unknown top-level key": setter("surprise", value=1),
@@ -564,6 +572,42 @@ def test_validate_scenario_rejects_a_non_finite_initial_state(field: str) -> Non
     bad = replace(scenario(1), **{field: math.inf})
     with pytest.raises(ValueError, match="scenario"):
         validate_scenario(bad)
+
+
+@pytest.mark.parametrize(
+    ("field", "limit"),
+    [("init_pitch_rad", MAX_INIT_PITCH_RAD), ("init_pitch_rate_rads", MAX_INIT_PITCH_RATE_RADS)],
+)
+def test_the_initial_state_bounds_are_inclusive(field: str, limit: float) -> None:
+    """§9: |init_pitch_rad| <= pi (every orientation about the axle) and |init_pitch_rate_rads|
+    <= 100 rad/s (11x the gyro's full scale), with or without a clock; just beyond is refused."""
+    assert math.pi == MAX_INIT_PITCH_RAD
+    assert MAX_INIT_PITCH_RATE_RADS == 100.0
+    for value in (limit, -limit):
+        data = {**scenario(5).to_dict(), field: value}
+        assert getattr(Scenario.from_dict(data), field) == value
+        assert getattr(Scenario.from_dict(data, clock=CLOCK), field) == value
+        beyond = {**data, field: math.nextafter(value, math.copysign(math.inf, value))}
+        with pytest.raises(ValueError, match=rf"invalid scenario: {field} = .* is outside"):
+            Scenario.from_dict(beyond)
+        with pytest.raises(ValueError, match="is outside"):
+            validate_scenario(replace(scenario(5), **{field: beyond[field]}))
+
+
+@pytest.mark.parametrize(
+    ("pitch", "rate", "message"),
+    [
+        (math.nan, 0.0, "finite"),
+        (0.0, -math.inf, "finite"),
+        (3.5, 0.0, r"init_pitch_rad = 3\.5 is outside"),
+        (0.0, 1e200, r"init_pitch_rate_rads = 1e\+200 is outside"),
+    ],
+)
+def test_check_initial_state(pitch: float, rate: float, message: str) -> None:
+    """The check every reset path makes, trusted test hooks included (§9)."""
+    with pytest.raises(ValueError, match=message):
+        check_initial_state(pitch, rate)
+    check_initial_state(-math.pi, MAX_INIT_PITCH_RATE_RADS)
 
 
 # ------------------------------------------------------------------ portable draws (contract §9)

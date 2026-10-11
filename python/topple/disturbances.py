@@ -34,6 +34,10 @@ MAX_LATERAL_RATIO = 1.0
 # The force cap held for a standard 0.1 s pulse: 11x the strongest calibrated push (0.45 N·s).
 MAX_PUSH_IMPULSE_NS = 5.0
 MAX_EXACT_INT = 2**53  # a scenario's integers must be exact in a JSON double, like seeds
+# The initial state, on every reset path (contract §9): any orientation about the axle, and up
+# to 11x the gyro's full scale, far beyond any state a controller could recover from.
+MAX_INIT_PITCH_RAD = math.pi
+MAX_INIT_PITCH_RATE_RADS = 100.0
 
 
 @dataclass(frozen=True)
@@ -351,14 +355,23 @@ def _check_sensors(sensors: SensorOffsets) -> None:
         _check_range(f"sensors.gyro_bias_rads[{i}]", bias, -MAX_GYRO_BIAS_RADS, MAX_GYRO_BIAS_RADS)
 
 
+def check_initial_state(pitch_rad: float, pitch_rate_rads: float) -> None:
+    """Raise ``ValueError`` unless the initial pitch and pitch rate are finite and inside their
+    bounds (contract §9). Every reset path checks this, the trusted test hooks included: from
+    about 1e84 rad/s MuJoCo cannot compute the reset (its accelerations come out NaN), and the
+    float32 records cannot hold a rate beyond 3.4e38 rad/s."""
+    if not (math.isfinite(pitch_rad) and math.isfinite(pitch_rate_rads)):
+        raise ValueError("initial pitch and pitch rate must be finite")
+    _check_range("init_pitch_rad", pitch_rad, -MAX_INIT_PITCH_RAD, MAX_INIT_PITCH_RAD)
+    limit = MAX_INIT_PITCH_RATE_RADS
+    _check_range("init_pitch_rate_rads", pitch_rate_rads, -limit, limit)
+
+
 def validate_scenario(scenario: Scenario, *, clock: EpisodeClock | None = None) -> None:
     """Raise ``ValueError`` unless ``scenario`` is inside the contract's sane bounds (§9);
     with the env's ``clock``, its pushes must also fit the episode."""
-    if not (
-        math.isfinite(scenario.init_pitch_rad) and math.isfinite(scenario.init_pitch_rate_rads)
-    ):
-        raise ValueError(f"{_INVALID}initial pitch and pitch rate must be finite")
     try:
+        check_initial_state(scenario.init_pitch_rad, scenario.init_pitch_rate_rads)
         _check_pushes(scenario.pushes, clock)
         _check_model(scenario.model)
         _check_sensors(scenario.sensors)

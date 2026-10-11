@@ -353,7 +353,9 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
 - `Scenario.from_dict(data, *, clock=None)` validates what it reads, and `ValueError` rejects
   anything else: exact key sets of string keys (every key `to_dict` writes, none optional:
   `init_pitch_rate_rads` included); numbers that fit a float (a huge JSON integer does not) and
-  are finite; integer `start_step`/`n_substeps`, exact in a float (|n| ≤ 2**53);
+  are finite; `|init_pitch_rad| ≤ π` and `|init_pitch_rate_rads| ≤ 100` rad/s (11× the gyro's
+  full scale, far beyond any state a controller can recover from); integer
+  `start_step`/`n_substeps`, exact in a float (|n| ≤ 2**53);
   pushes sorted by `start_step` with no two at the same step, `start_step ≥ 0`,
   `n_substeps ≥ 1`, `0 ≤ magnitude_n ≤ 50` N, `forward_sign = ±1`, `|lateral_ratio| ≤ 1`; scales
   in [0.5, 2] (frictionloss [0, 3]), `|com_x_offset_m| ≤ 0.02`, `0 ≤ actuator_delay_s ≤ 0.010`,
@@ -366,10 +368,14 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   (`start_step · frame_skip + n_substeps ≤ next.start_step · frame_skip`). Every preset draws
   well inside these bounds; `reset(options={"scenario": dict})` goes through this check with the
   env's clock. In-process `Scenario` objects and the `pushes`/`init_pitch_rad`/`init_pitch_rate`
-  reset options are trusted test hooks and skip the bounds (robustness tests use absurd pushes),
-  but every reset path still requires finite initial pitch and rate and pushes sorted by
-  `start_step` that never overlap: the env runs one push at a time, so two at one step, or one
-  starting while another is active, would silently cut one short.
+  reset options are trusted test hooks and skip the other bounds (robustness tests use absurd
+  pushes), but every reset path still requires the initial pitch and rate inside theirs and
+  pushes sorted by `start_step` that never overlap. From about 1e84 rad/s MuJoCo cannot compute
+  the reset (its accelerations come out NaN), and the float32 records cannot hold a rate beyond
+  3.4e38 rad/s; the env runs one push at a time, so two at one step, or one starting while
+  another is active, would silently cut one short. A reset whose state MuJoCo still cannot
+  compute (a non-finite acceleration or sensor reading after its `mj_forward`) raises
+  `ValueError` and ends the episode in progress, so no record starts with a non-finite row.
 - `reset(seed=None)` (training): `episode_seed = int(self.np_random.integers(2**53))`, returned in
   `info["episode_seed"]` so any training failure can be replayed.
 

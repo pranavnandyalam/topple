@@ -558,6 +558,76 @@ def test_reset_rejects_non_finite_initial_state(option: str, field: str, value: 
         env.reset(options={"scenario": bad})
 
 
+@pytest.mark.parametrize(("field", "value"), [("init_pitch_rad", 3.5), ("init_pitch_rate", 1e200)])
+@pytest.mark.parametrize("via", ["option", "scenario object", "scenario dict"])
+def test_every_reset_path_bounds_the_initial_state(field: str, value: float, via: str) -> None:
+    """§9: |pitch| <= pi and |pitch rate| <= 100 rad/s on every reset path, the trusted test
+    hooks included. From a scenario dict, 1e200 rad/s once made step() raise OverflowError and
+    1e100 recorded a NaN accelerometer row; through the ideal sensors, 1e40 rad/s overflowed the
+    float32 records."""
+    env = BalanceEnv("clean", record=True)
+    key = "init_pitch_rate_rads" if field == "init_pitch_rate" else field
+    scenario = replace(scenario_for(3, "clean"), **{key: value})
+    options: dict[str, Any] = {
+        "option": {field: value},
+        "scenario object": {"scenario": scenario},
+        "scenario dict": {"scenario": scenario.to_dict()},
+    }[via]
+    with pytest.raises(ValueError, match=rf"{key} = .* is outside"):
+        env.reset(seed=3, options=options)
+    with pytest.raises(RuntimeError, match="reset"):
+        env.step((0.0, 0.0))
+
+
+@pytest.mark.parametrize("preset", ["ideal", "clean"])
+@pytest.mark.parametrize("rate", [100.0, -100.0])
+def test_the_fastest_initial_rate_leaves_a_finite_record(preset: str, rate: float) -> None:
+    env = BalanceEnv(preset, record=True)
+    ep = rollout(env, idle, seed=3, options={"init_pitch_rate": rate})
+    assert ep.terminated
+    traj = env.trajectory()
+    for name in ("qpos", "qvel", "obs", "gyro", "accel"):
+        assert np.isfinite(getattr(traj, name)).all(), name
+
+
+def test_a_reset_mujoco_cannot_compute_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """§9: a non-finite acceleration or sensor reading after the reset's mj_forward (what a state
+    beyond MuJoCo's range leaves) raises ValueError and ends the episode in progress, so no
+    record starts with a non-finite row."""
+    env = BalanceEnv("clean", record=True)
+    rollout(env, seed=0, max_steps=5)
+    real_forward = mujoco.mj_forward
+
+    def poisoned(m: mujoco.MjModel, d: mujoco.MjData) -> None:
+        real_forward(m, d)
+        d.sensordata[env.binding.accel_adr] = math.nan
+
+    monkeypatch.setattr(mujoco, "mj_forward", poisoned)
+    with pytest.raises(ValueError, match="not finite"):
+        env.reset(seed=1)
+    with pytest.raises(RuntimeError, match="reset"):
+        env.step((0.0, 0.0))
+    with pytest.raises(RuntimeError, match="run an episode first"):
+        env.trajectory()
+    monkeypatch.undo()
+    fresh = BalanceEnv("clean", record=True)
+    assert_same_episode(rollout(env, seed=1, max_steps=20), rollout(fresh, seed=1, max_steps=20))
+
+
+def test_the_reward_saturates_before_squaring() -> None:
+    """A state written into MjData by hand (as a fuzzer might) at 1e200 rad/s ends the step with
+    sim_unstable, and its reward must not overflow: (rate / 3)**2 once raised OverflowError out of
+    step(). Every cost now saturates before it is squared."""
+    env = BalanceEnv("clean")
+    env.reset(seed=0)
+    env.data.qvel[env.binding.root_dofadr + 4] = 1e200
+    _, reward, terminated, _, info = env.step((0.0, 0.0))
+    assert terminated
+    assert info["termination_reason"] == "sim_unstable"
+    assert info["reward_terms"]["rate"] == 1.0
+    assert 0.0 <= reward <= 1.0
+
+
 @pytest.mark.parametrize(
     "pushes",
     [
