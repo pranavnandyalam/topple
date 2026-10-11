@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 
 from topple.rng import Stream, stream_rng, validate_seed
 
-_MAX_PUSHES = 3  # the PUSHES stream always draws this many candidates (fixed consumption)
+MAX_PUSHES = 3  # the PUSHES stream always draws this many candidates (fixed consumption)
 MAX_PUSH_FORCE_N = 50.0  # contract §10: no push is ever stronger than this
 MAX_ACTUATOR_DELAY_S = 0.010  # what the native delay buffer (robot.DELAY_HISTORY) is sized for
 
@@ -49,8 +49,8 @@ class PushConfig(_Frozen):
 
     @model_validator(mode="after")
     def _check(self) -> PushConfig:
-        if not self.count or min(self.count) < 0 or max(self.count) > _MAX_PUSHES:
-            raise ValueError(f"count values must be in [0, {_MAX_PUSHES}]")
+        if not self.count or min(self.count) < 0 or max(self.count) > MAX_PUSHES:
+            raise ValueError(f"count values must be in [0, {MAX_PUSHES}]")
         if self.impulse_ns[1] / self.duration_s > self.max_force_n:
             raise ValueError("impulse_ns / duration_s exceeds max_force_n")
         span = self.latest_s - self.earliest_s - (max(self.count) - 1) * self.min_spacing_s
@@ -318,8 +318,25 @@ def validate_scenario(scenario: Scenario, *, max_steps: int | None = None) -> No
         raise ValueError(f"{_INVALID}{exc}") from exc
 
 
+def _affine(low: float, high: float, u: float) -> float:
+    """``low + (high - low)·u``, rounded after each operation (Python floats never fuse)."""
+    return low + (high - low) * u
+
+
+def _uniforms(rng: Any, low: float, high: float, n: int) -> list[float]:
+    """``n`` draws from U[low, high), identical on every platform (contract §9).
+
+    Each consumes exactly one raw double ``u`` from ``rng.random`` (exact: a 53-bit integer times
+    2**-53), as ``Generator.uniform`` does, but the affine map runs in Python, where every operation
+    is rounded. numpy evaluates it in C, where a compiler may contract it into one fused
+    multiply-add: numpy's macOS arm64 and Linux x86_64 builds disagree in the last bit. Scenarios
+    are trusted data compared bit for bit (contract §16), so they must not.
+    """
+    return [_affine(low, high, u) for u in rng.random(n).tolist()]
+
+
 def _uniform(rng: Any, bounds: tuple[float, float]) -> float:
-    return float(rng.uniform(bounds[0], bounds[1]))
+    return _uniforms(rng, bounds[0], bounds[1], 1)[0]
 
 
 def _draw_pushes(
@@ -327,15 +344,16 @@ def _draw_pushes(
 ) -> tuple[Push, ...]:
     rng = stream_rng(seed, Stream.PUSHES)
     count = int(cfg.count[int(rng.integers(len(cfg.count)))])
-    # Fixed consumption: always draw _MAX_PUSHES candidates, keep the first `count`.
-    offsets = rng.uniform(0.0, 1.0, size=_MAX_PUSHES)
-    impulses = rng.uniform(cfg.impulse_ns[0], cfg.impulse_ns[1], size=_MAX_PUSHES)
-    signs = rng.integers(0, 2, size=_MAX_PUSHES)
-    laterals = rng.uniform(-cfg.lateral_fraction_max, cfg.lateral_fraction_max, size=_MAX_PUSHES)
+    # Fixed consumption: always draw MAX_PUSHES candidates, keep the first `count`.
+    offsets = _uniforms(rng, 0.0, 1.0, MAX_PUSHES)
+    impulses = _uniforms(rng, cfg.impulse_ns[0], cfg.impulse_ns[1], MAX_PUSHES)
+    signs = rng.integers(0, 2, size=MAX_PUSHES)
+    lateral = cfg.lateral_fraction_max
+    laterals = _uniforms(rng, -lateral, lateral, MAX_PUSHES)
     if count == 0:
         return ()
     span = cfg.latest_s - cfg.earliest_s - (count - 1) * cfg.min_spacing_s
-    starts = sorted(float(o) * span for o in offsets[:count])
+    starts = sorted(o * span for o in offsets[:count])
     n_substeps = round(cfg.duration_s / timestep)
     pushes = []
     for i in range(count):
@@ -344,9 +362,9 @@ def _draw_pushes(
             Push(
                 start_step=round(start_s / control_dt),
                 n_substeps=n_substeps,
-                magnitude_n=float(impulses[i]) / (n_substeps * timestep),
+                magnitude_n=impulses[i] / (n_substeps * timestep),
                 forward_sign=1.0 if signs[i] else -1.0,
-                lateral_ratio=float(laterals[i]),
+                lateral_ratio=laterals[i],
             )
         )
     return tuple(pushes)

@@ -12,6 +12,7 @@ from hypothesis import strategies as st
 
 from topple.disturbances import (
     MAX_PUSH_FORCE_N,
+    MAX_PUSHES,
     PRESETS,
     PushConfig,
     Scenario,
@@ -19,6 +20,7 @@ from topple.disturbances import (
     push_force_world,
     validate_scenario,
 )
+from topple.rng import Stream, stream_rng
 
 TIMESTEP = 0.002
 CONTROL_DT = 0.01
@@ -361,3 +363,61 @@ def test_validate_scenario_rejects_a_non_finite_initial_state(field: str) -> Non
     bad = replace(scenario(1), **{field: math.inf})
     with pytest.raises(ValueError, match="scenario"):
         validate_scenario(bad)
+
+
+# ------------------------------------------------------------------ portable draws (contract §9)
+
+
+def _affine(low: float, high: float, u: float) -> float:
+    """``low + (high - low)·u`` in plain IEEE double arithmetic: no fused multiply-add."""
+    return low + (high - low) * u
+
+
+@settings(max_examples=200, deadline=None)
+@given(seed=st.integers(0, 2**53 - 1))
+def test_scenario_draws_are_portable_affine_maps_of_raw_doubles(seed: int) -> None:
+    """Every uniform draw is ``low + (high - low)·u`` with ``u`` the stream's next raw double,
+    rounded step by step. numpy's ``Generator.uniform`` computes the same expression in C, where a
+    compiler may contract it into one fused multiply-add, and its macOS arm64 and Linux x86_64
+    builds disagree in the last bit; scenarios are trusted data compared bit for bit, so they must
+    not (contract §9)."""
+    preset = PRESETS["standard"]
+    r = preset.randomization
+    got = scenario(seed, "standard")
+
+    init = stream_rng(seed, Stream.INIT).random()
+    assert got.init_pitch_rad == _affine(*r.init_pitch_rad, init)
+
+    u = iter(stream_rng(seed, Stream.MODEL).random(11).tolist())
+    common = _affine(*r.motor_gain_common, next(u))
+    assert got.model.chassis_mass_scale == _affine(*r.mass_scale, next(u))
+    assert got.model.com_x_offset_m == _affine(*r.com_x_offset_m, next(u))
+    assert got.model.wheel_friction_scale == _affine(*r.wheel_friction_scale, next(u))
+    assert got.model.motor_gain == (
+        common * _affine(*r.motor_gain_per_wheel, next(u)),
+        common * _affine(*r.motor_gain_per_wheel, next(u)),
+    )
+    assert got.model.frictionloss_scale == _affine(*r.frictionloss_scale, next(u))
+    assert got.sensors.imu_pitch_offset_rad == _affine(*r.imu_pitch_offset_rad, next(u))
+    assert got.sensors.gyro_bias_rads == tuple(
+        _affine(*r.gyro_bias_rads, next(u)) for _ in range(3)
+    )
+
+
+@settings(max_examples=200, deadline=None)
+@given(seed=st.integers(0, 2**53 - 1))
+def test_push_draws_are_portable_affine_maps_of_raw_doubles(seed: int) -> None:
+    cfg = PRESETS["standard"].pushes
+    assert cfg is not None
+    pushes = scenario(seed, "standard").pushes
+    rng = stream_rng(seed, Stream.PUSHES)
+    rng.integers(len(cfg.count))
+    n = MAX_PUSHES
+    rng.random(n)  # start offsets: sorted and scaled, checked by the schedule tests
+    impulses = [_affine(*cfg.impulse_ns, u) for u in rng.random(n).tolist()]
+    rng.integers(0, 2, size=n)
+    lim = cfg.lateral_fraction_max
+    laterals = [_affine(-lim, lim, u) for u in rng.random(n).tolist()]
+    for i, push in enumerate(pushes):
+        assert push.magnitude_n == impulses[i] / (push.n_substeps * TIMESTEP)
+        assert push.lateral_ratio == laterals[i]

@@ -1340,13 +1340,13 @@ def test_env_uses_the_challenge_object_it_is_given(tmp_path: Path) -> None:
     root = tmp_path / "balance-v1"
     shutil.copytree(challenge_dir("balance-v1"), root)
     yaml_path = root / "challenge.yaml"
-    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.3", "e_ref_j: 99.0"))
+    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.0", "e_ref_j: 99.0"))
     bundle = load_challenge_dir(root)
     env = BalanceEnv("clean", challenge=bundle)
     assert env.challenge is bundle
     assert env.challenge.config.score.e_ref_j == 99.0
     assert env.robot_xml == root / "robot" / "balancer.xml"
-    assert BalanceEnv("clean", challenge="balance-v1").challenge.config.score.e_ref_j == 13.3
+    assert BalanceEnv("clean", challenge="balance-v1").challenge.config.score.e_ref_j == 13.0
 
 
 def test_reset_validates_scenario_dicts() -> None:

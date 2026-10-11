@@ -260,11 +260,17 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   reset reading (§5). Blocks are drawn even when a noise std is 0 or the preset is `ideal`, so
   presets never change stream consumption.
 - `make_scenario(episode_seed, preset) -> Scenario` materializes everything that is not per-step
-  noise as JSON-serializable data: initial pitch/pitch_rate, push list, model overrides, actuator
-  delay, IMU biases and mounting offset. Trajectories embed it. Model overrides are
-  **multiplicative scales** relative to the robot params (`chassis_mass_scale`,
-  `wheel_friction_scale`, `motor_gain` per wheel, `frictionloss_scale`) plus `com_x_offset_m`
-  (added to the chassis COM x) and `actuator_delay_s`, not absolute values.
+  noise as JSON-serializable data, identically on every platform: initial pitch/pitch_rate, push
+  list, model overrides, actuator delay, IMU biases and mounting offset. Trajectories embed it.
+  Model overrides are **multiplicative scales** relative to the robot params
+  (`chassis_mass_scale`, `wheel_friction_scale`, `motor_gain` per wheel, `frictionloss_scale`)
+  plus `com_x_offset_m` (added to the chassis COM x) and `actuator_delay_s`, not absolute values.
+- Scenario draws are portable bit for bit. A draw from U[low, high) takes one raw double `u` from
+  the stream (`Generator.random()`: the top 53 bits of a 64-bit output times 2⁻⁵³, the same raw
+  draw `Generator.uniform` consumes) and computes `low + (high − low)·u` in IEEE double arithmetic
+  with each operation rounded (never a fused multiply-add: numpy's C `uniform` computes the same
+  expression, but its macOS arm64 and Linux x86_64 builds disagree in the last bit). Choices (push
+  count, push sign, actuator delay) use `Generator.integers`, which only uses raw bits.
 - `Scenario.from_dict` validates what it reads, and `ValueError` rejects anything else: exact key
   sets of string keys; numbers that fit a float (a huge JSON integer does not) and are finite;
   integer `start_step`/`n_substeps`; pushes sorted by `start_step` with no two at the same step,
@@ -301,8 +307,8 @@ the application point (`push_point`'s position) and the Jacobian `mj_applyFT` us
 MuJoCo's data of the previous substep, so like contacts and the IMU (§5, §11) they lag the state
 by one substep (2 ms);
 impulse magnitude **[calibrated]** U(0.25, 0.45) N·s (target: the reference LQR survives ≥ 80%
-and the shipped PID 40–90% of `standard` episodes; measured on seeds 0..199: LQR 86.5%, PID
-65.0%, both 100% on `clean`). Force is capped at 50 N.
+and the shipped PID 40–90% of `standard` episodes; measured on seeds 0..199 (darwin-arm64):
+LQR 86.5%, PID 64.5%, both 100% on `clean`). Force is capped at 50 N.
 
 ## 11. Termination, stability
 
@@ -353,7 +359,8 @@ Episode score (0–100):
 
 `success = survived ∧ drift_m < 1 ∧ energy_j ≤ 5·E_ref`. `E_ref` **[calibrated]** = 2× the PID
 baseline's median energy on `balance-v1/standard` (seeds 0..199, all episodes), rounded to 0.1 J,
-frozen: 2 × 6.64 J → `E_ref = 13.3` J.
+frozen: 2 × 6.49 J → `E_ref = 13.0` J (measured on darwin-arm64; physics, unlike scenarios, is
+only reproducible per platform, §14).
 
 Protocol score = `fsum` of episode scores in seed order / N, and success rate = successes / N,
 where N is the number of episodes the protocol expects: a missing or errored episode counts as 0.

@@ -1,12 +1,12 @@
 {
  "clean": {
   "0": {
-   "init_pitch_rad": 0.0068205825401075355,
+   "init_pitch_rad": 0.006820582540107534,
    "init_pitch_rate_rads": 0.0,
    "model": {
     "actuator_delay_s": 0.002,
     "chassis_mass_scale": 0.9773712554658008,
-    "com_x_offset_m": -0.0005882536606505809,
+    "com_x_offset_m": -0.0005882536606505806,
     "frictionloss_scale": 1.3483727960344514,
     "motor_gain": [
      0.8836198382772341,
@@ -20,10 +20,10 @@
    "sensors": {
     "gyro_bias_rads": [
      -0.0026877164430001545,
-     0.0011910112564795905,
+     0.0011910112564795898,
      0.0054467755165786905
     ],
-    "imu_pitch_offset_rad": -0.0014166757216844677
+    "imu_pitch_offset_rad": -0.0014166757216844683
    }
   },
   "1000": {
@@ -32,7 +32,7 @@
    "model": {
     "actuator_delay_s": 0.0,
     "chassis_mass_scale": 0.9638805033041801,
-    "com_x_offset_m": 0.00039302317721328863,
+    "com_x_offset_m": 0.00039302317721328847,
     "frictionloss_scale": 1.1205638827640376,
     "motor_gain": [
      0.9733494095126839,
@@ -46,19 +46,19 @@
    "sensors": {
     "gyro_bias_rads": [
      -0.008033731894494753,
-     5.230023311305177e-05,
+     5.230023311305135e-05,
      -0.0070434153154218665
     ],
     "imu_pitch_offset_rad": -0.012583680461353875
    }
   },
   "9007199254740991": {
-   "init_pitch_rad": 0.030932437037703934,
+   "init_pitch_rad": 0.03093243703770393,
    "init_pitch_rate_rads": 0.0,
    "model": {
     "actuator_delay_s": 0.0,
     "chassis_mass_scale": 1.0321006366330243,
-    "com_x_offset_m": 0.00033289337576016264,
+    "com_x_offset_m": 0.0003328933757601625,
     "frictionloss_scale": 1.3817695915934514,
     "motor_gain": [
      1.118514281065635,
@@ -71,8 +71,8 @@
    "seed": 9007199254740991,
    "sensors": {
     "gyro_bias_rads": [
-     0.0041461134385711905,
-     0.009691105550645115,
+     0.004146113438571191,
+     0.009691105550645113,
      -0.00904171036501564
     ],
     "imu_pitch_offset_rad": -0.015730592019925053
@@ -81,7 +81,7 @@
  },
  "ideal": {
   "0": {
-   "init_pitch_rad": 0.0068205825401075355,
+   "init_pitch_rad": 0.006820582540107534,
    "init_pitch_rate_rads": 0.0,
    "model": {
     "actuator_delay_s": 0.0,
@@ -133,7 +133,7 @@
    }
   },
   "9007199254740991": {
-   "init_pitch_rad": 0.030932437037703934,
+   "init_pitch_rad": 0.03093243703770393,
    "init_pitch_rate_rads": 0.0,
    "model": {
     "actuator_delay_s": 0.0,
@@ -161,12 +161,12 @@
  },
  "standard": {
   "0": {
-   "init_pitch_rad": 0.0068205825401075355,
+   "init_pitch_rad": 0.006820582540107534,
    "init_pitch_rate_rads": 0.0,
    "model": {
     "actuator_delay_s": 0.002,
     "chassis_mass_scale": 0.9773712554658008,
-    "com_x_offset_m": -0.0005882536606505809,
+    "com_x_offset_m": -0.0005882536606505806,
     "frictionloss_scale": 1.3483727960344514,
     "motor_gain": [
      0.8836198382772341,
@@ -178,14 +178,14 @@
    "pushes": [
     {
      "forward_sign": -1.0,
-     "lateral_ratio": 0.2072750492289314,
+     "lateral_ratio": 0.20727504922893142,
      "magnitude_n": 3.0406467560788224,
      "n_substeps": 50,
      "start_step": 476
     },
     {
      "forward_sign": 1.0,
-     "lateral_ratio": 0.1837146692543035,
+     "lateral_ratio": 0.18371466925430346,
      "magnitude_n": 3.716322825132702,
      "n_substeps": 50,
      "start_step": 814
@@ -195,10 +195,10 @@
    "sensors": {
     "gyro_bias_rads": [
      -0.0026877164430001545,
-     0.0011910112564795905,
+     0.0011910112564795898,
      0.0054467755165786905
     ],
-    "imu_pitch_offset_rad": -0.0014166757216844677
+    "imu_pitch_offset_rad": -0.0014166757216844683
    }
   },
   "1000": {
@@ -207,7 +207,7 @@
    "model": {
     "actuator_delay_s": 0.0,
     "chassis_mass_scale": 0.9638805033041801,
-    "com_x_offset_m": 0.00039302317721328863,
+    "com_x_offset_m": 0.00039302317721328847,
     "frictionloss_scale": 1.1205638827640376,
     "motor_gain": [
      0.9733494095126839,
@@ -229,19 +229,19 @@
    "sensors": {
     "gyro_bias_rads": [
      -0.008033731894494753,
-     5.230023311305177e-05,
+     5.230023311305135e-05,
      -0.0070434153154218665
     ],
     "imu_pitch_offset_rad": -0.012583680461353875
    }
   },
   "9007199254740991": {
-   "init_pitch_rad": 0.030932437037703934,
+   "init_pitch_rad": 0.03093243703770393,
    "init_pitch_rate_rads": 0.0,
    "model": {
     "actuator_delay_s": 0.0,
     "chassis_mass_scale": 1.0321006366330243,
-    "com_x_offset_m": 0.00033289337576016264,
+    "com_x_offset_m": 0.0003328933757601625,
     "frictionloss_scale": 1.3817695915934514,
     "motor_gain": [
      1.118514281065635,
@@ -253,7 +253,7 @@
    "pushes": [
     {
      "forward_sign": -1.0,
-     "lateral_ratio": 0.18922351154039732,
+     "lateral_ratio": 0.18922351154039735,
      "magnitude_n": 3.3288207026649794,
      "n_substeps": 50,
      "start_step": 101
@@ -269,8 +269,8 @@
    "seed": 9007199254740991,
    "sensors": {
     "gyro_bias_rads": [
-     0.0041461134385711905,
-     0.009691105550645115,
+     0.004146113438571191,
+     0.009691105550645113,
      -0.00904171036501564
     ],
     "imu_pitch_offset_rad": -0.015730592019925053

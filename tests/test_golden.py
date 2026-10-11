@@ -7,9 +7,12 @@ fixed controller's score on a fixed seed. Do not "update the numbers": either th
 or it needs a new challenge major version (or an ``ENV_ALGO_VERSION`` bump before publication) and
 a deliberate, reviewed re-pin.
 
-Seeds, scenario draws and hashes are platform-independent (numpy's ``SeedSequence``/PCG64 and
-sha256 are portable). Episode scores come from MuJoCo physics, which is only deterministic per
-platform (PLAN.md, trust model), so they are pinned per platform tag.
+Seeds, scenario draws and hashes are platform-independent (numpy's ``SeedSequence``/PCG64 raw
+bits and sha256 are portable, and scenario draws apply their affine maps in Python; see
+``topple.disturbances._uniforms``), so the scenario file must pass unchanged on every platform.
+Episode scores come from MuJoCo physics, which is only deterministic per platform (PLAN.md, trust
+model), so they are pinned per platform tag; a platform without pins skips and prints what it
+measured.
 """
 
 from __future__ import annotations
@@ -46,16 +49,16 @@ CONTROLLER_SEEDS: dict[tuple[int, int], int] = {
     (0, 2**127 + 12345): 8639439415161446,
 }
 
-BUNDLE_HASH = "4354497568c748625a73b4ddb5187fdafef1761f7f9b30636445d25493d52a70"
+BUNDLE_HASH = "a3b4846310a1a174f288da82d9532fe986a4b0428ab5069d1620e1237f5017a9"
 # Public protocols: the public seed list, salt 0 (contract §13).
 PROTOCOL_HASHES = {
-    "ideal": "47b2ca3748c223986f4c797c415dc8932b5b442de9a3857b8d2994f126a5baeb",
-    "clean": "2fbc269d89f28f106d8d528e21d9f4db85d11def73ae7068fc83338055cf9ddc",
-    "standard": "0cd7059ce234a0c1006036bb25f634f02824793969560ea7db0876eb1c7fe180",
+    "ideal": "6ad4cf45adfef1b813229aec1e0b899c99f8e4d7953031e70ac8bf27093cb368",
+    "clean": "f30f5119c86f1ef9196d4f4de92cf1b4fc5d7d4204458c8ffe2e5efb6f4194d6",
+    "standard": "a32517413cace0c73c300cddbaf6e480ab78a01ee68b717b67adf0fe7f59c5f4",
 }
 PRIVATE_SEEDS = (1, 2, 3)
 PRIVATE_SALT = 2**127 + 5
-PRIVATE_PROTOCOL_HASH = "ac2ad94f5d48205c3dc8adf51cda625bf2ede0b0dfd910cb69f1a3f96c8cb13f"
+PRIVATE_PROTOCOL_HASH = "aa7220e396ffefda76e044adbeb8f496d7bb12a45fa36c81e55e069b180c749e"
 
 # platform tag -> controller -> seed -> (score, success, time_upright_s), balance-v1/standard.
 EpisodeKey = tuple[float, bool, float]
@@ -63,14 +66,14 @@ EPISODE_SEEDS = (1000, 1001, 1002)
 EPISODES: dict[str, dict[str, dict[int, EpisodeKey]]] = {
     "darwin-arm64": {
         "pid": {
-            1000: (92.10566273263854, True, 10.0),
-            1001: (77.502526600719, True, 10.0),
-            1002: (46.38905576742924, False, 5.97),
+            1000: (92.05698981231265, True, 10.0),
+            1001: (77.65148730115902, True, 10.0),
+            1002: (46.296017498043454, False, 5.97),
         },
         "lqr": {
-            1000: (91.5961524979523, True, 10.0),
-            1001: (84.50243299777665, True, 10.0),
-            1002: (83.80593189848054, True, 10.0),
+            1000: (91.5273532508896, True, 10.0),
+            1001: (84.07772455809453, True, 10.0),
+            1002: (83.74288560556353, True, 10.0),
         },
     },
 }

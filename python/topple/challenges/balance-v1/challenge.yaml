@@ -9,12 +9,13 @@ scene: scene.xml
 control_dt: 0.01
 episode_seconds: 10.0
 presets: [ideal, clean, standard]
-# Calibrated on 200 held-out seeds (0..199), pushes U(0.25, 0.45) N.s. Re-measured 2026-10-11
-# after the phase 1 fixes (current-state fall check, reset-relative energy seed; ENV_ALGO_VERSION 1):
+# Calibrated on 200 held-out seeds (0..199), pushes U(0.25, 0.45) N.s. Re-measured 2026-10-11 on
+# darwin-arm64 after the phase 1 fixes (current-state fall check, reset-relative energy seed,
+# platform-independent scenario draws; ENV_ALGO_VERSION 1):
 #   clean:    LQR 100.0%, PID 100.0% survival
-#   standard: LQR  86.5% (median 3.28 J), shipped PID 65.0% (median 6.64 J)
+#   standard: LQR  86.5% (median 3.26 J), shipped PID 64.5% (median 6.49 J)
 score:
-  e_ref_j: 13.3         # 2x the shipped PID's median battery energy on standard
+  e_ref_j: 13.0         # 2x the shipped PID's median battery energy on standard (2 x 6.49 J)
   tilt_ref_rad: 0.2
   drift_ref_m: 1.0
   success_max_drift_m: 1.0

@@ -1,4 +1,5 @@
 import json
+import re
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -13,6 +14,14 @@ from topple.cli import app
 
 runner = CliRunner()
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Typer's rich help forces styled output under CI (GITHUB_ACTIONS, FORCE_COLOR): drop the escapes
+# before matching text that rich renders, such as usage errors.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    """``text`` without ANSI style escapes."""
+    return _ANSI.sub("", text)
 
 
 def test_version_command() -> None:
@@ -218,7 +227,7 @@ def test_run_rejects_seeds_outside_the_contract(tmp_path: Path, seed: str) -> No
     )
     assert result.exit_code == 2
     assert "Traceback" not in result.output
-    assert "--seed" in result.output
+    assert "--seed" in plain(result.output)
     assert not (tmp_path / "results.json").exists()
 
 

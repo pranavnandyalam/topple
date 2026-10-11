@@ -198,4 +198,4 @@ def test_rms_tilt_is_a_root_mean_square() -> None:
 
 def test_score_config_is_frozen_constant() -> None:
     assert ScoreConfig.model_fields.keys() >= {"e_ref_j", "tilt_ref_rad", "drift_ref_m"}
-    assert CFG.e_ref_j == pytest.approx(13.3)
+    assert CFG.e_ref_j == pytest.approx(13.0)
