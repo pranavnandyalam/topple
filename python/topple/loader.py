@@ -213,6 +213,13 @@ def _factory_of(module: ModuleType, entry: Path) -> object:
         ) from exc
 
 
+def submission_id(path: Path) -> str:
+    """The controller id of the submission at ``path``: the resolved directory's name or the
+    resolved file's stem, so ``.``, ``bot/..`` and ``bot`` all name the directory itself."""
+    resolved = path.resolve()
+    return resolved.stem if resolved.is_file() else resolved.name
+
+
 def load_submission(path: Path) -> Submission:
     _utf8_name(path.name)  # the name becomes the controller id
     if path.is_symlink():
@@ -230,9 +237,7 @@ def load_submission(path: Path) -> Submission:
     except LoadError:
         sys.modules.pop(_module_name(sha), None)  # a failed load leaves nothing behind
         raise
-    return Submission(
-        id=path.stem if path.is_file() else path.name, sha256=sha, entry=entry, factory=factory
-    )
+    return Submission(id=submission_id(path), sha256=sha, entry=entry, factory=factory)
 
 
 def _factory(module: ModuleType, entry: Path) -> Callable[[TaskSpec], Controller[Any]]:

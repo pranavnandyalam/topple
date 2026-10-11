@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -87,6 +88,37 @@ def test_rescore_reproduces_evaluate_exactly(honest_runs: dict[str, Honest], nam
     assert again.model_dump(exclude={"versions", "platform"}) == run.results.model_dump(
         exclude={"versions", "platform"}
     )
+
+
+class RecordingUploads(Mapping[int, Trajectory]):
+    """A mapping that records every lookup, as a lazily loading caller would see them."""
+
+    def __init__(self, uploads: dict[int, Trajectory]) -> None:
+        self.uploads = uploads
+        self.lookups: list[int] = []
+
+    def __getitem__(self, index: int) -> Trajectory:
+        self.lookups.append(index)
+        return self.uploads[index]
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.uploads)
+
+    def __len__(self) -> int:
+        return len(self.uploads)
+
+
+def test_rescore_looks_each_upload_up_once_in_order(honest_runs: dict[str, Honest]) -> None:
+    """The order a lazily loading mapping relies on to hold one upload at a time (§16)."""
+    run = honest_runs["pid"]
+    uploads = RecordingUploads({2: run.uploads[2], 0: run.uploads[0]})
+    again = rescore(run.protocol, uploads, INFO, "inprocess")
+    assert uploads.lookups == [0, 1, 2]  # index 1 is looked up and found missing
+    assert again.episodes is not None
+    assert run.results.episodes is not None
+    assert again.episodes[1].error is not None
+    assert again.episodes[1].error.code == "missing"
+    assert [again.episodes[i] for i in (0, 2)] == [run.results.episodes[i] for i in (0, 2)]
 
 
 def test_the_random_controller_really_clips(honest_runs: dict[str, Honest]) -> None:
@@ -543,6 +575,24 @@ def test_every_env_meta_field_must_equal_the_replay(
     assert not verdict.ok
     assert verdict.code == "not_reproducible"
     assert verdict.reason == f"meta.{field} differs from the replay"
+    assert (verdict.result.score, verdict.result.success) == (0.0, False)
+
+
+@pytest.mark.parametrize("retype", [float, bool], ids=["float", "bool"])
+@pytest.mark.parametrize("index", [0, 1])
+def test_episode_index_must_be_an_int_not_an_equal_float_or_bool(
+    honest_runs: dict[str, Honest], index: int, retype: Any
+) -> None:
+    """§16 step 1: ``meta.episode_index == index`` as an integer (``1.0 == True == 1``)."""
+    run = honest_runs["pid"]
+    forged = retype(index)
+    assert forged == index
+    verdict = verify_episode(
+        with_meta(run.uploads[index], episode_index=forged), run.protocol, index
+    )
+    assert not verdict.ok
+    assert verdict.code == "not_reproducible"
+    assert verdict.reason == f"meta.episode_index is {forged!r}, expected {index}"
     assert (verdict.result.score, verdict.result.success) == (0.0, False)
 
 

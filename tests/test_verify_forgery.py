@@ -19,13 +19,14 @@ from hypothesis import strategies as st
 from topple.contract import controller_obs
 from topple.disturbances import Scenario
 from topple.envs.balance import BalanceEnv
-from topple.evaluate import EPILOGUE_S, ControllerFactory, wants_epilogue
+from topple.evaluate import EPILOGUE_S, ControllerFactory, EvalProtocol, wants_epilogue
 from topple.traj import Trajectory, load_npz
 from topple.verify import (
     EpisodeVerdict,
     protocol_max_steps,
     rescore,
     verify_episode,
+    verify_with_seed,
 )
 from verify_support import (
     INFO,
@@ -77,8 +78,10 @@ def falls(tmp_path_factory: pytest.TempPathFactory) -> Honest:
 
 
 def rejected(
-    verdict: EpisodeVerdict, code: str = "not_reproducible", *, mentions: str = ""
+    verdict: EpisodeVerdict, code: str = "not_reproducible", *, steps: int, mentions: str = ""
 ) -> None:
+    """A failed verdict (§16 step 6): score 0, no success, and the error
+    ``{code: <verify code>, step: T, detail: reason}`` with T the upload's row count."""
     assert not verdict.ok
     assert verdict.code == code
     assert mentions in verdict.reason
@@ -87,7 +90,22 @@ def rejected(
     assert not result.success
     assert result.error is not None
     assert result.error.code == code
+    assert result.error.step == steps
     assert result.error.detail == verdict.reason[: len(result.error.detail)]
+
+
+def rejects(
+    upload: Trajectory,
+    protocol: EvalProtocol,
+    index: int,
+    code: str = "not_reproducible",
+    *,
+    mentions: str = "",
+) -> EpisodeVerdict:
+    """Verify ``upload`` as episode ``index``; it must be rejected with ``code`` at step T."""
+    verdict = verify_episode(upload, protocol, index)
+    rejected(verdict, code, steps=upload.steps, mentions=mentions)
+    return verdict
 
 
 def survived(run: Honest) -> int:
@@ -105,7 +123,7 @@ def fell(run: Honest) -> int:
 def test_a_clean_run_relabelled_standard(clean: Honest) -> None:
     standard_protocol = public("standard", 2)
     upload = with_meta(clean.uploads[0], preset="standard")
-    rejected(verify_episode(upload, standard_protocol, 0), mentions="scenario")
+    rejects(upload, standard_protocol, 0, mentions="scenario")
 
 
 def test_a_clean_run_relabelled_with_the_standard_scenario(clean: Honest) -> None:
@@ -114,12 +132,12 @@ def test_a_clean_run_relabelled_with_the_standard_scenario(clean: Honest) -> Non
     env = BalanceEnv("standard")
     env.reset(seed=standard_protocol.seeds[0])
     upload = with_meta(clean.uploads[0], preset="standard", scenario=env.scenario.to_dict())
-    rejected(verify_episode(upload, standard_protocol, 0))
+    rejects(upload, standard_protocol, 0)
 
 
 def test_a_wrong_challenge_is_rejected(clean: Honest) -> None:
     upload = with_meta(clean.uploads[0], challenge="balance-v2")
-    rejected(verify_episode(upload, clean.protocol, 0), mentions="challenge")
+    rejects(upload, clean.protocol, 0, mentions="challenge")
 
 
 # ------------------------------------------------------------------ B: shortened episode length
@@ -130,13 +148,17 @@ def test_b_max_steps_shrunk_to_the_fall_with_a_timeout(standard: Honest) -> None
     upload = standard.uploads[i]
     steps = upload.steps
     forged = with_meta(upload, max_steps=steps, termination={"step": steps, "reason": "timeout"})
-    rejected(
-        verify_episode(forged, standard.protocol, i),
+    rejects(
+        forged,
+        standard.protocol,
+        i,
         mentions="meta.termination differs from the replay",
     )
     alone = with_meta(upload, max_steps=steps)
-    rejected(
-        verify_episode(alone, standard.protocol, i),
+    rejects(
+        alone,
+        standard.protocol,
+        i,
         mentions="meta.max_steps differs from the replay",
     )
 
@@ -164,7 +186,7 @@ def test_c_error_deleted_from_an_errored_run(errored: Honest) -> None:
         with_meta(upload, error=None),
         replace(upload, meta={k: v for k, v in upload.meta.items() if k != "error"}),
     ):
-        rejected(verify_episode(forged, errored.protocol, 0), "incomplete")
+        rejects(forged, errored.protocol, 0, "incomplete")
 
 
 def test_c_error_replaced_by_a_survival_claim(errored: Honest) -> None:
@@ -175,7 +197,7 @@ def test_c_error_replaced_by_a_survival_claim(errored: Honest) -> None:
         max_steps=upload.steps,
         termination={"step": upload.steps, "reason": "timeout"},
     )
-    rejected(verify_episode(forged, errored.protocol, 0), "incomplete")
+    rejects(forged, errored.protocol, 0, "incomplete")
 
 
 @pytest.mark.parametrize(
@@ -194,7 +216,7 @@ def test_c_error_replaced_by_a_survival_claim(errored: Honest) -> None:
     ids=repr,
 )
 def test_c_malformed_error_claims_are_rejected(errored: Honest, error: Any) -> None:
-    rejected(verify_episode(with_meta(errored.uploads[0], error=error), errored.protocol, 0))
+    rejects(with_meta(errored.uploads[0], error=error), errored.protocol, 0)
 
 
 # ------------------------------------------------------------------ D: seed swap
@@ -203,7 +225,7 @@ def test_c_malformed_error_claims_are_rejected(errored: Honest, error: Any) -> N
 def test_d_index_holds_another_index_trajectory(standard: Honest) -> None:
     swapped = {0: standard.uploads[1], 1: standard.uploads[0], 2: standard.uploads[2]}
     for i in (0, 1):
-        rejected(verify_episode(swapped[i], standard.protocol, i), mentions="episode_index")
+        rejects(swapped[i], standard.protocol, i, mentions="episode_index")
     again = rescore(standard.protocol, swapped, INFO, "inprocess")
     assert again.episodes is not None
     assert standard.results.episodes is not None
@@ -216,7 +238,7 @@ def test_d_index_holds_another_index_trajectory(standard: Honest) -> None:
 
 def test_d_seed_swap_with_a_relabelled_index(standard: Honest) -> None:
     forged = with_meta(standard.uploads[1], episode_index=0)
-    rejected(verify_episode(forged, standard.protocol, 0), mentions="scenario")
+    rejects(forged, standard.protocol, 0, mentions="scenario")
 
 
 # ------------------------------------------------------------------ E: zeroed records
@@ -226,16 +248,16 @@ def test_e_push_force_zeroed(standard: Honest) -> None:
     upload = standard.uploads[0]
     assert np.abs(upload.push_force).sum() > 0
     forged = replace(upload, push_force=np.zeros_like(upload.push_force))
-    rejected(verify_episode(forged, standard.protocol, 0), mentions="push_force")
+    rejects(forged, standard.protocol, 0, mentions="push_force")
 
 
 def test_e_epilogue_zeroed_or_dropped(falls: Honest) -> None:
     upload = falls.uploads[0]
     assert upload.epilogue_qpos.shape[0] == round(EPILOGUE_S / 0.01)
     zeroed = replace(upload, epilogue_qpos=np.zeros_like(upload.epilogue_qpos))
-    rejected(verify_episode(zeroed, falls.protocol, 0), mentions="epilogue_qpos")
+    rejects(zeroed, falls.protocol, 0, mentions="epilogue_qpos")
     dropped = replace(upload, epilogue_qpos=upload.epilogue_qpos[:0])
-    rejected(verify_episode(dropped, falls.protocol, 0), mentions="epilogue_qpos")
+    rejects(dropped, falls.protocol, 0, mentions="epilogue_qpos")
 
 
 def test_e_epilogue_added_to_a_survivor(standard: Honest) -> None:
@@ -243,7 +265,7 @@ def test_e_epilogue_added_to_a_survivor(standard: Honest) -> None:
     i = survived(standard)
     upload = standard.uploads[i]
     forged = replace(upload, epilogue_qpos=np.repeat(upload.qpos[-1:], 100, axis=0))
-    rejected(verify_episode(forged, standard.protocol, i), mentions="epilogue_qpos")
+    rejects(forged, standard.protocol, i, mentions="epilogue_qpos")
 
 
 # ------------------------------------------------------------------ F: scenario edited
@@ -252,8 +274,10 @@ def test_e_epilogue_added_to_a_survivor(standard: Honest) -> None:
 def test_f_pushes_removed_from_the_scenario(standard: Honest) -> None:
     upload = standard.uploads[0]
     scenario = {**upload.meta["scenario"], "pushes": []}
-    rejected(
-        verify_episode(with_meta(upload, scenario=scenario), standard.protocol, 0),
+    rejects(
+        with_meta(upload, scenario=scenario),
+        standard.protocol,
+        0,
         mentions="scenario",
     )
 
@@ -283,7 +307,7 @@ def test_f_a_genuine_push_free_run_with_the_seed_kept(tmp_path: Path, standard: 
     forged.save_npz(path)
     loaded = load_npz(path, max_steps=protocol_max_steps(standard.protocol))
     assert loaded.meta["scenario"]["seed"] == standard.uploads[0].meta["scenario"]["seed"]
-    rejected(verify_episode(loaded, standard.protocol, 0), mentions="scenario")
+    rejects(loaded, standard.protocol, 0, mentions="scenario")
 
 
 # ------------------------------------------------------------------ G: dropped episodes
@@ -355,12 +379,12 @@ def test_i_truncated_without_error_is_incomplete(clean: Honest) -> None:
     upload = clean.uploads[0]
     short = truncated(upload, 500)
     forged = with_meta(short, termination={"step": 500, "reason": "timeout"})
-    rejected(verify_episode(forged, clean.protocol, 0), "incomplete")
-    rejected(verify_episode(short, clean.protocol, 0), "incomplete")
+    rejects(forged, clean.protocol, 0, "incomplete")
+    rejects(short, clean.protocol, 0, "incomplete")
 
 
 def test_i_zero_rows_without_error_is_incomplete(clean: Honest) -> None:
-    rejected(verify_episode(truncated(clean.uploads[0], 0), clean.protocol, 0), "incomplete")
+    rejects(truncated(clean.uploads[0], 0), clean.protocol, 0, "incomplete")
 
 
 def test_i_rows_beyond_the_end_of_the_replay(falls: Honest) -> None:
@@ -378,15 +402,30 @@ def test_i_rows_beyond_the_end_of_the_replay(falls: Honest) -> None:
         accel=np.vstack([upload.accel, upload.accel[-1:]]),
         push_force=np.vstack([upload.push_force, upload.push_force[-1:]]),
     )
-    verdict = verify_episode(longer, falls.protocol, 0)
-    rejected(verdict, mentions=f"the replay ended after {upload.steps} steps")
+    verdict = rejects(
+        longer, falls.protocol, 0, mentions=f"the replay ended after {upload.steps} steps"
+    )
+    # The error's step is the upload's T, not the length of the replay (§16, step 6).
+    assert verdict.result.error is not None
+    assert verdict.result.error.step == longer.steps == upload.steps + 1
     # The replay did run: the failed verdict carries it and its metrics (§16, step 6).
     assert verdict.replay is not None
     assert verdict.replay.steps == upload.steps
     np.testing.assert_array_equal(verdict.replay.qpos, upload.qpos)
     np.testing.assert_array_equal(verdict.replay.action, upload.action)
+    np.testing.assert_array_equal(verdict.replay.ctrl, upload.ctrl)
     assert falls.results.episodes is not None
     assert verdict.result.metrics == falls.results.episodes[0].metrics
+    # "the replay up to that step (no error, no epilogue)": the honest upload fell and carries
+    # its epilogue, the early-ended replay does not.
+    assert upload.epilogue_qpos.shape[0] == round(EPILOGUE_S / 0.01)
+    assert verdict.replay.epilogue_qpos.shape == (0, upload.qpos.shape[1])
+    assert verdict.replay.meta["error"] is None
+    assert verdict.replay.meta["episode_index"] == 0
+    labelled = verify_with_seed(longer, falls.protocol, falls.protocol.seeds[0], index=3)
+    rejected(labelled, steps=longer.steps, mentions="the replay ended after")
+    assert labelled.replay is not None
+    assert labelled.replay.meta["episode_index"] == 3
 
 
 # ------------------------------------------------------------------ J: robot hash
@@ -394,7 +433,7 @@ def test_i_rows_beyond_the_end_of_the_replay(falls: Honest) -> None:
 
 def test_j_robot_hash_mismatch(clean: Honest) -> None:
     forged = with_meta(clean.uploads[0], robot_hash="0" * 64)
-    rejected(verify_episode(forged, clean.protocol, 0), mentions="robot_hash")
+    rejects(forged, clean.protocol, 0, mentions="robot_hash")
 
 
 # ------------------------------------------------------------------ K: commands
@@ -405,8 +444,10 @@ def test_k_ctrl_outside_the_unit_range(clean: Honest) -> None:
     ctrl, action = upload.ctrl.copy(), upload.action.copy()
     ctrl[10] = action[10] = (1.5, 0.0)
     forged = replace(upload, ctrl=ctrl, action=action)
-    rejected(
-        verify_episode(forged, clean.protocol, 0),
+    rejects(
+        forged,
+        clean.protocol,
+        0,
         mentions="ctrl row 10 is not a finite command in [-1, 1]",
     )
 
@@ -416,19 +457,17 @@ def test_k_non_finite_commands(clean: Honest, value: float) -> None:
     upload = clean.uploads[0]
     ctrl = upload.ctrl.copy()
     ctrl[3, 1] = value
-    rejected(verify_episode(replace(upload, ctrl=ctrl), clean.protocol, 0), mentions="ctrl row 3")
+    rejects(replace(upload, ctrl=ctrl), clean.protocol, 0, mentions="ctrl row 3")
     action = upload.action.copy()
     action[4, 0] = value
-    rejected(
-        verify_episode(replace(upload, action=action), clean.protocol, 0), mentions="action row 4"
-    )
+    rejects(replace(upload, action=action), clean.protocol, 0, mentions="action row 4")
 
 
 def test_k_ctrl_is_not_the_clipped_action(clean: Honest) -> None:
     upload = clean.uploads[0]
     action = upload.action.copy()
     action[20, 0] = -0.5 if upload.ctrl[20, 0] > 0 else 0.5
-    rejected(verify_episode(replace(upload, action=action), clean.protocol, 0), mentions="row 20")
+    rejects(replace(upload, action=action), clean.protocol, 0, mentions="row 20")
 
 
 # ------------------------------------------------------------------ L: too many steps
@@ -453,8 +492,10 @@ def test_l_more_than_max_steps_is_rejected_at_load(tmp_path: Path, clean: Honest
     longer.save_npz(path)
     with pytest.raises(ValueError, match="more than 1000"):
         load_npz(path, max_steps=protocol_max_steps(clean.protocol))
-    rejected(
-        verify_episode(longer, clean.protocol, 0),
+    rejects(
+        longer,
+        clean.protocol,
+        0,
         mentions="the trajectory has 1001 steps, more than the protocol's 1000",
     )
 
@@ -474,9 +515,9 @@ def test_m_one_ulp_anywhere_is_caught(falls: Honest, name: str) -> None:
         flat[k] += 1
     forged = replace(upload, **{name: arr})
     if name == "ctrl":  # the clipped-action check sees a ctrl edit first
-        rejected(verify_episode(forged, falls.protocol, 0), mentions="ctrl row")
+        rejects(forged, falls.protocol, 0, mentions="ctrl row")
     else:
-        rejected(verify_episode(forged, falls.protocol, 0), mentions=name)
+        rejects(forged, falls.protocol, 0, mentions=name)
 
 
 def test_m_negative_zero_is_a_different_bit_pattern(falls: Honest) -> None:
@@ -484,9 +525,7 @@ def test_m_negative_zero_is_a_different_bit_pattern(falls: Honest) -> None:
     push = upload.push_force.copy()
     assert push[0, 0] == 0.0
     push[0, 0] = -0.0
-    rejected(
-        verify_episode(replace(upload, push_force=push), falls.protocol, 0), mentions="push_force"
-    )
+    rejects(replace(upload, push_force=push), falls.protocol, 0, mentions="push_force")
 
 
 @settings(
@@ -522,3 +561,5 @@ def test_any_single_bit_flip_fails_or_changes_nothing(
     else:
         assert not verdict.ok
         assert verdict.result.score == 0.0
+        assert verdict.result.error is not None
+        assert verdict.result.error.step == forged.steps

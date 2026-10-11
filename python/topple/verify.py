@@ -173,6 +173,9 @@ def rescore(
     raises ``ValueError``; a missing one scores 0 with error ``missing``. The aggregate divides
     by N, and ``complete`` is true only when no episode is missing. ``controller`` and
     ``isolation`` come from the trusted caller; nothing is copied from the uploads.
+
+    Each index is looked up once, in order, and no upload is kept once it is verified, so a
+    mapping that loads on lookup holds one upload in memory at a time.
     """
     n = len(protocol.seeds)
     bad = [k for k in uploads if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k < n]

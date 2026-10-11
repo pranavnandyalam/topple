@@ -415,10 +415,14 @@ unreadable, truncated or missing files and corrupted members:
 - each an `.npy` of format 1.0 or 2.0, C order, the exact dtype of the table (no object arrays),
   whose header shape needs exactly the bytes the member holds (a header can never make the
   loader allocate more than the file contains);
+- the size limits, checked on each member's header before any of its data is read (a few KB of
+  compressed zeros can never make the loader allocate more than an honest file needs):
+  `T ≤ max_steps` (every per-step array), `E ≤ max_steps`, at most `MAX_STATE_DIM = 256`
+  columns in `qpos`, `qvel` and `epilogue_qpos` (so nq, nv ≤ 256), and `meta_json` at most
+  `MAX_META_BYTES = 262144` bytes (256 KiB; an honest one is a few KiB);
 - the fixed trailing shapes of the table (`obs` 10; `action`, `ctrl`, `enc_counts` 2; `gyro`,
   `accel`, `push_force` 3), `qpos`/`qvel` with T+1 rows and at least one column, `epilogue_qpos`
   as wide as `qpos`;
-- `T ≤ max_steps`;
 - `meta_json` a UTF-8 JSON object with `"format": "topple.traj/1"` and only finite numbers: no
   `NaN`/`Infinity` tokens and no literal that overflows to infinity, such as `1e400`.
 
@@ -542,7 +546,9 @@ metrics, error), on the same platform and MuJoCo version.
 anything but an index in `[0, N)` raises `ValueError`. A missing index gives an episode with
 error `missing`, score 0 and no metrics. The aggregate is §12's (score = `fsum`/N, success rate
 = successes/N, mean time upright over the episodes with metrics), and `complete` is true only
-when no episode is missing (§15). Private-protocol results are redacted as usual.
+when no episode is missing (§15). Private-protocol results are redacted as usual. `rescore`
+looks each index up once, in index order, and keeps no upload once it is verified, so a mapping
+that loads on lookup holds one upload in memory at a time.
 
 **CLI.** Exit codes: 0 reproduced, 1 verification failed, 2 usage or load error. A crash inside
 the verifier exits 2 with `verification crashed: <Type: message>`, never 1, and never prints a
@@ -552,9 +558,9 @@ traceback.
   [--submission SUB] [--isolation inprocess|subprocess|container]`
   - PATH a **run directory**: every `traj_<index>.npz` in it (1–6 digits) is re-scored with
     `rescore`; the protocol is `--protocol`, else the challenge/preset named by the
-    lowest-numbered file. An index outside the protocol, two files for one index, a file that
-    does not load, or `--index`/`--seed` exit 2. Exit 1 unless every episode reproduced and
-    none is missing.
+    lowest-numbered file. The files are loaded one at a time, as `rescore` reaches them. An
+    index outside the protocol, two files for one index, a file that does not load, or
+    `--index`/`--seed` exit 2. Exit 1 unless every episode reproduced and none is missing.
   - PATH a **file**: by default the protocol comes from `meta.challenge`/`meta.preset` and the
     index from `meta.episode_index`. If that index is outside the protocol or its seed differs
     from `meta.scenario.seed`, the file is verified with `verify_with_seed` on the scenario's
@@ -564,9 +570,16 @@ traceback.
     an unbound one. Both exit 0, so the exit code of a default file binding never proves that
     the file is a given episode of the protocol: a script that needs that passes `--index` (or
     re-scores a run directory), as the trusted path does.
+  - Without `--protocol`, the protocol (challenge and preset) is read from the upload's own
+    labels, so it says only which protocol the uploader chose: a run on the easier `clean`
+    preset, labelled `clean`, verifies OK as `balance-v1/clean`. The printed protocol id is the
+    only sign of it. Trusted callers (Phase 3 publishing, nightly re-evaluation) always pass
+    `--protocol`.
   - `--out` writes the trusted results (§15): for a directory the `rescore` results, for a file
     a one-episode result with `complete: false`. The controller is recorded as
-    `{id: <SUB's name>, sha256: <SUB's submission sha256>}`, computed without importing SUB, or
+    `{id: <SUB's name>, sha256: <SUB's submission sha256>}`, computed without importing SUB (the
+    name is that of the resolved path, a directory's name or a file's stem, exactly the id
+    `topple eval SUB` records, so `.` names the current directory), or
     `{id: "unknown", sha256: <64 zeros>}` without `--submission`. `--submission` is resolved
     before anything is verified: one that cannot be hashed, or whose name is not valid UTF-8,
     exits 2 before any verdict is printed.

@@ -2,6 +2,7 @@ import json
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import mujoco
 import pytest
@@ -341,6 +342,27 @@ def test_verify_a_directory_records_the_submission_hash(eval_dir: Path, tmp_path
     assert trusted["isolation"] == "container"
 
 
+@pytest.mark.parametrize("spelling", [".", "inner/.."])
+def test_verify_records_the_resolved_submission_name(
+    eval_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
+) -> None:
+    """`--submission .` records the directory's own name, as `topple eval .` does (§16)."""
+    from topple.loader import ENTRY_FILE, load_submission, submission_sha256
+
+    bot = tmp_path / "mybot"
+    (bot / "inner").mkdir(parents=True)
+    (bot / ENTRY_FILE).write_text(PID_SUBMISSION)
+    out = tmp_path / "trusted.json"
+    monkeypatch.chdir(bot)
+    result = runner.invoke(
+        app, ["verify", str(eval_dir), "--submission", spelling, "--out", str(out)]
+    )
+    assert result.exit_code == 0, result.output
+    recorded = json.loads(out.read_text())["controller"]
+    assert recorded == {"id": "mybot", "sha256": submission_sha256(bot)}
+    assert recorded["id"] == load_submission(Path(spelling)).id
+
+
 def test_verify_a_directory_with_a_missing_episode(eval_dir: Path, tmp_path: Path) -> None:
     run = _copy_run(eval_dir, tmp_path / "copy")
     (run / "traj_004.npz").unlink()
@@ -364,6 +386,80 @@ def test_verify_a_directory_with_a_forged_episode(eval_dir: Path, tmp_path: Path
     result = runner.invoke(app, ["verify", str(run)])
     assert result.exit_code == 1
     assert "FAIL: 1 of 20 episodes failed verification" in result.output
+
+
+def test_verify_a_directory_holds_one_upload_at_a_time(
+    eval_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Uploads are loaded only as `rescore` reaches them and dropped once verified, so a run
+    directory never costs more memory than its largest single file (§16)."""
+    import gc
+    import weakref
+
+    import topple.traj
+    import topple.verify
+
+    loaded: list[weakref.ref[object]] = []
+    live_at_verify: list[int] = []
+    real_load, real_verify = topple.traj.load_npz, topple.verify._verify
+
+    def load(path: Path, *, max_steps: int) -> object:
+        traj = real_load(path, max_steps=max_steps)
+        loaded.append(weakref.ref(traj))
+        return traj
+
+    def verify(*args: Any, **kwargs: Any) -> Any:
+        gc.collect()
+        live_at_verify.append(sum(ref() is not None for ref in loaded))
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(topple.traj, "load_npz", load)
+    monkeypatch.setattr(topple.verify, "_verify", verify)
+    result = runner.invoke(app, ["verify", str(eval_dir)])
+    assert result.exit_code == 0, result.output
+    assert len(loaded) == 20
+    assert live_at_verify == [1] * 20
+
+
+def _bloated_file(path: Path) -> None:
+    """The review's bloat: T = 0, but state members 2,000,000 wide, deflated to a few KB."""
+    import io
+    import zipfile
+
+    import numpy as np
+
+    from topple.traj import FORMAT
+
+    width = 2_000_000
+    arrays: dict[str, Any] = {
+        "qpos": np.zeros((1, width)),
+        "qvel": np.zeros((1, width)),
+        "epilogue_qpos": np.zeros((1, width)),
+        "obs": np.zeros((0, 10), np.float32),
+        "action": np.zeros((0, 2)),
+        "ctrl": np.zeros((0, 2)),
+        "enc_counts": np.zeros((0, 2), np.int32),
+        "gyro": np.zeros((0, 3), np.float32),
+        "accel": np.zeros((0, 3), np.float32),
+        "push_force": np.zeros((0, 3)),
+        "meta_json": np.frombuffer(json.dumps({"format": FORMAT}).encode(), np.uint8),
+    }
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, arr in arrays.items():
+            buf = io.BytesIO()
+            np.lib.format.write_array(buf, arr)
+            zf.writestr(f"{name}.npy", buf.getvalue())
+
+
+def test_verify_a_directory_with_a_bloated_file_exits_2(eval_dir: Path, tmp_path: Path) -> None:
+    """A file whose state widths are beyond the format's limits does not load (§14)."""
+    run = _copy_run(eval_dir, tmp_path / "copy")
+    _bloated_file(run / "traj_005.npz")
+    assert (run / "traj_005.npz").stat().st_size < 200_000
+    result = runner.invoke(app, ["verify", str(run)])
+    assert result.exit_code == 2, result.output
+    assert "traj_005.npz: qpos must have at most 256 columns" in result.output
+    assert "Traceback" not in result.output
 
 
 @pytest.mark.parametrize(
@@ -730,6 +826,11 @@ def test_score_never_prints_a_private_seed(tmp_path: Path, monkeypatch: pytest.M
 
     monkeypatch.setattr(cli, "_protocol", private)
     result = runner.invoke(app, ["score", str(out / "traj_000.npz"), "--index", "0"])
+    assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
+    # A real, reproduced private score is printed without its seed.
+    assert payload["ok"] is True
+    assert payload["code"] is None
+    assert payload["score"] > 0
     assert payload["bound"] is True
     assert payload["seed"] is None

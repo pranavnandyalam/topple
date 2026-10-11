@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -334,17 +335,19 @@ def _controller(name: str, sha256: str) -> ControllerInfo:
 
 
 def _controller_info(submission: Path | None) -> ControllerInfo:
-    """The submission's hash (computed, never imported), or the ``unknown`` placeholder."""
-    from topple.loader import LoadError, submission_sha256
+    """The submission's hash (computed, never imported) and its id as ``topple eval`` records it,
+    or the ``unknown`` placeholder."""
+    from topple.loader import LoadError, submission_id, submission_sha256
     from topple.results import ControllerInfo
 
     if submission is None:
         return ControllerInfo(id=UNKNOWN_CONTROLLER_ID, sha256=UNKNOWN_SHA256)
     try:
-        sha = submission_sha256(submission)
-    except (LoadError, OSError, ValueError) as exc:
+        sha = submission_sha256(submission)  # refuses a symlink before anything is resolved
+        name = submission_id(submission)
+    except (LoadError, OSError, ValueError, RuntimeError) as exc:
         _fail(f"cannot hash {submission}: {exc}")
-    return _controller(submission.stem if submission.is_file() else submission.name, sha)
+    return _controller(name, sha)
 
 
 def _traj_files(directory: Path) -> dict[int, Path]:
@@ -363,10 +366,42 @@ def _traj_files(directory: Path) -> dict[int, Path]:
     return dict(sorted(files.items()))
 
 
+class _UploadLoadError(Exception):
+    """A run directory's file did not load while ``rescore`` was reading it."""
+
+
+class _UploadFiles(Mapping[int, "Trajectory"]):
+    """The uploads of a run directory, by index, each loaded only when it is looked up.
+
+    ``rescore`` looks each index up once, in order, and keeps only the verdict's result, so one
+    upload at a time is in memory however many files the directory holds. Nothing is cached.
+    """
+
+    def __init__(self, files: dict[int, Path], max_steps: int) -> None:
+        self._files = files
+        self._max_steps = max_steps
+
+    def __getitem__(self, index: int) -> Trajectory:
+        from topple.traj import load_npz
+
+        path = self._files[index]  # KeyError: no file for this index (``missing``)
+        try:
+            return load_npz(path, max_steps=self._max_steps)
+        except ValueError as exc:
+            raise _UploadLoadError(str(exc)) from exc
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self._files)
+
+    def __len__(self) -> int:
+        return len(self._files)
+
+
 def _verify_directory(
     directory: Path, protocol_id: str | None, controller: ControllerInfo, isolation: Isolation
 ) -> EvalResults:
-    """``rescore`` every trajectory of a run directory against its protocol."""
+    """``rescore`` every trajectory of a run directory against its protocol, loading the files
+    one at a time as they are verified."""
     from topple import verify as trusted
     from topple.contract import describe_exception
 
@@ -376,9 +411,11 @@ def _verify_directory(
     for index, path in files.items():
         if index >= n:
             _fail(f"{path.name}: index outside {protocol.id}'s {n} episodes")
-    uploads = {index: _load_upload(path, protocol) for index, path in files.items()}
+    uploads = _UploadFiles(files, trusted.protocol_max_steps(protocol))
     try:
         return trusted.rescore(protocol, uploads, controller, isolation)
+    except _UploadLoadError as exc:
+        _fail(str(exc))
     except Exception as exc:  # a verifier bug must never look like a verification failure
         _fail(f"verification crashed: {describe_exception(exc)}")
 

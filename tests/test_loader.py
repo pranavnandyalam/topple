@@ -10,7 +10,7 @@ import topple.loader as loader_module
 from topple.contract import FEATURES, Controller, TaskSpec
 from topple.envs.balance import BalanceEnv
 from topple.evaluate import run_episode
-from topple.loader import LoadError, load_submission, submission_sha256
+from topple.loader import LoadError, load_submission, submission_id, submission_sha256
 
 SPEC: TaskSpec = BalanceEnv("ideal").task_spec
 
@@ -641,3 +641,18 @@ def test_hashing_a_symlinked_file_is_refused(tmp_path: Path) -> None:
     link.symlink_to(real)
     with pytest.raises(LoadError, match="symlink"):
         submission_sha256(link)
+
+
+def test_submission_id_names_the_resolved_file_or_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The id is what the path resolves to, however it is spelled (``.``, ``bot/..``)."""
+    bot = tmp_path / "mybot"
+    (bot / "inner").mkdir(parents=True)
+    (bot / "solo.py").write_text("")
+    monkeypatch.chdir(bot)
+    assert submission_id(Path(".")) == "mybot"
+    assert submission_id(Path("inner/..")) == "mybot"
+    assert submission_id(bot) == "mybot"
+    assert submission_id(Path("solo.py")) == "solo"
+    assert submission_id(Path("inner/../solo.py")) == "solo"

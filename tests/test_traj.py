@@ -5,6 +5,7 @@ import re
 import tempfile
 import threading
 import time
+import tracemalloc
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -291,7 +292,9 @@ def test_header_cannot_claim_more_data_than_the_member_holds(tmp_path: Path) -> 
     members["obs.npy"] = header.getvalue() + np.zeros((5, 10), np.float32).tobytes()
     path = tmp_path / "liar.npz"
     write_members(path, members)
-    with pytest.raises(ValueError, match="obs"):
+    with pytest.raises(ValueError, match=r"obs: header shape .* needs more data"):
+        load_npz(path, max_steps=2**21)  # within the step limit: only the member size refuses it
+    with pytest.raises(ValueError, match="obs: trajectory has 1048576 steps, more than 1000"):
         load_npz(path, max_steps=1000)
 
 
@@ -566,4 +569,143 @@ def test_meta_must_be_one_dimensional(tmp_path: Path) -> None:
     path = tmp_path / "meta2d.npz"
     write_members(path, members)
     with pytest.raises(ValueError, match="1-D"):
+        load_npz(path, max_steps=1000)
+
+
+# ------------------------------------------------------------------ size limits (§14)
+
+
+def raw_members(t: int, nq: int, nv: int, e: int, meta: bytes | None = None) -> dict[str, bytes]:
+    """Members of a file with the given sizes, built without ``Trajectory``'s own checks."""
+    arrays = {
+        "qpos": np.zeros((t + 1, nq)),
+        "qvel": np.zeros((t + 1, nv)),
+        "obs": np.zeros((t, 10), np.float32),
+        "action": np.zeros((t, 2)),
+        "ctrl": np.zeros((t, 2)),
+        "enc_counts": np.zeros((t, 2), np.int32),
+        "gyro": np.zeros((t, 3), np.float32),
+        "accel": np.zeros((t, 3), np.float32),
+        "push_force": np.zeros((t, 3)),
+        "epilogue_qpos": np.zeros((e, nq)),
+    }
+    members = {f"{n}.npy": npy_bytes(a) for n, a in arrays.items()}
+    raw = json.dumps({"format": FORMAT}).encode() if meta is None else meta
+    members["meta_json.npy"] = npy_bytes(np.frombuffer(raw, dtype=np.uint8))
+    return members
+
+
+def write_deflated(path: Path, members: dict[str, bytes]) -> None:
+    """Like ``write_members``, compressed: a bloated member costs next to nothing on disk."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+
+
+def meta_of_size(size: int) -> bytes:
+    """A valid ``meta_json`` document of exactly ``size`` bytes."""
+    head = json.dumps({"format": FORMAT, "pad": ""}).encode()
+    return head[:-2] + b"x" * (size - len(head)) + head[-2:]
+
+
+def test_state_widths_are_capped() -> None:
+    cap = traj_module.MAX_STATE_DIM
+    assert make_traj(nq=cap, nv=cap).qpos.shape == (6, cap)
+    with pytest.raises(ValueError, match=f"qpos must have at most {cap} columns"):
+        make_traj(nq=cap + 1)
+    with pytest.raises(ValueError, match=f"qvel must have at most {cap} columns"):
+        make_traj(nv=cap + 1)
+
+
+def test_a_wide_state_is_refused_at_load(tmp_path: Path) -> None:
+    cap = traj_module.MAX_STATE_DIM
+    for name, (nq, nv) in {"qpos": (cap + 1, 8), "qvel": (9, cap + 1)}.items():
+        path = tmp_path / f"wide_{name}.npz"
+        write_members(path, raw_members(t=2, nq=nq, nv=nv, e=0))
+        with pytest.raises(ValueError, match=rf"wide_{name}\.npz: {name} must have at most"):
+            load_npz(path, max_steps=1000)
+
+
+def test_epilogue_rows_are_bounded_by_max_steps(tmp_path: Path) -> None:
+    path = tmp_path / "t.npz"
+    write_members(path, raw_members(t=2, nq=9, nv=8, e=5))
+    assert load_npz(path, max_steps=5).epilogue_qpos.shape == (5, 9)
+    with pytest.raises(ValueError, match="epilogue_qpos has 5 rows, more than 4"):
+        load_npz(path, max_steps=4)
+
+
+@pytest.mark.parametrize(
+    "read",
+    [lambda path: load_npz(path, max_steps=1000), read_meta],
+    ids=["load_npz", "read_meta"],
+)
+def test_meta_json_is_capped(tmp_path: Path, read: Callable[[Path], object]) -> None:
+    cap = traj_module.MAX_META_BYTES
+    assert cap < traj_module.MAX_MEMBER_BYTES
+    path = tmp_path / "meta.npz"
+    write_deflated(path, raw_members(t=2, nq=9, nv=8, e=0, meta=meta_of_size(cap)))
+    read(path)
+    write_deflated(path, raw_members(t=2, nq=9, nv=8, e=0, meta=meta_of_size(cap + 1)))
+    with pytest.raises(ValueError, match="meta_json"):
+        read(path)
+
+
+def test_bloated_members_are_refused_before_their_data_is_read(tmp_path: Path) -> None:
+    """A few KB of deflated zeros can claim 16 MiB per member: a header shape beyond the format's
+    limits (T <= max_steps, widths <= MAX_STATE_DIM, meta <= MAX_META_BYTES) is refused before
+    any of its data is read, so loading never allocates more than an honest file could need."""
+    width = 2_000_000  # 16 MB of f8 per state member: under the 16 MiB member cap
+    members = raw_members(t=0, nq=width, nv=width, e=1)
+    path = tmp_path / "bloat.npz"
+    write_deflated(path, members)
+    assert path.stat().st_size < 200_000
+    del members
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match=r"bloat\.npz: qpos"):
+            load_npz(path, max_steps=1000)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 2_000_000
+
+
+@settings(max_examples=40, deadline=None)
+@given(
+    t=st.integers(0, 4),
+    nq=st.sampled_from([1, 9, 256, 257, 300]),
+    nv=st.sampled_from([1, 8, 256, 257]),
+    e=st.integers(0, 5),
+)
+def test_load_accepts_exactly_the_files_within_the_limits(t: int, nq: int, nv: int, e: int) -> None:
+    """With max_steps = 3: T <= 3, E <= 3 and both widths <= MAX_STATE_DIM load, nothing else."""
+    cap = traj_module.MAX_STATE_DIM
+    within = t <= 3 and e <= 3 and nq <= cap and nv <= cap
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "limits.npz"
+        write_members(path, raw_members(t=t, nq=nq, nv=nv, e=e))
+        if within:
+            traj = load_npz(path, max_steps=3)
+            assert traj.steps == t
+            assert traj.qpos.shape == (t + 1, nq)
+            assert traj.epilogue_qpos.shape == (e, nq)
+        else:
+            with pytest.raises(ValueError, match=r"limits\.npz"):
+                load_npz(path, max_steps=3)
+
+
+@pytest.mark.parametrize(
+    ("name", "arr"),
+    [
+        ("qpos", np.zeros((6, 9, 1))),  # a third axis would slip past the width limit
+        ("epilogue_qpos", np.zeros(9)),
+        ("ctrl", np.zeros((5, 2, 1))),
+    ],
+)
+def test_array_members_must_be_two_dimensional(tmp_path: Path, name: str, arr: np.ndarray) -> None:
+    members = honest_members()
+    members[f"{name}.npy"] = npy_bytes(arr)
+    path = tmp_path / "ndim.npz"
+    write_members(path, members)
+    with pytest.raises(ValueError, match=rf"ndim\.npz: {name} must be 2-D"):
         load_npz(path, max_steps=1000)

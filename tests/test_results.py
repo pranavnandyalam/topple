@@ -311,7 +311,8 @@ def test_results_can_be_written_into_a_write_only_drop_directory(tmp_path: Path)
 def test_any_other_failure_to_open_the_directory_is_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Only "cannot open" is skipped; any other failure to open the directory still raises."""
+    """Only "cannot open" is skipped; any other failure to open the directory still raises, and
+    it raises after the rename (§15): the complete file is in place, no temporary is left."""
     real_open = os.open
 
     def open_(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
@@ -322,6 +323,8 @@ def test_any_other_failure_to_open_the_directory_is_reported(
     monkeypatch.setattr(results_module.os, "open", open_)
     with pytest.raises(OSError, match="I/O error"):
         write_results(EvalResults.model_validate(results_dict()), tmp_path / "results.json")
+    assert read_results(tmp_path / "results.json").challenge == results_dict()["challenge"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["results.json"]
 
 
 def test_results_are_written_where_os_has_no_fchmod(

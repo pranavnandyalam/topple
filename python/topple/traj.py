@@ -16,6 +16,7 @@ import zipfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import IO, Any, NoReturn
 
@@ -26,6 +27,10 @@ from topple.contract import BALANCE_V1_ACTION, FEATURES
 
 FORMAT = "topple.traj/1"
 MAX_MEMBER_BYTES = 16 * 1024 * 1024
+MAX_STATE_DIM = 256
+"""Most columns ``qpos``, ``qvel`` and ``epilogue_qpos`` may have (nq, nv <= this)."""
+MAX_META_BYTES = 256 * 1024
+"""Most bytes of ``meta_json`` (an honest one is a few KiB)."""
 META = "meta_json"
 _ALLOWED_DTYPES = {np.dtype("<f8"), np.dtype("<f4"), np.dtype("<i4"), np.dtype("|u1")}
 # name -> (dtype, fixed trailing shape, or None for the model-dependent nq / nv widths)
@@ -83,6 +88,10 @@ class Trajectory:
                     f"{name} must have T+1={t + 1} rows and at least one column, "
                     f"got shape {arr.shape}"
                 )
+            if arr.shape[1] > MAX_STATE_DIM:
+                raise ValueError(
+                    f"{name} must have at most {MAX_STATE_DIM} columns, got shape {arr.shape}"
+                )
         for name, (_, trailing) in _SCHEMA.items():
             if trailing is None:
                 continue
@@ -111,10 +120,11 @@ class Trajectory:
 def load_npz(path: Path, *, max_steps: int) -> Trajectory:
     """Load and validate an untrusted trajectory file (contract §14).
 
-    Nothing is unpickled and nothing is allocated beyond what the file really holds: every member
-    is size-capped and its npy header is checked against its size before it is read. Any problem
-    (including an unreadable or missing file) raises ``ValueError``; so does a trajectory longer
-    than ``max_steps``, which every caller must pass.
+    Nothing is unpickled and nothing is allocated beyond what the file really holds or the format
+    allows: every member is size-capped, and its npy header is checked against its size and
+    against the limits (T and E at most ``max_steps``, state widths at most ``MAX_STATE_DIM``,
+    ``meta_json`` at most ``MAX_META_BYTES``) before any of its data is read. Any problem
+    (including an unreadable or missing file) raises ``ValueError``; ``max_steps`` is required.
     """
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
         raise ValueError(f"max_steps must be a non-negative int, got {max_steps!r}")
@@ -178,22 +188,63 @@ def _open_members(path: Path) -> Iterator[zipfile.ZipFile]:
 def _build(path: Path, max_steps: int) -> Trajectory:
     with _open_members(path) as zf:
         arrays = {
-            name: _read_member(zf, name, np.dtype(dtype)) for name, (dtype, _) in _SCHEMA.items()
+            name: _read_member(
+                zf, name, np.dtype(dtype), partial(_array_limits, name, max_steps=max_steps)
+            )
+            for name, (dtype, _) in _SCHEMA.items()
         }
-        meta = _parse_meta(_read_member(zf, META, np.dtype("|u1")))
-    traj = Trajectory(**arrays, meta=meta)
-    if traj.steps > max_steps:
-        raise ValueError(f"trajectory has {traj.steps} steps, more than {max_steps}")
-    return traj
+        meta = _read_meta_member(zf)
+    return Trajectory(**arrays, meta=meta)
 
 
 def _read_meta_only(path: Path) -> dict[str, Any]:
     with _open_members(path) as zf:
-        return _parse_meta(_read_member(zf, META, np.dtype("|u1")))
+        return _read_meta_member(zf)
 
 
-def _read_member(zf: zipfile.ZipFile, name: str, dtype: np.dtype[Any]) -> npt.NDArray[Any]:
-    """One ``.npy`` member, read by hand so a lying header can never trigger a big allocation."""
+def _read_meta_member(zf: zipfile.ZipFile) -> dict[str, Any]:
+    return _parse_meta(_read_member(zf, META, np.dtype("|u1"), _meta_limits))
+
+
+def _array_limits(name: str, shape: tuple[int, ...], *, max_steps: int) -> None:
+    """Refuse an array header beyond the format's limits (§14) before its data is read.
+
+    Rows: T+1 <= max_steps+1 for ``qpos``/``qvel``, T <= max_steps for the per-step arrays and
+    E <= max_steps for the epilogue. Columns: the fixed width of the table, or at most
+    ``MAX_STATE_DIM`` for the state arrays. Exact shapes are checked once the arrays are read.
+    """
+    if len(shape) != 2:
+        raise ValueError(f"{name} must be 2-D, got header shape {shape}")
+    rows, width = shape
+    trailing = _SCHEMA[name][1]
+    if name == "epilogue_qpos":
+        if rows > max_steps:
+            raise ValueError(f"epilogue_qpos has {rows} rows, more than {max_steps}")
+    else:
+        steps = rows - 1 if name in _STATE else rows
+        if steps > max_steps:
+            raise ValueError(f"{name}: trajectory has {steps} steps, more than {max_steps}")
+    if trailing is None:
+        if width > MAX_STATE_DIM:
+            raise ValueError(f"{name} must have at most {MAX_STATE_DIM} columns, got shape {shape}")
+    elif (width,) != trailing:
+        raise ValueError(f"{name} must have shape {(rows, *trailing)}, got {shape}")
+
+
+def _meta_limits(shape: tuple[int, ...]) -> None:
+    size = math.prod(shape)
+    if size > MAX_META_BYTES:
+        raise ValueError(f"{META} has {size} bytes, more than {MAX_META_BYTES}")
+
+
+def _read_member(
+    zf: zipfile.ZipFile,
+    name: str,
+    dtype: np.dtype[Any],
+    limits: Callable[[tuple[int, ...]], None],
+) -> npt.NDArray[Any]:
+    """One ``.npy`` member, read by hand so a lying header can never trigger a big allocation:
+    its shape must pass ``limits`` and fit the bytes the member holds before any data is read."""
     info = zf.getinfo(f"{name}.npy")
     with zf.open(info) as fh:
         shape, fortran, found = _read_header(fh, name)
@@ -205,6 +256,7 @@ def _read_member(zf: zipfile.ZipFile, name: str, dtype: np.dtype[Any]) -> npt.ND
             raise ValueError(f"{name}: expected dtype {dtype.str}, got {found.str}")
         if any(n < 0 for n in shape):
             raise ValueError(f"{name}: negative dimension in header shape {shape}")
+        limits(shape)
         nbytes = math.prod(shape) * found.itemsize
         if nbytes > info.file_size - fh.tell():
             raise ValueError(f"{name}: header shape {shape} needs more data than the member holds")
