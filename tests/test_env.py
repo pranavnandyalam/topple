@@ -10,6 +10,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import gymnasium as gym
@@ -153,13 +154,16 @@ def rollout(
     options: dict[str, Any] | None = None,
     max_steps: int | None = None,
 ) -> Rollout:
+    """Run ``policy`` for at most ``max_steps`` steps. Without ``max_steps`` the episode must
+    end by itself within the env's ``max_steps`` (truncation), else the test fails."""
     obs, info = env.reset(seed=seed, options=options)
     observations, infos = [obs], [info]
     rewards: list[float] = []
     actions: list[Any] = []
     qpos, qvel = [env.data.qpos.copy()], [env.data.qvel.copy()]
     terminated = truncated = False
-    while not (terminated or truncated) and (max_steps is None or len(rewards) < max_steps):
+    limit = env.max_steps if max_steps is None else max_steps
+    while not (terminated or truncated) and len(rewards) < limit:
         action = policy(obs, info)
         obs, reward, terminated, truncated, info = env.step(action)
         observations.append(obs)
@@ -168,7 +172,38 @@ def rollout(
         actions.append(action)
         qpos.append(env.data.qpos.copy())
         qvel.append(env.data.qvel.copy())
+    if max_steps is None and not (terminated or truncated):
+        pytest.fail(f"the episode did not end within the env's {env.max_steps} steps")
     return Rollout(observations, infos, rewards, actions, qpos, qvel, terminated, truncated)
+
+
+class NeverEnds:
+    """Looks like a BalanceEnv whose episodes never end, as after a broken truncation."""
+
+    max_steps = 20
+
+    def __init__(self) -> None:
+        self.data = SimpleNamespace(qpos=np.zeros(9), qvel=np.zeros(8))
+        self.steps = 0
+
+    def reset(self, *, seed: int | None = None, options: Any = None) -> tuple[Obs, Info]:
+        return np.zeros(len(FEATURES), np.float32), {"t": 0.0, "termination_reason": None}
+
+    def step(self, action: Any) -> tuple[Obs, float, bool, bool, Info]:
+        self.steps += 1
+        assert self.steps <= 3 * self.max_steps, "the helper kept stepping an endless episode"
+        info = {"t": 0.0, "termination_reason": None}
+        return np.zeros(len(FEATURES), np.float32), 0.0, False, False, info
+
+
+def test_rollout_fails_fast_when_an_episode_never_ends() -> None:
+    """A regression that breaks truncation must fail the tests that run whole episodes, not
+    hang them while a recording env grows by about 1 KB a step."""
+    env = NeverEnds()
+    with pytest.raises(pytest.fail.Exception, match="did not end"):
+        rollout(env, idle)  # type: ignore[arg-type]
+    assert env.steps == env.max_steps
+    assert rollout(env, idle, max_steps=5).steps == 5  # an explicit limit is not a failure
 
 
 def assert_bitwise_equal(actual: npt.ArrayLike, expected: npt.ArrayLike) -> None:

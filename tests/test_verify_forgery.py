@@ -288,11 +288,13 @@ def run_on_scenario(scenario: Scenario, factory: ControllerFactory) -> Trajector
     obs, info = env.reset(options={"scenario": scenario})
     controller = factory(env.task_spec)
     controller.reset(0)
-    while True:
+    for _ in range(env.max_steps):  # bounded: a broken truncation fails instead of hanging
         action = controller.act(controller_obs(obs, float(info["t"])))
         obs, _, terminated, truncated_, info = env.step(action)
         if terminated or truncated_:
             break
+    else:
+        pytest.fail(f"the episode did not end within the env's {env.max_steps} steps")
     if wants_epilogue(env.termination_reason or "timeout", has_error=False):
         env.simulate_epilogue(EPILOGUE_S)
     return env.trajectory({"episode_index": 0, "error": None})

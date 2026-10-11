@@ -34,11 +34,12 @@ def obs(
 def survives(env: BalanceEnv, controller: LQRController, seed: int) -> bool:
     obs_arr, info = env.reset(seed=seed)
     controller.reset(seed)
-    while True:
+    for _ in range(env.max_steps):  # bounded: a broken truncation fails instead of hanging
         action = controller.act(BalancerObs.from_array(obs_arr, info["t"]))
         obs_arr, _, terminated, truncated, info = env.step(action)
         if terminated or truncated:
             return not terminated
+    pytest.fail(f"seed {seed}: the episode did not end within the env's {env.max_steps} steps")
 
 
 # ---------------------------------------------------------------- gains and controller
