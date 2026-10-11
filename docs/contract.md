@@ -677,10 +677,17 @@ and `index` only labels the verdict.
    before the rows run out, the upload does not reproduce; the verdict's replay is then the
    replay up to that step (no error, no epilogue). Then the episode's trusted error is
    decided: a `sim_unstable` termination in the replay gives error `sim_unstable` at step T
-   (whatever the upload claims); otherwise the upload's own well-formed error report is kept;
-   otherwise, if the replay neither terminated nor truncated at step T (so T < max_steps), the
-   verdict is **`incomplete`** (score 0): the commands stop early with no explanation, which
-   covers controller errors stripped from `meta`. The epilogue (§11) is simulated when
+   (whatever the upload claims). Otherwise the upload's own well-formed error report is kept,
+   if an honest run could have made it: a controller is never called again once the env
+   terminates or truncates, so a report at a step where the replay ended does not reproduce,
+   and neither does one that claims `sim_unstable`, which only the replay assigns (the
+   verdict's replay is then the replay without an error or an epilogue). A kept report of a
+   runner code (`timeout`, `crash`, `protocol`, `output_limit`, `load_error`) is the uploader's
+   word, not a runner's: nothing attests it, so it only zeroes the episode, and Phase 3 acts
+   on what its own runner reports, never on an uploaded code. Otherwise, if the replay neither
+   terminated nor truncated at step T (so T < max_steps), the verdict is **`incomplete`**
+   (score 0): the commands stop early with no explanation, which covers controller errors
+   stripped from `meta`. The epilogue (§11) is simulated when
    `evaluate.wants_epilogue(<replay termination reason or "timeout">, <trusted error present>)`.
 5. **Integrity.** These arrays must equal the replay's byte for byte (so `−0.0 ≠ 0.0`), compared
    in this order, the reason naming the first differing array and row: `qpos, qvel, obs, ctrl,

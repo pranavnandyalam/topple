@@ -318,6 +318,11 @@ def _replay(
         _, _, terminated, truncated, _ = env.step(upload.ctrl[k])
         done = terminated or truncated
     reason = env.termination_reason
+    impossible = _impossible_claim(reason, done, steps, claimed)
+    if impossible is not None:
+        raise _RejectedError(
+            "not_reproducible", impossible, _bare_replay(env, upload, steps, index)
+        )
     error = _replay_error(reason, done, steps, env.max_steps, claimed)
     if wants_epilogue(reason or SURVIVED, has_error=error is not None):
         env.simulate_epilogue(EPILOGUE_S)
@@ -327,15 +332,42 @@ def _replay(
     return _Replayed(replace(env.trajectory(meta), action=upload.action), error)
 
 
+def _bare_replay(env: BalanceEnv, upload: Trajectory, steps: int, index: int) -> Trajectory:
+    """The replay of the upload's first ``steps`` rows, without an error or an epilogue, for a
+    rejection's metrics."""
+    return replace(
+        env.trajectory({"episode_index": index, "error": None}), action=upload.action[:steps]
+    )
+
+
 def _ended_early(env: BalanceEnv, upload: Trajectory, k: int, index: int) -> _RejectedError:
     """The env terminated or truncated after ``k`` of the upload's rows: the upload does not
     reproduce, but the replay ran, so the rejection carries it (its first ``k`` steps, no error
     and no epilogue) for the verdict's metrics."""
-    replay = replace(
-        env.trajectory({"episode_index": index, "error": None}), action=upload.action[:k]
-    )
     reason = f"the replay ended after {k} steps, the trajectory has {upload.steps}"
-    return _RejectedError("not_reproducible", reason, replay)
+    return _RejectedError("not_reproducible", reason, _bare_replay(env, upload, k, index))
+
+
+def _impossible_claim(
+    reason: str | None, done: bool, steps: int, claimed: ErrorInfo | None
+) -> str | None:
+    """Why the upload's error report cannot come from an honest run, if it cannot.
+
+    The replay's own blow-up overrides any report. Otherwise: a controller is never called again
+    once the env terminates or truncates, so no honest run records an error at that step, and
+    only the replay itself assigns ``sim_unstable``. Either claim would put a code that nothing
+    reported (a runner's, or the physics') into the trusted results.
+    """
+    if claimed is None or reason == "sim_unstable":
+        return None
+    if done:
+        return (
+            f"meta.error claims {claimed.code} at step {steps}, where the replay ended "
+            f"({reason or SURVIVED}) without an error"
+        )
+    if claimed.code == "sim_unstable":
+        return "meta.error claims sim_unstable, but the replay stayed stable"
+    return None
 
 
 def _replay_error(

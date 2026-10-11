@@ -36,6 +36,7 @@ from verify_support import (
     pid,
     public,
     run_honest,
+    truncated,
     wide_random,
     with_meta,
     without_meta,
@@ -290,22 +291,28 @@ def test_survivors_have_no_epilogue_and_falls_do(
     assert fell.replay.epilogue_qpos.shape[0] == round(EPILOGUE_S / 0.01)
 
 
+CUT = 500  # where a claimed error stops an honest episode in the tests below
+
+
 def claim_error(run: Honest, index: int, code: str = "timeout") -> Trajectory:
-    """A well-formed error report added to an honest episode, with the epilogue the replay
-    then simulates (an error means a 1 s epilogue, §11), so the claim reaches the accepted path."""
-    upload = run.uploads[index]
-    claimed = with_meta(upload, error={"code": code, "step": upload.steps, "detail": "my bad"})
-    replay = verify_episode(claimed, run.protocol, index).replay
+    """What an honest run whose controller failed at step ``CUT`` with ``code`` uploads: the
+    episode's first ``CUT`` steps with that error report, then the 1 s epilogue an error earns
+    (§11). Built from the replay of the claim, so every record is the replay's own."""
+    upload = truncated(run.uploads[index], CUT)
+    claimed = with_meta(upload, error={"code": code, "step": CUT, "detail": "my bad"})
+    replay = verify_episode(claimed, run.protocol, index).replay  # fails: no epilogue yet
     assert replay is not None
-    return replace(claimed, epilogue_qpos=replay.epilogue_qpos)
+    assert replay.meta["error"] == claimed.meta["error"]
+    assert replay.epilogue_qpos.shape[0] == round(EPILOGUE_S / 0.01)
+    return replay
 
 
 def test_a_claimed_error_without_its_epilogue_does_not_reproduce(
     honest_runs: dict[str, Honest],
 ) -> None:
     run = honest_runs["lqr"]
-    upload = run.uploads[0]
-    claimed = with_meta(upload, error={"code": "timeout", "step": upload.steps, "detail": "x"})
+    complete = claim_error(run, 0)
+    claimed = replace(complete, epilogue_qpos=complete.epilogue_qpos[:0])
     verdict = verify_episode(claimed, run.protocol, 0)
     assert not verdict.ok
     assert verdict.code == "not_reproducible"
@@ -314,23 +321,63 @@ def test_a_claimed_error_without_its_epilogue_does_not_reproduce(
 
 
 def test_an_honest_error_report_only_lowers_the_score(honest_runs: dict[str, Honest]) -> None:
-    """Claiming an error on a good episode can only cost its author: it reproduces, keeps the
-    error, scores 0 and is not a success, although the replay's own metrics are a success."""
+    """Claiming an error can only cost its author: an episode stopped by a claimed error at
+    step 500 reproduces, keeps the error, scores 0 and is not a success."""
     run = honest_runs["lqr"]
     assert run.results.episodes is not None
-    honest = run.results.episodes[0]
-    assert honest.success
-    assert honest.score > 0
+    assert run.results.episodes[0].success
     verdict = verify_episode(claim_error(run, 0), run.protocol, 0)
     assert verdict.ok, verdict.reason
     assert verdict.code is None
     assert verdict.result.error is not None
-    assert (verdict.result.error.code, verdict.result.error.step) == ("timeout", 1000)
+    assert (verdict.result.error.code, verdict.result.error.step) == ("timeout", CUT)
     assert verdict.result.error.detail == "my bad"
     assert verdict.result.score == 0.0
     assert verdict.result.success is False
-    assert verdict.result.metrics == honest.metrics  # the replay is scored, then zeroed
+    assert verdict.result.metrics is not None
+    assert verdict.result.metrics["steps"] == CUT  # the replay is scored, then zeroed
     assert "ended with timeout" in verdict.reason
+
+
+@pytest.mark.parametrize("code", ["exception", "timeout", "crash", "sim_unstable"])
+@pytest.mark.parametrize("ending", ["survived", "fell"])
+def test_an_error_claimed_where_the_episode_ended_is_refused(
+    honest_runs: dict[str, Honest], fallen: Honest, ending: str, code: str
+) -> None:
+    """§16 step 4: once the env terminates or truncates, the controller is never called again,
+    so an honest run records no error at that step. Such a claim is a forgery: it would plant a
+    runner code (or a physics blow-up) that no runner ever reported in the trusted results."""
+    run = honest_runs["lqr"] if ending == "survived" else fallen
+    upload = run.uploads[0]
+    claimed = with_meta(upload, error={"code": code, "step": upload.steps, "detail": "x"})
+    verdict = verify_episode(claimed, run.protocol, 0)
+    assert not verdict.ok
+    assert verdict.code == "not_reproducible"
+    reason = upload.meta["termination"]["reason"]
+    assert verdict.reason == (
+        f"meta.error claims {code} at step {upload.steps}, where the replay ended ({reason}) "
+        "without an error"
+    )
+    assert (verdict.result.score, verdict.result.success) == (0.0, False)
+    assert verdict.replay is not None  # the replay ran: no error, no epilogue (§16 step 4)
+    assert verdict.replay.meta["error"] is None
+    assert verdict.replay.epilogue_qpos.shape[0] == 0
+    assert verdict.result.metrics == run.results.episodes[0].metrics  # type: ignore[index]
+
+
+def test_sim_unstable_is_never_taken_from_an_upload(honest_runs: dict[str, Honest]) -> None:
+    """Only the replay assigns ``sim_unstable``: a stable replay that an upload says blew up is a
+    forgery, even where an honest run could have stopped with an error."""
+    run = honest_runs["lqr"]
+    honest = claim_error(run, 0, "exception")
+    assert verify_episode(honest, run.protocol, 0).ok
+    forged = with_meta(honest, error={**honest.meta["error"], "code": "sim_unstable"})
+    verdict = verify_episode(forged, run.protocol, 0)
+    assert not verdict.ok
+    assert verdict.code == "not_reproducible"
+    assert verdict.reason == "meta.error claims sim_unstable, but the replay stayed stable"
+    assert verdict.result.error is not None
+    assert verdict.result.error.code == "not_reproducible"
 
 
 def test_rescore_counts_a_claimed_error_as_a_failure(honest_runs: dict[str, Honest]) -> None:
