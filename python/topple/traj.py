@@ -11,21 +11,20 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
-import stat
 import struct
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import IO, Any, NoReturn
+from typing import Any, NoReturn
 
 import numpy as np
 import numpy.typing as npt
 
 from topple._atomic import replacement
+from topple._inputs import open_regular
 from topple._zip import READ_CHUNK, Archive, MemberReader
 from topple.contract import BALANCE_V1_ACTION, FEATURES
 
@@ -180,34 +179,11 @@ def _guarded[R](path: Path, read: Callable[[], R]) -> R:
         ) from exc
 
 
-def _open_regular(path: Path) -> tuple[IO[bytes], int]:
-    """Open ``path`` for reading only if it is a regular file (after following symlinks) of at
-    most ``MAX_FILE_BYTES``; return it with its size.
-
-    The open itself never blocks: a FIFO would wait forever for a writer and a device can be
-    endless, so the type is checked on the opened descriptor (no race with a swapped path).
-    """
-    nonblock = getattr(os, "O_NONBLOCK", 0)
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | nonblock)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise ValueError("not a regular file")
-        if info.st_size > MAX_FILE_BYTES:
-            raise ValueError(f"the file has {info.st_size} bytes, more than {MAX_FILE_BYTES}")
-        if nonblock:
-            os.set_blocking(fd, True)
-        return os.fdopen(fd, "rb"), info.st_size
-    except BaseException:
-        os.close(fd)
-        raise
-
-
 @contextmanager
 def _open_members(path: Path) -> Iterator[Archive]:
     """The members of the trajectory file at ``path``: a regular file holding a zip archive in
     the canonical layout (``topple._zip``, contract §14) with exactly the format's members."""
-    fh, size = _open_regular(path)
+    fh, size = open_regular(path, MAX_FILE_BYTES)
     with fh:
         yield Archive(
             fh,

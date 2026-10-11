@@ -601,7 +601,9 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
   `time_upright_s` that is a number of seconds from 0 to 10⁹, far beyond any episode, so the
   sum over at most 10,000 episodes can never overflow). Private-seed results are redacted:
   `episodes` is null, aggregate only.
-- **Reading** (`read_results`) reads at most 16 MiB and validates all of the above. Validation
+- **Reading** (`read_results`) opens only a regular file (symlinks are followed; a FIFO, device
+  or directory is refused without blocking on it or reading from it, as `load_npz` does, §14),
+  reads at most 16 MiB and validates all of the above. Validation
   proves a file well formed, never its numbers true: whoever publishes a score (Phase 3's
   publish step, the leaderboard) takes every number from trusted verification (§16), never from
   an uploaded `results.json`.

@@ -22,6 +22,7 @@ from pydantic import (
     model_validator,
 )
 
+from topple._inputs import open_regular
 from topple.ids import parse_protocol, validate_challenge_id
 
 FORMAT: Literal["topple.results/1"] = "topple.results/1"
@@ -315,13 +316,18 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def read_results(path: Path) -> EvalResults:
-    """Read and validate ``path``, at most ``MAX_RESULTS_BYTES`` of it.
+    """Read and validate ``path``: a regular file (a FIFO or a device is refused without blocking
+    on it or reading from it) of at most ``MAX_RESULTS_BYTES``.
 
     Validation proves a file well formed, never its numbers true: whoever publishes a score takes
     it from trusted verification (``topple.verify``, contract §16), never from an uploaded file.
     """
-    with path.open("rb") as fh:
-        data = fh.read(MAX_RESULTS_BYTES + 1)
+    try:
+        fh, _ = open_regular(path, MAX_RESULTS_BYTES)
+    except ValueError as exc:
+        raise ValueError(f"{path.name}: {exc}") from exc
+    with fh:
+        data = fh.read(MAX_RESULTS_BYTES + 1)  # it may have grown since it was examined
     if len(data) > MAX_RESULTS_BYTES:
         raise ValueError(f"{path.name} has more than {MAX_RESULTS_BYTES} bytes")
     return EvalResults.model_validate_json(data)

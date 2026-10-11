@@ -1,11 +1,13 @@
 """``topple.results/1``: schema bounds, cross-field checks, error details, atomic writes (§15)."""
 
 import errno
+import io
 import json
 import math
 import os
 import stat
 import unicodedata
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -520,10 +522,46 @@ def test_read_results_reads_at_most_the_cap(
     write_results(EvalResults.model_validate(results_dict()), path)
     size = path.stat().st_size
     monkeypatch.setattr(results_module, "MAX_RESULTS_BYTES", size - 1)
-    with pytest.raises(ValueError, match=rf"results\.json has more than {size - 1} bytes"):
+    message = rf"^results\.json: the file has {size} bytes, more than {size - 1}$"
+    with pytest.raises(ValueError, match=message):
         read_results(path)
     monkeypatch.setattr(results_module, "MAX_RESULTS_BYTES", size)
     assert read_results(path).controller.id == "pid"
+
+
+def test_read_results_refuses_a_fifo_without_blocking(
+    tmp_path: Path, make_fifo: Callable[[Path], Path]
+) -> None:
+    """Opening a FIFO for reading blocks until a writer appears: ``read_results`` refuses one on
+    its descriptor, as ``load_npz`` does (§14, §15). ``make_fifo`` releases a reader that
+    blocked anyway, so a regression fails here instead of hanging the suite."""
+    path = make_fifo(tmp_path / "results.json")
+    with pytest.raises(ValueError, match=r"^results\.json: not a regular file$"):
+        read_results(path)
+
+
+@pytest.mark.parametrize("kind", ["device", "directory"])
+def test_read_results_refuses_what_is_not_a_regular_file(tmp_path: Path, kind: str) -> None:
+    path = Path(os.devnull) if kind == "device" else tmp_path
+    if kind == "device" and (not path.exists() or path.is_file()):
+        pytest.skip("no character device to try")
+    with pytest.raises(ValueError, match=r"not a regular file$"):
+        read_results(path)
+
+
+def test_read_results_refuses_a_file_that_grew_past_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The size is checked before reading; a file that grows afterwards is still read only up
+    to the cap and refused."""
+    path = tmp_path / "results.json"
+    write_results(EvalResults.model_validate(results_dict()), path)
+    monkeypatch.setattr(results_module, "MAX_RESULTS_BYTES", 100)
+    monkeypatch.setattr(
+        results_module, "open_regular", lambda _path, _cap: (io.BytesIO(b" " * 1000), 50)
+    )
+    with pytest.raises(ValueError, match=r"^results\.json has more than 100 bytes$"):
+        read_results(path)
 
 
 UNSAFE_TEXT = "\x1b]0;pwn\x07\u202e\n::error::x"  # a terminal escape, a bidi override, a CI command
