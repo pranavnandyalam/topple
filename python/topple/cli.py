@@ -476,15 +476,27 @@ def _report_directory(run: RunVerdict) -> bool:
 
 
 def _report_file(binding: _Binding, verdict: EpisodeVerdict) -> None:
-    """The verdict; the first line alone tells a protocol-bound pass from an unbound one."""
+    """The verdict. The first line names the protocol and the episode, and alone tells a
+    protocol-bound pass from an unbound one (contract §16): without ``--protocol`` the protocol
+    is the file's own label, so its id is what shows that a pass is, say, a ``clean`` one."""
     head = ("OK" if binding.bound else "OK (UNBOUND)") if verdict.ok else f"FAIL ({verdict.code})"
-    typer.echo(f"{head}: {verdict.reason}")
+    typer.echo(f"{head}: {_episode_label(binding, verdict)}: {verdict.reason}")
     if not binding.bound:
         typer.echo(
             f"{binding.note}: seed {binding.seed} is checked against {binding.protocol.id}'s "
             "challenge and preset, not as one of its episodes"
         )
     typer.echo(_episode_line(verdict.result))
+
+
+def _episode_label(binding: _Binding, verdict: EpisodeVerdict) -> str:
+    """``<protocol> episode <i> (seed <s>)`` when bound (a private protocol's seed is secret and
+    left out), ``<protocol> seed <s>`` when unbound (the seed came from the caller or the file)."""
+    if not binding.bound:
+        return f"{binding.protocol.id} seed {binding.seed}"
+    seed = verdict.result.seed  # None for a private protocol
+    shown = f" (seed {seed})" if seed is not None else ""
+    return f"{binding.protocol.id} episode {binding.index}{shown}"
 
 
 def _single_results(

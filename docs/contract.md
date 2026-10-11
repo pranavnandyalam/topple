@@ -734,15 +734,18 @@ terminal nor start a GitHub Actions workflow command.
     from `meta.scenario.seed`, the file is verified with `verify_with_seed` on the scenario's
     seed and the output says `UNBOUND (seed taken from file)`; the scenario is still re-derived
     from that seed. `--index I` binds explicitly; `--seed S` verifies unbound on S.
-  - The first output line is `OK: …` for a pass bound to the protocol and `OK (UNBOUND): …` for
-    an unbound one. Both exit 0, so the exit code of a default file binding never proves that
-    the file is a given episode of the protocol: a script that needs that passes `--index` (or
-    re-scores a run directory), as the trusted path does.
+  - The first output line names the protocol and the episode, then gives the verdict's reason:
+    `OK: <protocol> episode <i> (seed <s>): …` for a pass bound to the protocol (a private
+    protocol's seed is left out), `OK (UNBOUND): <protocol> seed <s>: …` for an unbound one, and
+    `FAIL (<code>): …` with the same label for a failure. Both passes exit 0, so the exit code
+    of a default file binding never proves that the file is a given episode of the protocol: a
+    script that needs that passes `--index` (or re-scores a run directory), as the trusted path
+    does.
   - Without `--protocol`, the protocol (challenge and preset) is read from the upload's own
     labels, so it says only which protocol the uploader chose: a run on the easier `clean`
-    preset, labelled `clean`, verifies OK as `balance-v1/clean`. The printed protocol id is the
-    only sign of it. Trusted callers (Phase 3 publishing, nightly re-evaluation) always pass
-    `--protocol`.
+    preset, labelled `clean`, verifies OK as `balance-v1/clean`. The protocol id on the first
+    line is the only sign of it. Trusted callers (Phase 3 publishing, nightly re-evaluation)
+    always pass `--protocol`.
   - `--out` writes the trusted results (§15): for a directory the `rescore` results, for a file
     a one-episode result with `complete: false`. The controller is recorded as
     `{id: <SUB's name>, sha256: <SUB's submission sha256>}`, computed without importing SUB (the

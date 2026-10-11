@@ -252,7 +252,8 @@ def test_verify_and_score_commands(tmp_path: Path) -> None:
     traj = out / "traj_000.npz"
     verified = runner.invoke(app, ["verify", str(traj)])
     assert verified.exit_code == 0, verified.output
-    assert verified.output.startswith("OK: reproduced bit-exactly")
+    first_line = "OK: balance-v1/standard episode 0 (seed 1000): reproduced bit-exactly\n"
+    assert verified.output.startswith(first_line)
     assert "UNBOUND" not in verified.output
     scored = runner.invoke(app, ["score", str(traj)])
     assert scored.exit_code == 0, scored.output
@@ -286,7 +287,26 @@ def test_verify_detects_tampering(tmp_path: Path) -> None:
     Trajectory(**{**traj.__dict__, "qpos": qpos}).save_npz(out / "forged.npz")
     result = runner.invoke(app, ["verify", str(out / "forged.npz")])
     assert result.exit_code == 1
-    assert result.output.startswith("FAIL")
+    assert result.output.startswith(
+        "FAIL (not_reproducible): balance-v1/clean episode 0 (seed 1000): qpos differs"
+    )
+
+
+def test_verify_names_the_protocol_a_file_was_verified_against(tmp_path: Path) -> None:
+    """§16: without --protocol a file is verified against its own labels, so a run on the
+    push-free clean preset passes. The first line names that protocol: nothing else would show
+    that the pass is not a standard one."""
+    out = _run(tmp_path, "-p", "balance-v1/clean")
+    result = runner.invoke(app, ["verify", str(out / "traj_000.npz")])
+    assert result.exit_code == 0, result.output
+    first = result.output.splitlines()[0]
+    assert first == "OK: balance-v1/clean episode 0 (seed 1000): reproduced bit-exactly"
+    standard = runner.invoke(app, ["verify", str(out / "traj_000.npz"), "-p", "eval_v1"])
+    assert standard.exit_code == 1, standard.output
+    assert standard.output.splitlines()[0] == (
+        "FAIL (not_reproducible): balance-v1/standard episode 0 (seed 1000): "
+        "meta.preset is 'clean', expected 'standard'"
+    )
 
 
 def test_load_error_exits_2(tmp_path: Path) -> None:
@@ -619,11 +639,11 @@ def test_verify_a_local_seed_is_unbound(tmp_path: Path) -> None:
     result = runner.invoke(app, ["verify", str(out / "traj_000.npz")])
     assert result.exit_code == 0, result.output
     # The first line alone tells a protocol-bound pass from an unbound one.
-    assert result.output.startswith("OK (UNBOUND): reproduced bit-exactly")
+    assert result.output.startswith("OK (UNBOUND): balance-v1/clean seed 7: reproduced bit-exactly")
     assert "UNBOUND (seed taken from file)" in result.output
     explicit = runner.invoke(app, ["verify", str(out / "traj_000.npz"), "--seed", "7"])
     assert explicit.exit_code == 0, explicit.output
-    assert explicit.output.startswith("OK (UNBOUND)")
+    assert explicit.output.startswith("OK (UNBOUND): balance-v1/clean seed 7: ")
     assert "UNBOUND (seed from --seed)" in explicit.output
     scored = runner.invoke(app, ["score", str(out / "traj_000.npz"), "--seed", "7"])
     assert scored.exit_code == 0, scored.output
@@ -1227,3 +1247,9 @@ def test_score_never_prints_a_private_seed(tmp_path: Path, monkeypatch: pytest.M
     assert payload["score"] > 0
     assert payload["bound"] is True
     assert payload["seed"] is None
+    verified = runner.invoke(app, ["verify", str(out / "traj_000.npz"), "--index", "0"])
+    assert verified.exit_code == 0, verified.output
+    assert verified.output.splitlines()[0] == (
+        "OK: balance-v1/clean episode 0: reproduced bit-exactly"
+    )
+    assert "1000" not in verified.output
