@@ -20,3 +20,4 @@ smoke.png
 .ruff_cache/
 node_modules/
 .claude/settings.local.json
+MUJOCO_LOG.TXT

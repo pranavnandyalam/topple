@@ -1,11 +1,15 @@
+import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
 import imageio.v3 as iio
 import mujoco
+import numpy as np
 import pytest
 
+import topple.smoke
 from topple.rendering import RenderingUnavailableError
 from topple.smoke import SMOKE_XML, main, run_smoke
 
@@ -62,6 +66,48 @@ def test_run_smoke_reports_missing_renderer(
     assert not (tmp_path / "s.png").exists()
 
 
+class _FlatRenderer:
+    """Stands in for MuJoCo's renderer: a fixed frame, so writing is tested without GL."""
+
+    def __init__(self, height: int, width: int) -> None:
+        self.shape = (height, width, 3)
+
+    def update_scene(self, data: object) -> None:
+        pass
+
+    def render(self) -> np.ndarray:
+        return np.full(self.shape, 120, np.uint8)
+
+    def close(self) -> None:
+        pass
+
+
+def test_the_png_replaces_a_planted_symlink_instead_of_writing_through_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``topple smoke`` writes ``smoke.png`` in the current directory, which can be someone
+    else's checkout: a symlink planted there (``smoke.png -> ~/.zshrc``) is replaced, its target
+    never written (contract §14, as for trajectories and videos)."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious")
+    out = tmp_path / "smoke.png"
+    out.symlink_to(victim)
+    monkeypatch.setattr(
+        topple.smoke, "make_renderer", lambda model, height, width: _FlatRenderer(height, width)
+    )
+    old = os.umask(0o077)
+    try:
+        run_smoke(out, steps=1, width=8, height=6)
+    finally:
+        os.umask(old)
+    assert victim.read_text() == "precious"
+    assert out.is_file()
+    assert not out.is_symlink()
+    assert iio.imread(out).shape == (6, 8, 3)
+    assert stat.S_IMODE(out.stat().st_mode) == 0o644
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["smoke.png", "victim.txt"]
+
+
 def test_smoke_xml_compiles() -> None:
     model = mujoco.MjModel.from_xml_string(SMOKE_XML)
     assert model.njnt == 1
@@ -108,3 +154,30 @@ def test_done_when_command_writes_smoke_png(tmp_path: Path, headless_env: dict[s
     image = iio.imread(tmp_path / "smoke.png")
     assert image.shape == (240, 320, 3)
     assert image.std() > 1.0
+
+
+def test_main_never_writes_through_a_planted_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A relative ``--out`` through a directory symlink committed in a checkout exits 2 before
+    anything renders (contract §14)."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "shots").symlink_to(victim)
+    monkeypatch.chdir(checkout)
+    assert main(["--out", "shots/smoke.png", "--steps", "1"]) == 2
+    assert capsys.readouterr().err.startswith(
+        "error: refusing to write through the symlink 'shots'"
+    )
+    assert list(victim.iterdir()) == []
+
+
+def test_main_reports_an_output_directory_that_cannot_be_examined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "file").write_text("not a directory")
+    monkeypatch.chdir(tmp_path)
+    assert main(["--out", "file/sub/smoke.png", "--steps", "1"]) == 2
+    assert capsys.readouterr().err == "error: cannot write to file/sub: Not a directory\n"
