@@ -161,12 +161,57 @@ def _require(spec: mujoco.MjSpec) -> None:
         raise ValueError(f"robot is missing required elements: {', '.join(missing)}")
 
 
+# The element kinds (``MjSpec`` lists) whose names the robot and the scene share once the robot
+# is attached with prefix "": MuJoCo names are unique per kind. The robot's actuators and sensors
+# are removed before it is attached, so they are not listed.
+_NAMED_KINDS = (
+    ("bodies", "body"),
+    ("frames", "frame"),
+    ("geoms", "geom"),
+    ("sites", "site"),
+    ("joints", "joint"),
+    ("cameras", "camera"),
+    ("lights", "light"),
+    ("materials", "material"),
+    ("textures", "texture"),
+    ("meshes", "mesh"),
+    ("skins", "skin"),
+    ("hfields", "hfield"),
+    ("tendons", "tendon"),
+    ("flexes", "flex"),
+    ("pairs", "pair"),
+    ("excludes", "exclude"),
+    ("equalities", "equality"),
+    ("numerics", "numeric"),
+    ("texts", "text"),
+    ("tuples", "tuple"),
+    ("keys", "key"),
+)
+
+
+def _reserved_names(scene: mujoco.MjSpec, robot: mujoco.MjSpec) -> list[str]:
+    """The robot's names that are taken: the replay camera's, and any the scene gives an element
+    of the same kind (the world body aside: attaching merges the robot's into the scene's)."""
+    taken = [
+        f"camera '{TRACK_CAMERA}' is reserved for the replay camera the env adds to '{CHASSIS}'"
+        for camera in robot.cameras
+        if camera.name == TRACK_CAMERA
+    ]
+    for kind, label in _NAMED_KINDS:
+        scene_names = {e.name for e in getattr(scene, kind) if e.name}
+        if kind == "bodies":
+            scene_names.discard(scene.worldbody.name)
+        robot_names = (e.name for e in getattr(robot, kind))
+        taken += [f"{label} '{name}' is the scene's" for name in robot_names if name in scene_names]
+    return taken
+
+
 def build_model(
     robot_xml: Path, scene_xml: Path, params: RobotParams, *, delay_buffer: bool = True
 ) -> mujoco.MjModel:
     """Compose robot + scene, inject motors, sensors and the replay camera, and set the wheels'
-    dynamics from ``params`` alone (contract §3). A robot camera named ``track`` is refused: the
-    replay camera reserves that name.
+    dynamics from ``params`` alone (contract §3). A robot that names an element as the scene names
+    one of its kind, or a camera ``track`` (the replay camera's), is refused.
 
     ``delay_buffer=False`` omits the native actuator history buffer; use it for linearization
     (``mjd_transitionFD`` does not support delays), never for evaluation.
@@ -174,10 +219,11 @@ def build_model(
     scene = mujoco.MjSpec.from_file(str(scene_xml))
     robot = mujoco.MjSpec.from_file(str(robot_xml))
     _require(robot)
-    if any(camera.name == TRACK_CAMERA for camera in robot.cameras):
+    taken = _reserved_names(scene, robot)
+    if taken:
         raise ValueError(
-            f"robot does not satisfy {ROBOT_INTERFACE_ID}: camera '{TRACK_CAMERA}' is reserved "
-            f"for the replay camera the env adds to '{CHASSIS}'; rename the robot's own"
+            f"robot does not satisfy {ROBOT_INTERFACE_ID}: {'; '.join(taken)}; "
+            "rename the robot's own"
         )
     for actuator in list(robot.actuators):
         robot.delete(actuator)

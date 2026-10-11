@@ -164,7 +164,10 @@ hashed with CRLF → LF, exactly as in `bundle_hash` (§13), so a checkout's lin
 
 The scene (`scene.xml`) owns physics options: `timestep=0.002`, `integrator=implicitfast`,
 `<flag autoreset="disable"/>`, a floor plane at z = 0 and lights. The robot is attached with
-prefix `""`.
+prefix `""`, so it may not give an element a name the scene gives one of the same kind (MuJoCo
+names are unique per kind; balance-v1's scene names the texture and the material `grid`, the
+lights `key` and `fill` and the geom `floor`): `build_model` refuses such a robot, as it refuses
+a camera named `track` (above), and names every taken name.
 
 ## 4. Timing
 

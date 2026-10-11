@@ -727,6 +727,47 @@ def test_the_replay_camera_name_is_reserved(params: RobotParams, tmp_path: Path)
     assert m.cam_bodyid[m.camera("track").id] == m.body("chassis").id
 
 
+ASSETS_BEFORE = "<worldbody>"
+SCENE_NAMES = {
+    "material": ((ASSETS_BEFORE, '<asset><material name="grid"/></asset><worldbody>'), "material"),
+    "texture": (
+        (
+            ASSETS_BEFORE,
+            '<asset><texture name="grid" type="2d" builtin="flat" width="8" height="8"/>'
+            "</asset><worldbody>",
+        ),
+        "texture",
+    ),
+    "geom": (
+        (
+            IMU_SITE,
+            '<geom name="floor" type="sphere" size="0.01" contype="0" conaffinity="0"/>' + IMU_SITE,
+        ),
+        "geom",
+    ),
+    "light": ((IMU_SITE, '<light name="key"/>' + IMU_SITE), "light"),
+}
+
+
+@pytest.mark.parametrize(("edit", "kind"), SCENE_NAMES.values(), ids=SCENE_NAMES.keys())
+def test_a_robot_may_not_reuse_a_name_the_scene_gives_an_element_of_its_kind(
+    params: RobotParams, tmp_path: Path, edit: tuple[str, str], kind: str
+) -> None:
+    """§3: the robot is attached with prefix "", so a name the scene already gives an element of
+    the same kind (balance-v1: texture and material ``grid``, lights ``key`` and ``fill``, geom
+    ``floor``) would name two elements. Such robots once failed with MuJoCo's bare "Error:
+    repeated name 'grid' in material"; a name the scene uses for another kind is fine."""
+    name = re.search(r'name="(\w+)"', edit[1])
+    assert name is not None
+    expected = rf"balancer\.robot\.v1: {kind} '{name.group(1)}' is the scene's; rename the robot's"
+    with pytest.raises(ValueError, match=expected):
+        model_from(params, tmp_path, edit)
+    with pytest.raises(ValueError, match=expected):
+        BalanceEnv("clean", robot_xml=tmp_path / "variant.xml")  # what model_from just wrote
+    elsewhere = '<site name="grid" pos="0 0 0.05"/><site name="floor" pos="0 0 0.06"/>'
+    assert validate_robot(model_from(params, tmp_path, (IMU_SITE, elsewhere + IMU_SITE))) == []
+
+
 def array_fields(m: mujoco.MjModel) -> list[str]:
     """Every array a compiled model holds: its numbers, names and structure."""
     return [name for name in dir(m) if isinstance(getattr(m, name, None), np.ndarray)]
