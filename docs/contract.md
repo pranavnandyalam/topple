@@ -528,9 +528,16 @@ class EpisodeVerdict:
     replay: Trajectory | None      # trusted replay as far as it ran (None if not replayed)
     result: EpisodeResult          # scored only from `replay` and the env's own metadata
 
+@dataclass(frozen=True)
+class RunVerdict:
+    results: EvalResults           # rescore's results (redacted for a private protocol)
+    failed: int                    # episodes not_reproducible, incomplete or missing
+    ok: bool                       # property: failed == 0
+
 def verify_episode(upload, protocol, index) -> EpisodeVerdict
 def verify_with_seed(upload, protocol, seed, *, index=0) -> EpisodeVerdict
 def rescore(protocol, uploads: Mapping[int, Trajectory], controller, isolation) -> EvalResults
+def verify_run(protocol, uploads: Mapping[int, Trajectory], controller, isolation) -> RunVerdict
 def protocol_max_steps(protocol) -> int
 ```
 
@@ -593,9 +600,18 @@ when no episode is missing (§15). Private-protocol results are redacted as usua
 looks each index up once, in index order, and keeps no upload once it is verified, so a mapping
 that loads on lookup holds one upload in memory at a time.
 
+**`verify_run`** returns `rescore`'s results together with `failed`, the number of episodes that
+did not verify (`not_reproducible`, `incomplete` or `missing`), counted from the verdicts before
+a private protocol's results are redacted; `ok` means none did. Whether a run verified always
+comes from `failed`, never from the results: a private protocol's results list no episodes. An
+episode with a run error (§15) that reproduces did verify; it only scores 0.
+
 **CLI.** Exit codes: 0 reproduced, 1 verification failed, 2 usage or load error. A crash inside
 the verifier exits 2 with `verification crashed: <Type: message>`, never 1, and never prints a
-traceback.
+traceback. An error is one line: every character of it that is not printable (control
+characters, line breaks, lone surrogates) is shown as its backslash escape, so untrusted text
+quoted in it (paths, file names, upload contents) can neither drive a terminal nor start a
+GitHub Actions workflow command.
 
 - `topple verify PATH [--protocol P] [--index I | --seed S] [--out results.json]
   [--submission SUB] [--isolation inprocess|subprocess|container]`
@@ -603,7 +619,9 @@ traceback.
     `rescore`; the protocol is `--protocol`, else the challenge/preset named by the
     lowest-numbered file. The files are loaded one at a time, as `rescore` reaches them. An
     index outside the protocol, two files for one index, a file that does not load, or
-    `--index`/`--seed` exit 2. Exit 1 unless every episode reproduced and none is missing.
+    `--index`/`--seed` exit 2. Exit 1 unless every episode reproduced and none is missing,
+    decided by `verify_run` (`ok`), so a private protocol's redacted results cannot hide a
+    failure.
   - PATH a **file**: by default the protocol comes from `meta.challenge`/`meta.preset` and the
     index from `meta.episode_index`. If that index is outside the protocol or its seed differs
     from `meta.scenario.seed`, the file is verified with `verify_with_seed` on the scenario's
@@ -625,7 +643,8 @@ traceback.
     `topple eval SUB` records, so `.` names the current directory), or
     `{id: "unknown", sha256: <64 zeros>}` without `--submission`. `--submission` is resolved
     before anything is verified: one that cannot be hashed, or whose name is not valid UTF-8,
-    exits 2 before any verdict is printed.
+    exits 2 before any verdict is printed. `--isolation` is recorded as given: a label that
+    nothing checks (§15).
 - `topple score FILE [--protocol P] [--index I | --seed S]` verifies first, then prints JSON:
   `ok, code, reason, bound, protocol, index, seed, score, success, error, metrics`, all from the
   verdict (so `seed` is null for a private protocol). Exit 1 if not ok (the score is then 0); an

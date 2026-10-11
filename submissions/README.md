@@ -29,3 +29,6 @@ uv run topple eval submissions/pid_example.py                       # 20 public 
 uv run topple eval submissions/lqr_example.py -p balance-v1/clean   # no pushes
 uv run topple run submissions/zero_example.py                       # one episode and a video
 ```
+
+`run` and `eval` import the controller and run it in their own process, with your privileges:
+only run code you trust (someone else's controller belongs in the sandboxed runner, Phase 3).

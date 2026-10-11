@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from topple.loader import Submission
     from topple.results import ControllerInfo, EpisodeResult, EvalResults, Isolation
     from topple.traj import Trajectory
-    from topple.verify import EpisodeVerdict
+    from topple.verify import EpisodeVerdict, RunVerdict
 
 app = typer.Typer(help="Topple: CI for robots.", no_args_is_help=True)
 
@@ -67,14 +67,24 @@ BindProtocolOpt = Annotated[
 ]
 
 
-def _fail(message: str) -> NoReturn:
-    """Usage, load or internal error: a clean one-line message and exit code 2.
+def _printable(text: str) -> str:
+    """``text`` with every character that is not printable shown as its escape (``\\x1b``).
 
-    Lone surrogates (how a file name that is not valid UTF-8 decodes) are printed escaped.
+    Error text quotes paths, file names and upload contents. Raw, a control character could
+    drive the terminal (retitle it, clear it), a line break followed by ``::error::`` would be a
+    workflow command in a GitHub Actions log, and a lone surrogate (a file name that is not valid
+    UTF-8) could not even be encoded.
     """
-    if len(message) > MAX_MESSAGE_CHARS:
-        message = message[: MAX_MESSAGE_CHARS - 3] + "..."
-    printable = message.encode("utf-8", "backslashreplace").decode("utf-8")
+    return "".join(
+        ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii") for ch in text
+    )
+
+
+def _fail(message: str) -> NoReturn:
+    """Usage, load or internal error: a clean one-line message (escaped) and exit code 2."""
+    printable = _printable(message)
+    if len(printable) > MAX_MESSAGE_CHARS:
+        printable = printable[: MAX_MESSAGE_CHARS - 3] + "..."
     typer.echo(f"error: {printable}", err=True)
     raise typer.Exit(code=2)
 
@@ -156,7 +166,7 @@ def _render(traj_path: Path, out: Path, fmt: VideoFormat, protocol: EvalProtocol
         traj = load_npz(traj_path, max_steps=protocol_max_steps(protocol))
         render_trajectory(traj, out.with_suffix(f".{fmt.value}"))
     except (RenderingUnavailableError, ValueError, OSError) as exc:
-        typer.echo(f"warning: video skipped: {exc}", err=True)
+        typer.echo(f"warning: video skipped: {_printable(str(exc))}", err=True)
 
 
 def _evaluate(
@@ -195,7 +205,10 @@ def run(
     video_format: FormatOpt = VideoFormat.mp4,
 ) -> None:
     """Run one episode (default: the first public seed): writes results.json (complete: false),
-    traj_000.npz and a video."""
+    traj_000.npz and a video.
+
+    It runs the controller's code in this process, with your privileges: only run code you trust.
+    """
     sub = _load(controller)
     proto = _protocol(protocol)
     proto = replace(proto, seeds=(proto.seeds[0] if seed is None else seed,))
@@ -213,7 +226,10 @@ def eval_cmd(
     videos: Annotated[Videos, typer.Option(help="Which episodes to render.")] = Videos.worst,
     video_format: FormatOpt = VideoFormat.mp4,
 ) -> None:
-    """Evaluate on every seed of a protocol: results.json, trajectories, videos."""
+    """Evaluate on every seed of a protocol: results.json, trajectories, videos.
+
+    It runs the controller's code in this process, with your privileges: only run code you trust.
+    """
     sub = _load(controller)
     proto = _protocol(protocol)
     results = _evaluate(sub, proto, out)
@@ -399,9 +415,9 @@ class _UploadFiles(Mapping[int, "Trajectory"]):
 
 def _verify_directory(
     directory: Path, protocol_id: str | None, controller: ControllerInfo, isolation: Isolation
-) -> EvalResults:
-    """``rescore`` every trajectory of a run directory against its protocol, loading the files
-    one at a time as they are verified."""
+) -> RunVerdict:
+    """Re-score every trajectory of a run directory against its protocol (``verify_run``),
+    loading the files one at a time as they are verified."""
     from topple import verify as trusted
     from topple.contract import describe_exception
 
@@ -413,7 +429,7 @@ def _verify_directory(
             _fail(f"{path.name}: index outside {protocol.id}'s {n} episodes")
     uploads = _UploadFiles(files, trusted.protocol_max_steps(protocol))
     try:
-        return trusted.rescore(protocol, uploads, controller, isolation)
+        return trusted.verify_run(protocol, uploads, controller, isolation)
     except _UploadLoadError as exc:
         _fail(str(exc))
     except Exception as exc:  # a verifier bug must never look like a verification failure
@@ -425,16 +441,16 @@ def _not_a_file(path: Path) -> str:
     return f"{path}: not a regular file" if path.exists() else f"{path} does not exist"
 
 
-def _report_directory(results: EvalResults) -> bool:
-    """Print the trusted results; True if every expected episode reproduced."""
-    from topple.results import VERIFY_ERROR_CODES
+def _report_directory(run: RunVerdict) -> bool:
+    """Print the trusted results; True if every expected episode reproduced.
 
-    _print_results(results)
-    episodes = results.episodes or []
-    failed = [e for e in episodes if e.error is not None and e.error.code in VERIFY_ERROR_CODES]
-    n = len(episodes)
-    if failed or not results.complete:
-        typer.echo(f"FAIL: {len(failed)} of {n} episodes failed verification")
+    The verdict comes from ``run.failed``, counted before redaction: a private protocol's
+    results list no episodes, so they cannot tell a forged run from a reproduced one.
+    """
+    _print_results(run.results)
+    n = run.results.aggregate.episodes
+    if not run.ok:
+        typer.echo(f"FAIL: {run.failed} of {n} episodes failed verification")
         return False
     typer.echo(f"OK: all {n} episodes reproduced")
     return True
@@ -476,7 +492,10 @@ def verify(
         typer.Option(help="Submission to record in --out results (hashed, never imported)."),
     ] = None,
     isolation: Annotated[
-        IsolationChoice, typer.Option(help="How the controller ran, recorded in --out results.")
+        IsolationChoice,
+        typer.Option(
+            help="How the controller ran, recorded in --out results (a label that nothing checks)."
+        ),
     ] = IsolationChoice.inprocess,
 ) -> None:
     """Re-simulate uploaded trajectories open loop and re-score them from the replay only.
@@ -487,8 +506,9 @@ def verify(
     if path.is_dir():
         if index is not None or seed is not None:
             _fail("--index and --seed apply to a single trajectory file")
-        results = _verify_directory(path, protocol, _controller_info(submission), iso)
-        ok = _report_directory(results)
+        run = _verify_directory(path, protocol, _controller_info(submission), iso)
+        ok = _report_directory(run)
+        results = run.results
     elif path.is_file():
         controller = _controller_info(submission)  # a bad --submission fails before any verdict
         binding, verdict = _verify_file(path, protocol, index, seed)

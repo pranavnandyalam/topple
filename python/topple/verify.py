@@ -30,6 +30,7 @@ from topple.evaluate import (
 )
 from topple.results import (
     RUN_ERROR_CODES,
+    VERIFY_ERROR_CODES,
     ControllerInfo,
     EpisodeResult,
     ErrorInfo,
@@ -83,6 +84,20 @@ class EpisodeVerdict:
     # before replaying); its ``action`` is the upload's checked raw output, which a replay cannot
     # re-derive
     result: EpisodeResult  # scored only from ``replay`` and the env's own metadata
+
+
+@dataclass(frozen=True)
+class RunVerdict:
+    """The trusted outcome of re-scoring a whole run (``verify_run``)."""
+
+    results: EvalResults  # the trusted results; redacted (episodes null) for a private protocol
+    failed: int  # episodes that did not verify (not_reproducible, incomplete or missing),
+    # counted before redaction
+
+    @property
+    def ok(self) -> bool:
+        """Every one of the protocol's episodes was uploaded and reproduced."""
+        return self.failed == 0
 
 
 @dataclass(frozen=True)
@@ -175,8 +190,20 @@ def rescore(
     ``isolation`` come from the trusted caller; nothing is copied from the uploads.
 
     Each index is looked up once, in order, and no upload is kept once it is verified, so a
-    mapping that loads on lookup holds one upload in memory at a time.
+    mapping that loads on lookup holds one upload in memory at a time. Whether the run verified
+    is ``verify_run``'s to say: a private protocol's results list no episodes.
     """
+    return verify_run(protocol, uploads, controller, isolation).results
+
+
+def verify_run(
+    protocol: EvalProtocol,
+    uploads: Mapping[int, Trajectory],
+    controller: ControllerInfo,
+    isolation: Isolation,
+) -> RunVerdict:
+    """``rescore``'s results, plus how many episodes did not verify (counted from the verdicts
+    before a private protocol's results are redacted)."""
     n = len(protocol.seeds)
     bad = [k for k in uploads if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k < n]
     if bad:
@@ -191,8 +218,9 @@ def rescore(
                 _missing(target) if upload is None else _verify(env, upload, target).result
             )
     complete = not any(e.error is not None and e.error.code == "missing" for e in episodes)
+    failed = sum(e.error is not None and e.error.code in VERIFY_ERROR_CODES for e in episodes)
     results = build_results(protocol, episodes, controller, isolation)
-    return results.model_copy(update={"complete": complete})
+    return RunVerdict(results.model_copy(update={"complete": complete}), failed)
 
 
 # ------------------------------------------------------------------ the checks, in order

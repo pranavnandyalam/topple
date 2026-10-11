@@ -20,9 +20,11 @@ from topple.traj import Trajectory
 from topple.verify import (
     ENV_META_FIELDS,
     EpisodeVerdict,
+    RunVerdict,
     protocol_max_steps,
     rescore,
     verify_episode,
+    verify_run,
     verify_with_seed,
 )
 from verify_support import (
@@ -461,6 +463,37 @@ def test_a_private_rescore_counts_forged_and_missing_episodes(
     assert again.aggregate.episodes == 3
     assert again.aggregate.score == pytest.approx(run.results.episodes[1].score / 3, abs=1e-12)
     assert again.aggregate.success_rate == run.results.episodes[1].success / 3
+
+
+PRIVATE_SALT = 2**127 + 1
+
+
+def test_verify_run_counts_failures_before_the_results_are_redacted(
+    honest_runs: dict[str, Honest],
+) -> None:
+    """§16: whether a run verified comes from the verdicts. A private protocol's results list no
+    episodes, so a count taken from them would call every forged run reproduced."""
+    run = honest_runs["lqr"]
+    private = replace(run.protocol, seed_set="private", salt=PRIVATE_SALT)
+    upload = run.uploads[0]
+    forged = replace(upload, push_force=upload.push_force + 1.0)
+    verdict = verify_run(private, {0: forged, 1: run.uploads[1]}, INFO, "container")
+    assert isinstance(verdict, RunVerdict)
+    assert verdict.results.episodes is None
+    assert verdict.failed == 2  # episode 0 does not reproduce, episode 2 is missing
+    assert not verdict.ok
+    assert verdict.results == rescore(private, {0: forged, 1: run.uploads[1]}, INFO, "container")
+    honest = verify_run(private, run.uploads, INFO, "container")
+    assert (honest.ok, honest.failed) == (True, 0)
+    assert honest.results == rescore(private, run.uploads, INFO, "container")
+
+
+def test_errors_of_the_run_itself_are_not_verification_failures(tmp_path: Path) -> None:
+    """An honest error report reproduces: the episode scores 0 but the run verified."""
+    errored = run_honest(public("clean", 2), explodes(30, RuntimeError("bug")), tmp_path)
+    verdict = verify_run(errored.protocol, errored.uploads, INFO, "inprocess")
+    assert verdict.results.aggregate.errors == 2
+    assert (verdict.ok, verdict.failed) == (True, 0)
 
 
 # ------------------------------------------------------------------ robustness

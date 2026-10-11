@@ -662,7 +662,7 @@ def test_a_crash_inside_rescore_exits_2(eval_dir: Path, monkeypatch: pytest.Monk
     def crash(*args: object, **kwargs: object) -> None:
         raise MemoryError("verifier ran out")
 
-    monkeypatch.setattr(topple.verify, "rescore", crash)
+    monkeypatch.setattr(topple.verify, "verify_run", crash)
     result = runner.invoke(app, ["verify", str(eval_dir)])
     assert result.exit_code == 2
     assert "verification crashed: MemoryError: verifier ran out" in result.output
@@ -890,6 +890,70 @@ def test_an_unreadable_part_of_a_submission_exits_2(
     assert f"cannot read 'bot/{locked.name}': Permission denied" in result.output
     assert "Traceback" not in result.output
     assert not (out / "results.json").exists()
+
+
+def test_a_private_directory_rescore_fails_on_a_forged_episode(
+    eval_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§16: pass/fail comes from the verdicts. A private protocol's results are redacted (no
+    episodes), so counting failures in them printed "OK: all 0 episodes reproduced"."""
+    from dataclasses import replace
+
+    import topple.cli as cli
+    from topple.traj import load_npz
+
+    run = _copy_run(eval_dir, tmp_path / "copy")
+    traj = load_npz(run / "traj_002.npz", max_steps=1000)
+    replace(traj, meta={**traj.meta, "robot_hash": "0" * 64}).save_npz(run / "traj_002.npz")
+    public_protocol = cli._protocol
+
+    def private(protocol_id: str) -> object:
+        return replace(public_protocol(protocol_id), seed_set="private", salt=2**127 + 1)
+
+    monkeypatch.setattr(cli, "_protocol", private)
+    forged = runner.invoke(app, ["verify", str(run)])
+    assert forged.exit_code == 1, forged.output
+    assert "FAIL: 1 of 20 episodes failed verification" in forged.output
+    honest = runner.invoke(app, ["verify", str(eval_dir)])
+    assert honest.exit_code == 0, honest.output
+    assert "OK: all 20 episodes reproduced" in honest.output
+    assert "seed" not in honest.output  # a private run prints no episode lines
+
+
+def test_untrusted_text_in_an_error_is_escaped(eval_dir: Path, tmp_path: Path) -> None:
+    """Terminal escapes, or a line break then ``::error::`` (a GitHub Actions workflow command),
+    in a path or a file name reach the error line escaped: one line, nothing raw."""
+    evil = tmp_path / "\x1b]0;pwned\x07\x1b[2J\n::error::evil.py"
+    result = runner.invoke(app, ["verify", str(eval_dir), "--submission", str(evil)])
+    assert result.exit_code == 2, result.output
+    assert result.output.startswith("error: cannot hash")
+    assert result.output.count("\n") == 1
+    for raw in ("\x1b", "\x07"):
+        assert raw not in result.output
+    assert "\\x1b]0;pwned\\x07\\x1b[2J\\n::error::evil.py" in result.output
+
+
+def test_printable_escapes_everything_a_terminal_or_ci_log_would_act_on() -> None:
+    from topple.cli import _printable
+
+    text = "ok é \t\n\r\x1b[31m\x07\u202e\u2028\udcff\x00"
+    assert _printable(text) == "ok é \\t\\n\\r\\x1b[31m\\x07\\u202e\\u2028\\udcff\\x00"
+
+
+@pytest.mark.parametrize("command", ["run", "eval"])
+def test_run_and_eval_say_the_controller_runs_in_process(command: str) -> None:
+    """Contract §8: in-process runs are for trusted code; the help says so where users look."""
+    result = runner.invoke(app, [command, "--help"])
+    assert result.exit_code == 0
+    text = " ".join(plain(result.output).replace("│", " ").split())
+    assert "runs the controller's code in this process" in text
+    assert "only run code you trust" in text
+
+
+def test_isolation_is_documented_as_an_unchecked_label() -> None:
+    result = runner.invoke(app, ["verify", "--help"])
+    text = " ".join(plain(result.output).replace("│", " ").split())
+    assert "a label that nothing checks" in text
 
 
 def test_a_bad_submission_fails_before_any_verdict_is_printed(tmp_path: Path) -> None:
