@@ -511,6 +511,20 @@ at `path` is replaced, never written through; a failed write leaves `path` as it
 videos, and the image `topple smoke` writes (`smoke.png` in the current directory by default),
 are written the same way.
 
+A checkout can also commit a directory as a symlink (`out -> ~/project`), which would send the
+default `out/run` and `out/eval` elsewhere. So the commands' output paths (the `--out` of
+`topple run`, `eval`, `verify` and `smoke`, and of `python -m topple.smoke`) are checked before
+anything runs: a **relative** path never passes through a symlink. Each of its directories that
+exists, the output directory itself included (for a file, the directory it goes in), is
+examined without following links (`lstat`), and a symlink among them exits 2 with `refusing to
+write through the symlink '<prefix>'`; one that cannot be examined (a component that is a file)
+exits 2 with `cannot write to <dir>: <reason>`. An **absolute** path is the caller's own choice
+and is followed as given (macOS's `/tmp`, a symlinked home directory), so a trusted job that
+writes into a checkout it does not trust uses a relative path there, or a directory outside the
+checkout. Limits: the check and the writes are separate steps, so a directory swapped for a
+symlink in between, by a process running alongside, is out of its reach; and the library writers
+(`Trajectory.save_npz`, `write_results`, `evaluate(traj_dir=…)`) take their paths as given.
+
 **Loading** (`load_npz(path, *, max_steps)`; `max_steps` is required, so every caller bounds T)
 reads the archive and each member by hand and raises `ValueError`, naming the file, for anything
 else, including unreadable, truncated or missing files and corrupted members:
@@ -782,7 +796,8 @@ terminal nor start a GitHub Actions workflow command.
     `{id: "unknown", sha256: <64 zeros>}` without `--submission`. `--submission` is resolved
     before anything is verified: one that cannot be hashed, or whose name is not valid UTF-8,
     exits 2 before any verdict is printed. `--isolation` is recorded as given: a label that
-    nothing checks (§15).
+    nothing checks (§15). A relative `--out` that passes through a symlink exits 2 before
+    anything is verified (§14).
 - `topple score FILE [--protocol P] [--index I | --seed S]` verifies first, then prints JSON:
   `ok, code, reason, bound, protocol, index, seed, score, success, error, metrics`, all from the
   verdict (so `seed` is null for a private protocol). Exit 1 if not ok (the score is then 0); an

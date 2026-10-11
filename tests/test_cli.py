@@ -1289,3 +1289,111 @@ def test_score_never_prints_a_private_seed(tmp_path: Path, monkeypatch: pytest.M
         "OK: balance-v1/clean episode 0: reproduced bit-exactly"
     )
     assert "1000" not in verified.output
+
+
+# ------------------------------------------------------------- planted output directories (§14)
+
+
+def _checkout_with_planted_out(tmp_path: Path, link: str, victim_files: list[str]) -> Path:
+    """A checkout whose ``link`` (``out`` or ``out/run``) is a committed symlink to another
+    project holding ``victim_files``."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    for name in victim_files:
+        (victim / name).parent.mkdir(parents=True, exist_ok=True)
+        (victim / name).write_text("precious")
+    checkout = tmp_path / "checkout"
+    (checkout / link).parent.mkdir(parents=True, exist_ok=True)
+    (checkout / link).symlink_to(victim)
+    return checkout
+
+
+def _untouched(tmp_path: Path, victim_files: list[str]) -> None:
+    victim = tmp_path / "victim"
+    assert sorted(str(p.relative_to(victim)) for p in victim.rglob("*") if p.is_file()) == sorted(
+        victim_files
+    )
+    assert all((victim / name).read_text() == "precious" for name in victim_files)
+
+
+@pytest.mark.parametrize("link", ["out", "out/{command}"])
+@pytest.mark.parametrize("command", ["run", "eval"])
+def test_a_default_output_directory_never_writes_through_a_planted_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, link: str
+) -> None:
+    """A branch can commit ``out`` (or ``out/run``) as a symlink to another project: the default
+    ``out/run`` and ``out/eval`` would drop results.json and trajectories there."""
+    link = link.format(command=command)
+    files = [f"{command}/results.json"] if link == "out" else ["results.json"]
+    checkout = _checkout_with_planted_out(tmp_path, link, files)
+    sub = _submission(tmp_path)
+    monkeypatch.chdir(checkout)
+    result = runner.invoke(app, [command, str(sub), *VIDEOS_OFF[command]])
+    assert result.exit_code == 2, result.output
+    assert result.output.startswith(f"error: refusing to write through the symlink '{link}'")
+    assert "Traceback" not in result.output
+    _untouched(tmp_path, files)
+
+
+def test_verify_out_never_writes_through_a_planted_symlink(
+    eval_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    checkout = _checkout_with_planted_out(tmp_path, "trusted", ["results.json"])
+    monkeypatch.chdir(checkout)
+    result = runner.invoke(app, ["verify", str(eval_dir), "--out", "trusted/results.json"])
+    assert result.exit_code == 2, result.output
+    assert result.output.startswith("error: refusing to write through the symlink 'trusted'")
+    _untouched(tmp_path, ["results.json"])
+
+
+def test_an_absolute_output_path_is_used_as_given(tmp_path: Path) -> None:
+    """An absolute path is the caller's own choice: symlinks on it (macOS's /tmp, a symlinked
+    home directory) are followed."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    out = tmp_path / "link" / "run"
+    result = runner.invoke(
+        app, ["run", str(_submission(tmp_path)), "--no-video", "--out", str(out)]
+    )
+    assert result.exit_code == 0, result.output
+    assert (real / "run" / "results.json").is_file()
+
+
+def test_smoke_never_writes_through_a_planted_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refused before anything renders, so this needs no GL backend."""
+    checkout = _checkout_with_planted_out(tmp_path, "shots", ["smoke.png"])
+    monkeypatch.chdir(checkout)
+    result = runner.invoke(app, ["smoke", "--out", "shots/smoke.png", "--steps", "1"])
+    assert result.exit_code == 2, result.output
+    assert result.output.startswith("error: refusing to write through the symlink 'shots'")
+    _untouched(tmp_path, ["smoke.png"])
+
+
+def test_the_default_output_directory_works_in_a_clean_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``out`` already there as a real directory (a previous run) is fine."""
+    checkout = tmp_path / "checkout"
+    (checkout / "out" / "eval").mkdir(parents=True)
+    sub = _submission(tmp_path)
+    monkeypatch.chdir(checkout)
+    result = runner.invoke(app, ["run", str(sub), "--no-video"])
+    assert result.exit_code == 0, result.output
+    assert sorted(p.name for p in (checkout / "out" / "run").iterdir()) == [
+        "results.json",
+        "traj_000.npz",
+    ]
+
+
+def test_a_relative_output_directory_that_cannot_be_examined_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "file").write_text("not a directory")
+    sub = _submission(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(app, ["run", str(sub), "--no-video", "--out", "file/run"])
+    assert result.exit_code == 2, result.output
+    assert result.output == "error: cannot write to file/run: Not a directory\n"

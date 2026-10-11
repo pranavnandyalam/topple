@@ -154,3 +154,30 @@ def test_done_when_command_writes_smoke_png(tmp_path: Path, headless_env: dict[s
     image = iio.imread(tmp_path / "smoke.png")
     assert image.shape == (240, 320, 3)
     assert image.std() > 1.0
+
+
+def test_main_never_writes_through_a_planted_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A relative ``--out`` through a directory symlink committed in a checkout exits 2 before
+    anything renders (contract §14)."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "shots").symlink_to(victim)
+    monkeypatch.chdir(checkout)
+    assert main(["--out", "shots/smoke.png", "--steps", "1"]) == 2
+    assert capsys.readouterr().err.startswith(
+        "error: refusing to write through the symlink 'shots'"
+    )
+    assert list(victim.iterdir()) == []
+
+
+def test_main_reports_an_output_directory_that_cannot_be_examined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "file").write_text("not a directory")
+    monkeypatch.chdir(tmp_path)
+    assert main(["--out", "file/sub/smoke.png", "--steps", "1"]) == 2
+    assert capsys.readouterr().err == "error: cannot write to file/sub: Not a directory\n"

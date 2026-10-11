@@ -13,7 +13,7 @@ from pathlib import Path
 import imageio.v3 as iio
 import mujoco
 
-from topple._atomic import replacement
+from topple._atomic import SymlinkedOutputError, check_output_directory, replacement
 from topple.rendering import RenderingUnavailableError, make_renderer
 
 SMOKE_XML = """
@@ -96,6 +96,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=Path("smoke.png"))
     parser.add_argument("--steps", type=_positive_int, default=1000)
     args = parser.parse_args(argv)
+    try:  # a relative --out never passes through a symlink (contract §14)
+        check_output_directory(args.out.parent)
+    except SymlinkedOutputError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        print(f"error: cannot write to {args.out.parent}: {reason}", file=sys.stderr)
+        return 2
     try:
         result = run_smoke(args.out, steps=args.steps)
     except RenderingUnavailableError as exc:

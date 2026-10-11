@@ -89,6 +89,19 @@ def _fail(message: str) -> NoReturn:
     raise typer.Exit(code=2)
 
 
+def _check_output(directory: Path) -> None:
+    """Exit 2, before anything runs, if the output ``directory`` is a relative path through a
+    symlink (a checkout can commit ``out`` as one, contract §14) or cannot be examined."""
+    from topple._atomic import SymlinkedOutputError, check_output_directory
+
+    try:
+        check_output_directory(directory)
+    except SymlinkedOutputError as exc:
+        _fail(str(exc))
+    except OSError as exc:
+        _fail(f"cannot write to {directory}: {exc.strerror or type(exc).__name__}")
+
+
 @app.command()
 def version() -> None:
     """Print the installed Topple version."""
@@ -104,6 +117,7 @@ def smoke(
     from topple.rendering import RenderingUnavailableError
     from topple.smoke import run_smoke
 
+    _check_output(out.parent)
     try:
         result = run_smoke(out, steps=steps)
     except RenderingUnavailableError as exc:
@@ -209,6 +223,7 @@ def run(
 
     It runs the controller's code in this process, with your privileges: only run code you trust.
     """
+    _check_output(out)
     sub = _load(controller)
     proto = _protocol(protocol)
     proto = replace(proto, seeds=(proto.seeds[0] if seed is None else seed,))
@@ -230,6 +245,7 @@ def eval_cmd(
 
     It runs the controller's code in this process, with your privileges: only run code you trust.
     """
+    _check_output(out)
     sub = _load(controller)
     proto = _protocol(protocol)
     results = _evaluate(sub, proto, out)
@@ -533,6 +549,8 @@ def verify(
 
     Exit 0: reproduced. Exit 1: verification failed. Exit 2: usage or load error.
     """
+    if out is not None:
+        _check_output(out.parent)
     iso: Isolation = isolation.value
     if _kind(path) == "directory":
         if index is not None or seed is not None:
