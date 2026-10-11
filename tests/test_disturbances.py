@@ -288,8 +288,8 @@ BAD_SCENARIOS: dict[str, Callable[[dict[str, Any]], None]] = {
     "pushes unsorted": swap_pushes,
     "pushes share a step": duplicate_push,
     "pushes overlap": overlap_pushes,
-    "push outlasts the episode": push_fields(
-        0, magnitude_n=0.0, n_substeps=MAX_STEPS * FRAME_SKIP + 1
+    "push outlasts the episode": push_fields(  # the last push: no later one for it to overlap
+        1, magnitude_n=0.0, n_substeps=MAX_STEPS * FRAME_SKIP + 1
     ),
     "push impulse above the cap": push_fields(0, magnitude_n=MAX_PUSH_FORCE_N, n_substeps=51),
     "push substeps not exact": setter("pushes", 0, "n_substeps", value=2**53 + 1),
@@ -496,6 +496,23 @@ def test_a_sustained_push_is_bounded_by_its_impulse() -> None:
         Scenario.from_dict(data, clock=CLOCK)
     push_fields(0, magnitude_n=0.0)(data)  # a zero-force push may last the whole episode
     assert Scenario.from_dict(data, clock=CLOCK).pushes[0].n_substeps == MAX_STEPS * FRAME_SKIP
+
+
+def test_a_push_lasts_no_longer_than_the_episode() -> None:
+    """§9: with the clock known, ``n_substeps <= max_steps * frame_skip``. A zero-force push
+    passes the impulse cap at any length and a lone push cannot overlap another, so only this
+    bound refuses one that outlasts the episode."""
+    limit = MAX_STEPS * FRAME_SKIP
+    data = with_two_pushes()
+    data["pushes"] = data["pushes"][:1]
+    push_fields(0, start_step=0, magnitude_n=0.0, n_substeps=limit)(data)
+    assert Scenario.from_dict(data, clock=CLOCK).pushes[0].n_substeps == limit
+    push_fields(0, n_substeps=limit + 1)(data)
+    with pytest.raises(
+        ValueError, match=rf"pushes\[0\]\.n_substeps = {limit + 1} is outside \[1, {limit}\]"
+    ):
+        Scenario.from_dict(data, clock=CLOCK)
+    assert Scenario.from_dict(data).pushes[0].n_substeps == limit + 1  # no clock, no such bound
 
 
 @pytest.mark.parametrize("field", ["start_step", "n_substeps"])
