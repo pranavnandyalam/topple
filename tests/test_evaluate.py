@@ -885,9 +885,23 @@ def deleted_code() -> BaseException:
 def test_only_the_harness_runner_error_names_a_code(
     make: Callable[[], BaseException], detail: str
 ) -> None:
-    """Anything but ``RunnerError`` itself, holding the code and detail it was built with, is an
-    ordinary ``exception``: in-process code cannot smuggle a hostile value into the record."""
+    """Anything but ``RunnerError`` itself, holding an exact-``str`` runner code and an
+    exact-``str`` detail, is an ordinary ``exception``: in-process code cannot smuggle a hostile
+    value into the record."""
     run = run_episode(
         BalanceEnv("ideal", record=True), lambda spec: RaisesAt("act", make()), seed=0, index=0
     )
     assert run.result.error == ErrorInfo(code="exception", step=5, detail=detail)
+
+
+def test_a_runner_error_names_the_code_it_holds_when_raised() -> None:
+    """§15: what counts is the exact ``str`` code and detail the instance holds when it is
+    raised, reassigned or not; a valid code only picks another zero-scoring error."""
+    error = RunnerError("timeout", "built with")
+    error.code = "crash"
+    error.detail = "reassigned"
+    run = run_episode(
+        BalanceEnv("ideal", record=True), lambda spec: RaisesAt("act", error), seed=0, index=0
+    )
+    assert run.result.error == ErrorInfo(code="crash", step=5, detail="reassigned")
+    assert run.result.score == 0.0

@@ -245,7 +245,9 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   Only salted private-seed runs produced by trusted CI are rankable (Phase 3).
 - **Misbehaviour never crashes the harness.** Anything the controller raises in `make_controller`,
   `reset` or `act` (any `BaseException`, including `SystemExit` and `GeneratorExit`) ends the
-  episode with error `exception` at that step; an unusable return value is `invalid_action` (§7).
+  episode with error `exception` at that step, except a genuine `topple.evaluate.RunnerError`,
+  which the runner's controller proxy raises to end it with the runner's own code (§15); an
+  unusable return value is `invalid_action` (§7).
   Errored episodes score 0. Only `KeyboardInterrupt` (the operator stopping the run) propagates.
   This holds even for exceptions whose own machinery is hostile (a failing `__str__`, a metaclass
   `__name__` that raises, a `str` subclass as message or name, a raising `__class__`): the error
@@ -542,8 +544,11 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
   `incomplete`, `not_reproducible` and `missing`. Every error scores 0. `timeout`, `crash`,
   `protocol`, `output_limit` and `load_error` are the runner's (Phase 3): its controller proxy
   raises `topple.evaluate.RunnerError(code, detail)` from `make_controller`, `reset` or `act`,
-  and the episode ends with that code at that step. Only that exact class, holding the code and
-  detail it was built with, names a code; anything else raised there is `exception` (§8).
+  and the episode ends with that code at that step. Only that exact class (not a subclass) names
+  a code, and only while its `code` attribute is one of those five codes and its `detail` a
+  `str`, both exact `str` objects, as the constructor requires (values reassigned since count
+  as long as they qualify). Anything else raised there, including an instance whose `code` or
+  `detail` was deleted or set to anything else, is `exception` (§8).
 - **`complete`** is true only when every one of the protocol's N episodes is present and none is
   `missing`. A single-seed `topple run` and a single-file `topple verify --out` write false.
 - **`isolation`** (`inprocess`/`subprocess`/`container`) records how the controller ran. It does

@@ -66,9 +66,11 @@ class RunnerError(Exception):
     (no reply in time, a crashed subprocess, a malformed or oversized reply, a submission that
     would not load): the episode ends with ``code`` (contract §15) instead of ``exception``.
 
-    Only this exact class, holding the code and detail it was built with, names a code; a
-    subclass, or an instance whose attributes were changed, is an ordinary exception. An
-    in-process controller could raise it too, which only picks another zero-scoring code.
+    Only this exact class names a code, and only while ``code`` is a runner error code and
+    ``detail`` a ``str``, both exact ``str`` objects, as the constructor requires (values
+    reassigned since count as long as they qualify). A subclass, or an instance whose ``code`` or
+    ``detail`` was deleted or set to anything else, is an ordinary exception. An in-process
+    controller could raise it too, which only picks another zero-scoring code.
     """
 
     def __init__(self, code: RunnerErrorCode, detail: str) -> None:
