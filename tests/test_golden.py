@@ -76,6 +76,19 @@ EPISODES: dict[str, dict[str, dict[int, EpisodeKey]]] = {
             1002: (83.74288560556353, True, 10.0),
         },
     },
+    # The CI platform (GitHub Actions ubuntu-24.04), the source of truth for ranked scores.
+    "linux-x86_64": {
+        "pid": {
+            1000: (92.06970433366325, True, 10.0),
+            1001: (77.66275112229928, True, 10.0),
+            1002: (46.37032752230015, False, 5.98),
+        },
+        "lqr": {
+            1000: (91.52687435124143, True, 10.0),
+            1001: (85.40370568144897, True, 10.0),
+            1002: (83.79327852535813, True, 10.0),
+        },
+    },
 }
 
 FACTORIES: dict[str, ControllerFactory] = {
