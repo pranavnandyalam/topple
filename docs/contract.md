@@ -460,8 +460,11 @@ scenarios (seeds 0, 1000 and 2**53−1 on every preset), the bundle and protocol
 PID/LQR baseline scores on public seeds 1000–1002 of `standard` (per platform, to 1e-9), so such
 a change cannot land unnoticed. CI (`linux-x86_64`, the platform ranked scores come from)
 enforces that platform's scores on every push; the `darwin-arm64` scores are enforced only by
-test runs on Apple Silicon, and any other platform skips them and prints what it measured. A
-deliberate re-pin updates every platform's scores in one change.
+test runs on Apple Silicon, and any other platform skips them and prints what it measured. In CI
+(`GITHUB_ACTIONS=true`) they are never skipped: a platform without pins fails, and so does any
+platform but `linux-x86_64`, so a job moved to another runner can never pass while enforcing
+none of the ranked platform's pins. A deliberate re-pin updates every platform's scores in one
+change.
 
 - `bundle_hash()` = sha256 of the tag `topple.bundle/1\n`, then, for each bundle file in POSIX-path
   order, `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths, path relative to the bundle

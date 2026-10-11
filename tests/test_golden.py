@@ -12,20 +12,24 @@ bits and sha256 are portable, and scenario draws apply their affine maps in Pyth
 ``topple.disturbances._uniforms``), so the scenario file must pass unchanged on every platform.
 Episode scores come from MuJoCo physics, which is only deterministic per platform (PLAN.md, trust
 model), so they are pinned per platform tag; a platform without pins skips and prints what it
-measured.
+measured, except in CI.
 
 Who enforces which pins: CI (GitHub Actions ubuntu-24.04, ``linux-x86_64``, the platform ranked
-scores come from) checks the linux-x86_64 scores on every push. The ``darwin-arm64`` scores, the
-development platform's, are checked only when the suite runs on an Apple Silicon Mac; no CI job
-runs there. So a deliberate re-pin (after a reviewed physics change, or a dependency bump that
-moves scores) updates every platform in ``EPISODES`` in the same change: the darwin-arm64 values
-from a local run of this file, the linux-x86_64 values from the CI failure message. Both print
-every measured value. Re-pinning only the platform that failed would leave the other stale.
+scores come from) checks the linux-x86_64 scores on every push. In CI (``GITHUB_ACTIONS=true``)
+a platform without pins fails instead of skipping, and so does any platform but linux-x86_64: a
+runner moved to another platform would otherwise pass while enforcing no pin, or not the ranked
+platform's. The ``darwin-arm64`` scores, the development platform's, are checked only when the
+suite runs on an Apple Silicon Mac; no CI job runs there. So a deliberate re-pin (after a
+reviewed physics change, or a dependency bump that moves scores) updates every platform in
+``EPISODES`` in the same change: the darwin-arm64 values from a local run of this file, the
+linux-x86_64 values from the CI failure message. Both print every measured value. Re-pinning
+only the platform that failed would leave the other stale.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -67,6 +71,9 @@ PROTOCOL_HASHES = {
 PRIVATE_SEEDS = (1, 2, 3)
 PRIVATE_SALT = 2**127 + 5
 PRIVATE_PROTOCOL_HASH = "aa7220e396ffefda76e044adbeb8f496d7bb12a45fa36c81e55e069b180c749e"
+
+RANKED_PLATFORM = "linux-x86_64"
+"""Where CI runs and ranked scores come from (contract §13)."""
 
 # platform tag -> controller -> seed -> (score, success, time_upright_s), balance-v1/standard.
 EpisodeKey = tuple[float, bool, float]
@@ -222,13 +229,41 @@ def test_every_platform_pins_the_same_episodes() -> None:
         assert all(set(scores) == set(EPISODE_SEEDS) for scores in table.values())
 
 
+def in_ci() -> bool:
+    """GitHub Actions sets ``GITHUB_ACTIONS=true`` in every step."""
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def pins_for(tag: str, name: str, measured: dict[int, EpisodeKey]) -> dict[int, EpisodeKey]:
+    """``name``'s pinned scores on platform ``tag``. Without pins: skip and print what was
+    measured, except in CI, where a skip would pass the job while enforcing no pin: fail."""
+    if tag in EPISODES:
+        return EPISODES[tag][name]
+    message = f"no golden episode scores for {tag}; measured {name}: {measured!r}"
+    if in_ci():
+        pytest.fail(f"{message}. CI must run on {RANKED_PLATFORM}, whose scores are pinned")
+    pytest.skip(message)
+
+
+def check_ci_platform(tag: str) -> None:
+    """In CI, ``tag`` must be the platform ranked scores come from, so that CI enforces its
+    pins; outside CI there is nothing to check."""
+    if in_ci():
+        assert tag == RANKED_PLATFORM, (
+            f"CI runs on {tag}, not {RANKED_PLATFORM}: its golden scores would go unchecked "
+            "(contract §13); move the job back or change the ranked platform deliberately"
+        )
+
+
+def test_ci_runs_on_the_ranked_platform() -> None:
+    check_ci_platform(platform_tag())
+
+
 @pytest.mark.parametrize("name", sorted(FACTORIES))
 def test_baseline_episode_scores_known_answers(name: str) -> None:
     tag = platform_tag()
     measured = _measure(name)
-    if tag not in EPISODES:
-        pytest.skip(f"no golden episode scores for {tag}; measured {name}: {measured!r}")
-    expected = EPISODES[tag][name]
+    expected = pins_for(tag, name, measured)
     assert set(measured) == set(expected) == set(EPISODE_SEEDS)
     for seed, (score, success, upright) in expected.items():
         got = measured[seed]
@@ -239,3 +274,49 @@ def test_baseline_episode_scores_known_answers(name: str) -> None:
         assert got[0] == pytest.approx(score, abs=SCORE_TOL, rel=0), context
         assert got[1] is success, context
         assert got[2] == upright, context
+
+
+UNPINNED = "linux-aarch64"  # a GitHub-hosted arm runner, which has no pins
+
+
+@pytest.mark.parametrize(
+    ("ci", "outcome"), [(True, pytest.fail.Exception), (False, pytest.skip.Exception)]
+)
+def test_an_unpinned_platform_fails_in_ci_and_skips_elsewhere(
+    monkeypatch: pytest.MonkeyPatch, ci: bool, outcome: type[BaseException]
+) -> None:
+    """In CI a skip would pass the job while enforcing no score pin at all."""
+    if ci:
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    else:
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    with pytest.raises(outcome, match=f"no golden episode scores for {UNPINNED}; measured pid"):
+        pins_for(UNPINNED, "pid", {})
+
+
+def test_a_pinned_platform_returns_its_pins(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    assert pins_for("linux-x86_64", "lqr", {}) is EPISODES["linux-x86_64"]["lqr"]
+
+
+@pytest.mark.parametrize(
+    ("ci", "tag", "ok"),
+    [
+        (True, "linux-x86_64", True),
+        (True, "darwin-arm64", False),  # pinned, but not the platform ranked scores come from
+        (True, UNPINNED, False),
+        (False, UNPINNED, True),  # outside CI there is nothing to check
+    ],
+)
+def test_ci_must_run_on_the_ranked_platform(
+    monkeypatch: pytest.MonkeyPatch, ci: bool, tag: str, ok: bool
+) -> None:
+    if ci:
+        monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    else:
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    if ok:
+        check_ci_platform(tag)
+    else:
+        with pytest.raises(AssertionError, match=f"CI runs on {tag}, not linux-x86_64"):
+            check_ci_platform(tag)
