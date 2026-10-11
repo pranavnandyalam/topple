@@ -581,7 +581,8 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         return not (np.isfinite(d.qpos).all() and np.isfinite(d.qvel).all())
 
     def _finite_state(self) -> bool:
-        """Whether MuJoCo's state and everything derived from it are finite (after a reset)."""
+        """Whether the state, its accelerations and the sensor readings are all finite (checked
+        after a reset's ``mj_forward``)."""
         d = self.data
         return all(np.isfinite(a).all() for a in (d.qpos, d.qvel, d.qacc, d.sensordata))
 

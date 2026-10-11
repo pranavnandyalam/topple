@@ -50,8 +50,12 @@ TIRE_TYPES = frozenset(
 AXIAL_TIRE_TYPES = frozenset(
     int(t) for t in (mujoco.mjtGeom.mjGEOM_CYLINDER, mujoco.mjtGeom.mjGEOM_CAPSULE)
 )
-AXIS_TOLERANCE = 1e-6  # |cos| of the angle between two axes that count as parallel, minus 1
-TIRE_CENTRE_TOLERANCE_M = 1e-6  # how far a tire's centre may sit from its hinge axis line
+# Two axes count as parallel when 1 - |cos| of the angle between them is at most this (the IMU
+# site's axes as aligned with the chassis's when 1 - cos is, sign included).
+AXIS_TOLERANCE = 1e-6
+# How far a tire's centre may sit from its hinge axis line or from the chassis y axis (the
+# axle), and how far the two centres' y coordinates may be from opposite.
+TIRE_CENTRE_TOLERANCE_M = 1e-6
 _FILE_ATTRS = ("file", "fileright", "fileleft", "fileup", "filedown", "filefront", "fileback")
 _MESH_DIR_TAGS = frozenset({"mesh", "skin", "hfield"})  # MuJoCo resolves these via meshdir
 _SUBMODEL_TAG = "model"  # <asset><model file="..."/>: a whole MJCF that <attach> places
