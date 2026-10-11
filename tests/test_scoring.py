@@ -101,8 +101,9 @@ def test_survival_gates_secondary_terms() -> None:
 
 
 def test_a_timeout_before_max_steps_is_not_survival() -> None:
-    """The env records a controller error as reason "timeout" at the step it happened
-    (contract §14), so only ``T == max_steps`` tells survival from an error at step 400."""
+    """Survival is a truncation: reason "timeout" and ``T == max_steps`` (§12). A trajectory that
+    says "timeout" at step 400 (the env records an error-ended episode as "error", so only a
+    hand-made file can) is not a survivor."""
     m = episode_metrics(synthetic(400, max_steps=1000, termination="timeout"), MOTOR)
     assert m.termination == "timeout"
     assert not m.survived

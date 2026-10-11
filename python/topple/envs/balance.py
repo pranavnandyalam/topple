@@ -398,6 +398,14 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             rows.append(d.qpos.copy())
         self._epilogue = rows
 
+    def _recorded_end(self) -> str:
+        """How the recorded episode ended (contract §11): the env's own termination reason,
+        ``timeout`` once it truncated at ``max_steps``, else ``error``: it was stopped before the
+        env ended it, which the harness does only for an error (§8, §15)."""
+        if self._termination is not None:
+            return self._termination
+        return "timeout" if self._step_count >= self.max_steps else "error"
+
     def trajectory(self, extra_meta: dict[str, Any] | None = None) -> Trajectory:
         if not self.record or self._scenario is None:
             raise RuntimeError("construct the env with record=True and run an episode first")
@@ -419,7 +427,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             },
             "wheel_sign": list(self.binding.wheel_sign),
             "robot_hash": robot_hash(self.robot_xml, self.params),
-            "termination": {"step": self._step_count, "reason": self._termination or "timeout"},
+            "termination": {"step": self._step_count, "reason": self._recorded_end()},
             "versions": {
                 "topple": __version__,
                 "mujoco": mujoco.__version__,

@@ -390,6 +390,12 @@ LQR 86.5%, PID 64.5%, both 100% on `clean`). Force is capped at 50 N.
 - `sim_unstable`: MuJoCo warnings BADQACC/BADQVEL/BADQPOS or non-finite state → episode error,
   score 0. The failed substep is rolled back so the record stays finite. Auto-reset is disabled.
 - `truncated` when `k == max_steps` and not terminated.
+- **Recorded reason.** A trajectory's `termination.reason` (§14), which `metrics.termination`
+  copies (§12), is the env's own reason (`fell`, `floor_contact`, `sim_unstable`), `timeout`
+  for a truncation at max_steps, or `error` for an episode stopped before the env ended it: the
+  harness stops an episode early only for an error (§8, §15), recorded in `meta.error` at that
+  step. So `timeout` always means a survivor, and an episode a runner ended with its `timeout`
+  error reads `error`.
 - **Epilogue.** After a fall (`fell`, `floor_contact`) or a controller error, 1.0 s (100 control
   steps) is simulated with `ctrl = 0` and no controller calls, for replays only; it never affects
   metrics. There is no epilogue after truncation (a surviving robot's replay ends upright) or after
@@ -490,7 +496,7 @@ pickles, no strings). Row `k` of state arrays is the state at `t = k·control_dt
 | `gyro`, `accel` | T × 3 | f4 | last-substep IMU readings (after bias/noise) |
 | `push_force` | T × 3 | f8 | world-frame push force active during step k (0 if none) |
 | `epilogue_qpos` | E × nq | f8 | the 1 s epilogue (E = 100) after a fall or a controller error (§11); E = 0 otherwise. Replay only |
-| `meta_json` | n | u1 | UTF-8 JSON: format, challenge, preset, episode_index, scenario, versions, robot_hash, wheel_sign, joint addresses, termination {step, reason}, error (null or {code, step, detail}), control_dt, timestep, frame_skip, max_steps, obs schema and features |
+| `meta_json` | n | u1 | UTF-8 JSON: format, challenge, preset, episode_index, scenario, versions, robot_hash, wheel_sign, joint addresses, termination {step, reason (§11)}, error (null or {code, step, detail}), control_dt, timestep, frame_skip, max_steps, obs schema and features |
 
 If the controller errors at step `k`, the episode stops there (T = k) and the error is stored in
 `meta.error`. The env is a pure function of (protocol, scenario, ctrl sequence), so a trajectory

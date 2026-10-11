@@ -229,16 +229,64 @@ class FailsLate:
 
 
 def test_an_errored_episode_did_not_survive() -> None:
-    """The trajectory stops at the error with reason "timeout" (§14), so ``survived`` hinges on
-    ``T == max_steps``: an episode that raised at step 400 must never report survival."""
+    """The trajectory stops at the error with reason "error" (§11, §14), never "timeout", which
+    means survival: an episode that raised at step 400 must never look like a survivor."""
     env = BalanceEnv("ideal", record=True)
     run = run_episode(env, lambda spec: FailsLate(400), seed=0, index=0)
     assert run.result.error is not None
     assert (run.result.error.code, run.result.error.step) == ("exception", 400)
-    assert run.trajectory.meta["termination"] == {"step": 400, "reason": "timeout"}
+    assert run.trajectory.meta["termination"] == {"step": 400, "reason": "error"}
     assert run.result.metrics is not None
+    assert run.result.metrics["termination"] == "error"
     assert run.result.metrics["survived"] is False
     assert (run.result.score, run.result.success) == (0.0, False)
+
+
+def _broken_factory(spec: TaskSpec) -> Zero:
+    raise ImportError("missing dependency")
+
+
+class BreaksAt(PIDController):
+    """Balances, then from step ``at`` on raises ``payload`` or returns it as the action."""
+
+    def __init__(self, at: int, payload: Any) -> None:
+        super().__init__()
+        self.at, self.payload, self.k = at, payload, 0
+
+    def act(self, obs: BalancerObs) -> Any:
+        self.k += 1
+        if self.k <= self.at:
+            return super().act(obs)
+        if isinstance(self.payload, BaseException):
+            raise self.payload
+        return self.payload
+
+
+@pytest.mark.parametrize(
+    ("factory", "reason", "steps", "code"),
+    [
+        (pid, "timeout", 1000, None),
+        (lambda spec: Zero(), "fell", None, None),
+        (lambda spec: BreaksAt(300, RuntimeError("bug")), "error", 300, "exception"),
+        (lambda spec: BreaksAt(300, (float("nan"), 0.0)), "error", 300, "invalid_action"),
+        (lambda spec: BreaksAt(300, RunnerError("timeout", "no reply")), "error", 300, "timeout"),
+        (_broken_factory, "error", 0, "exception"),
+    ],
+    ids=["survives", "falls", "raises", "invalid action", "runner timeout", "factory fails"],
+)
+def test_the_recorded_termination_tells_how_the_episode_ended(
+    factory: Any, reason: str, steps: int | None, code: str | None
+) -> None:
+    """§11: the env's own reason, "timeout" only for a truncation at max_steps, and "error" for
+    an episode the harness stopped because of an error, so a runner's ``timeout`` error never
+    reads as a 10-second survivor in the metrics."""
+    run = run_episode(BalanceEnv("ideal", record=True), factory, seed=0, index=0)
+    assert run.trajectory.meta["termination"]["reason"] == reason
+    assert run.result.metrics is not None
+    assert run.result.metrics["termination"] == reason
+    if steps is not None:
+        assert run.trajectory.steps == steps
+    assert (run.result.error.code if run.result.error else None) == code
 
 
 class CountsActs(PIDController):
