@@ -9,6 +9,79 @@
 push a controller, and get back a deterministic score, a crash-test rating, an AI coach's fix and a
 replay anyone can watch and poke in the browser. Free, Mac-native, zero-install to try.
 
+
+---
+
+## 0. Direction update (2026-10-11): a workbench for your own robot projects
+
+Pranav's direction: Topple should be **a place where people can build, test and simulate their
+own robot projects**, not only compete on our balancer. There should also be an **Arena** where,
+for example, FRC teams practice driving their own robot for competition. The leaderboard, seasons
+and Sumo stay, as the community layer on top of the workbench.
+
+**What changes**
+1. **Bring your own robot is central.** People import a robot from CAD (Onshape via
+   `onshape-to-robot`, URDF) or MJCF, start from templates (balancer, rover/drivetrain, arm,
+   quadruped), and edit it visually. This moves forward from Phases 8, 12 and 13.
+2. **People define their own tests.** The `challenge.yaml` format (Phase 9) becomes a general
+   *test scenario*: goals, pushes, terrain, pass/fail checks, written by anyone.
+3. **Testing is the core feature.** Crash-test ratings (Phase 4), CI on every commit (Phase 3) and
+   sim-to-real checks (Phase 8) are tools people run on *their own* projects. Competing is optional.
+4. **Many ways to control the robot.** Write Python, tune PID, train RL with one command, export to
+   a microcontroller, or ask the AI coach about your own design.
+5. **Robot validation becomes core work.** Every user brings their own robot, so the items in
+   `docs/design/deferred-risks.md` (e.g. a hidden mass below the floor making a passive pendulum)
+   must be closed before user robots are accepted.
+
+**Studio: desktop + browser, one codebase.**
+- *Desktop app* (`topple studio`, later wrapped with Tauri): the main workspace. It opens project
+  folders, imports CAD, runs long simulations and RL training on the user's own CPU/GPU, and talks
+  to hardware over USB/Bluetooth. No server cost.
+- *Browser:* viewing, sharing and quick tries. A link to someone's robot opens instantly; replays,
+  the Arena and classrooms stay zero-install (Chromebooks).
+- The web UI is built once; the desktop app adds local power. The site can also be an installable
+  PWA.
+
+**Arena: practice and play, including FRC driver practice.**
+- Two modes: a *sandbox* (shove and test any robot) and *match modes*. FRC drive practice comes
+  first; Sumo and seasons come later.
+- FRC practice:
+  - the team's own robot (Onshape import) on the current season's field (FIRST publishes field CAD
+    each January), with game pieces and scoring zones;
+  - real driving with a gamepad or driver-station controller (browser Gamepad API), and tank,
+    arcade, swerve and mecanum drivetrains with realistic motor limits, weight, traction and
+    bumper collisions;
+  - the team's real WPILib/RobotPy code run against the sim (WPILib simulation interface), so
+    autonomous routines and driver assists are tested before the robot exists;
+  - drills (cycle times, intake, defence), timed matches with scoring, ghost replays of the best
+    run, and per-driver stats over time;
+  - multiplayer alliances and scrimmages between teams over WebRTC.
+- Edge over existing FRC sims (e.g. xRC Simulator): *your* robot + *your* code + testing tools.
+- Needs: swerve/mecanum drivetrain models, game-piece physics, and a field format.
+- Timing: kickoff is early January and competitions run Feb–Apr, so the FRC Arena must be ready by a
+  kickoff to be useful that season.
+- Check FIRST's terms for field CAD and game names before a public launch.
+
+**Revised build order** (phase numbers below are kept for references; this is the order to build):
+1. Phases 0–2 as planned (0–1 merged; 2 designed).
+2. **Studio:** a project format, a desktop + web workspace and a live simulator.
+3. **Your own robot:** import (CAD/URDF/MJCF), templates, a visual editor, and robot validation
+   hardened against `deferred-risks.md`.
+4. **Test scenarios + crash-test rating** (old Phase 4, generalized to user scenarios).
+5. **Arena:** sandbox + FRC drive practice (drivetrains, fields, gamepad, team code, multiplayer).
+6. **Robot CI action** on the user's own repo (old Phase 3).
+7. **AI Coach + autotune** for any project (old Phase 6).
+8. **Sim-to-real:** hardware export and fidelity checks (old Phase 8).
+9. Community layer: sharing, leaderboards, seasons, Sumo (old Phases 5 and 7), then classrooms and
+   open challenges (old 9) and the extensions (old 10–15).
+
+**Open questions for Pranav**
+- Main user: hobbyists/makers, students and FRC teams, or researchers? This decides how simple vs.
+  powerful the UI is.
+- Robot types: mostly wheeled/balancing, or any robot (arms, legs, drones)?
+- Is hardware (running controllers on a real board) central or optional?
+- Which FRC season is the target (e.g. ready by the January 2027 kickoff)?
+
 ---
 
 ## 1. Why this, why now (research summary, Oct 2026)
@@ -355,6 +428,7 @@ parts ordering, which should happen in month 2 to absorb shipping time.
 5. **Workflow:** review-agent gate per phase, then auto-continue (see Review gate).
 6. **Hardware:** decide by month 2. UMich makerspaces for fabrication; Great Lakes HPC for GPU work.
 7. **Accounts** (Cloudflare, Onshape EDU, domain, optional Anthropic API key): created when a phase needs them, with Pranav doing the signup.
+8. **Direction (2026-10-11):** a workbench for people's own robot projects (Studio: desktop + browser), plus an Arena with FRC drive practice. See section 0 for the revised build order.
 
 ---
 
