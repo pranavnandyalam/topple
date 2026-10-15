@@ -6,7 +6,8 @@ v5 resolves re-critique round 3. Every issue from the six critiques (`wf_3f0c2a9
 PR #3); its changes are rows S1–S22 of the log's "Sync with merged Phase 1". v5.2 fixes the 18
 findings of the sync's adversarial verification (rows V1–V18 of the log's "Sync verification").
 v5.3 records slices 1a, 1b and 1c's resolved deviations (rows B1–B12 of the log's "Slice 1a build",
-B13–B16 of "Slice 1b build", B17–B26 of "Slice 1c build") and the linux-x86_64 recalibration
+B13–B16 of "Slice 1b build", B17–B26 of "Slice 1c build"), slice 2's torch-free half (rows B27–B36
+of "Slice 2 torch-free build") and the linux-x86_64 recalibration
 (E_ref 13.0 → 13.1; rows R1–R6 of the log's "Linux recalibration") and Pranav's answers to the
 open questions (rows A1–A8 of "Owner answers"), which keep the waypoint scene identical to
 balance-v1's (§8.2).
@@ -132,17 +133,21 @@ The dev box is a shared 48 GB / 18-core laptop; a past run exhausted its memory.
   - elapsed > `max_wall_clock_s` → `wall_clock_abort` (runaway guard only: balance 2,400,
     waypoint 3,600; about 4.5× the expected duration).
 
-  Each stops training, runs the final snapshot + selection eval, sets the flag and exits 4.
+  Each stops training, runs the final snapshot + selection eval and sets the flag; `topple train`
+  exits 4 when the finished run's `train_meta.flags` holds an abort flag.
 - **Aborted runs.** A run with any abort flag is never shipped or reported as a result; §2.5
   candidates exclude it and `topple export` without `--report-only` refuses it (exit 2). A
   `wall_clock_abort` run is re-run with `topple train ... --retry`: it renames the existing `--out`
-  to `<out>.attempt<k>` (k = 1, 2; only if its `train_meta.json` carries `wall_clock_abort`) and
-  starts afresh with the same seed (up to 2 re-runs, after which work waits for lower load). The
+  to `<out>.attempt<k>` (k = 1, 2; only if its `train_meta.json` carries `wall_clock_abort` and the
+  re-run's effective `config_sha256`, i.e. the same config and seed; only after
+  `topple.train.learn` imports, so a missing train extra never moves a run aside) and starts
+  afresh with the same seed (up to 2 re-runs, after which work waits for lower load). The
   re-run MUST reproduce the aborted attempt's `onnx_sha256` at every label both reached;
   otherwise it gets flag `nondeterministic` and is not reportable (G10). `phase2_results.py`
   globs `runs/<name>.attempt*` for each passed run and writes `attempts[] = [{dir, flags,
   wall_clock_s, load_avg_start, cpu_s}]`. `rss_abort` and `cpu_abort` are bugs to fix, not to
-  re-run. `topple train` exits 2 if `--out` exists and is non-empty (without `--retry`).
+  re-run. `topple train` exits 2 if `--out` exists and is not an empty directory (without
+  `--retry`).
 - **Soft target:** 600 s per run, reported only.
 - **Tests:** at most 2 envs (DummyVecEnv) and pools of at most 2 workers.
 
@@ -153,17 +158,30 @@ The dev box is a shared 48 GB / 18-core laptop; a past run exhausted its memory.
 ```python
 # --- torch-free (default CI) ---
 # topple/yamlsafe.py
+class ConfigError(ValueError)
 def safe_load_capped(data: bytes, cap: int = 64 * 1024, max_depth: int = 32) -> object
-    # size cap; yaml.parse event scan rejects AliasEvent/anchors and depth > max_depth; then SafeLoader.
-    # RecursionError / ValueError / UnicodeDecodeError -> ConfigError
-# topple/train/config.py  pydantic frozen extra="forbid"; discriminated on `algo`: (ppo block, PpoPolicy, health?)
-#   | (sac block, SacPolicy, no health); action_excess is a discriminated union on `enabled`
-#   PpoPolicy: net_arch {pi: [h1, h2], vf: [h1, h2]} (exactly 2 ints each, 1..256), activation Literal["tanh"], log_std_init
+    # bytes only; size cap; one yaml.parse event scan rejects AliasEvent/anchors, depth > max_depth (32 levels read, 33
+    # refused) and, per mapping, a repeated key, `<<`, a key with an explicit tag (`!!merge`, `!!str`, `!`) or a non-scalar
+    # key (PyYAML keeps the last of two equal keys and merges any `!!merge` key); then SafeLoader. RecursionError /
+    # UnicodeDecodeError / yaml.YAMLError / any other exception -> ConfigError, one line
+def clean_text(text: str, limit: int = 160) -> str   # non-printables escaped, cut with "..."; every input-derived
+    # ConfigError text (the parser's problem, pydantic messages; locations cut at 96) goes through it
+# topple/train/config.py  pydantic frozen extra="forbid" strict allow_inf_nan=False; discriminated on `algo`: (ppo block,
+#   PpoPolicy, health?) | (sac block, SacPolicy, no health); action_excess is a discriminated union on `enabled` (exactly
+#   true/false: pydantic's own tag lookup takes 1 for true)
+#   PpoPolicy: net_arch {pi: [h1, h2], vf: [h1, h2]} (exactly 2 ints each, 1..256), activation Literal["tanh"], log_std_init (−10..2)
 #   SacPolicy: net_arch {pi: [h1, h2], qf: [h1, h2]}, activation Literal["relu"]; no log_std_init (SB3 SAC ignores it without SDE)
-#   LrSchedule: {schedule: Literal["constant", "linear"], initial: float > 0, final: float >= 0}
-def lr_fn(s: LrSchedule) -> Callable[[float], float]   # linear: lambda p: final + (initial - final) * max(p, 0.0)
-def load_train_config(path: Path, *, seed: int | None = None) -> TrainConfig   # applies --seed; result is the effective config
+#   LrSchedule: {schedule: Literal["constant", "linear"], initial: (0, 1], final: [0, initial]}; constant: final == initial
+#   MAX_SELECTION_SEEDS = 250; MAX_SELECTION_EVALS = 40; MAX_TRAIN_META_BYTES = 64 KiB (§2.2, §2.3)
+def lr_fn(s: LrSchedule) -> Callable[[float], float]   # linear: p -> final + (initial - final) * max(p, 0.0); a picklable object
+def load_train_config(path: Path, *, seed: int | None = None) -> TrainConfig   # = read_train_config(path, seed=seed).config
+def read_train_config(path: Path, *, seed: int | None = None) -> LoadedTrainConfig   # (config, file_sha256) from one read
     # reads the file with topple._inputs.open_regular(path, 64 KiB): never blocks on a FIFO, refuses non-regular files
+def parse_train_config(data: bytes, *, seed: int | None = None) -> TrainConfig   # safe_load_capped, validate, then --seed
+    # replaces the file's seed and the result is validated again: the effective config
+def validate_train_config(raw: object) -> TrainConfig   # json.dumps(allow_nan=False), then strict JSON-mode validation
+    # (dates, sets, binary, NaN refused; arrays become tuples; int accepted for float); export re-validates
+    # train_meta.config with it. Every failure is a ConfigError of at most 8 "<loc>: <message>" parts
 def config_sha256(cfg: TrainConfig) -> str   # of the EFFECTIVE config (seed included): sha256(json.dumps(model_dump(mode="json"), sort_keys=True, separators=(",", ":")))
 # topple/train/wrappers.py  gymnasium only
 TRAIN_SEED_LO = 2**52
@@ -174,19 +192,51 @@ class ActionExcessPenalty(gym.Wrapper):  # PPO only; action_space Box(-box, box,
 def make_train_env(cfg: TrainConfig, env_index: int) -> gym.Env  # env -> Monitor -> penalty -> TrainingSeeds
     # env: the kind's env class (§8.1; balance: BalanceEnv(preset, challenge=load_challenge(id), reward=RewardConfig(...),
     # max_drift_m=...), record=False). No wrapper changes max_steps or truncation: the env ends every episode itself (contract §8, §11).
-# topple/train/selection.py  ONNX bytes through the real harness
+    # SB3's Monitor is imported inside the function, never at module import
+# topple/train/selection.py  ONNX bytes through the real harness; the pure logic the SB3 callbacks glue together
 @dataclass(frozen=True)
 class SelectionResult:
-    step: int; success_rate: float; score: float; median_energy_j: float; mean_saturation: float
+    step: int; success_rate: float; score: float; median_energy_j: float; mean_saturation: float   # all finite
     scores: tuple[float, ...]          # per seed, seed order (paired comparisons)
-    extras: Mapping[str, float]        # waypoint: mean_gates, docked, fell, median_t_finish_s
-def evaluate_policy_bytes(ref: PolicyRef, protocol: EvalProtocol, pool: Executor
-                          ) -> tuple[SelectionResult, NDArray[np.float32]]  # + up to 5 on-policy rows per seed (§2.4)
+    extras: Mapping[str, float]        # balance: fell (fall rate); waypoint: mean_gates, docked, fell, median_t_finish_s
+def summarize_episodes(episodes: Sequence[EpisodeResult], *, step: int) -> SelectionResult
+    # score and success rate from results.summarize (contract §12); fell = termination in evaluate.FALL_REASONS;
+    # a missing episode counts 0 energy, 0 saturation and no fall
+def selection_protocol(sel: SelectionConfig) -> EvalProtocol   # dataclasses.replace(EvalProtocol.from_id(protocol), seeds=...)
+def evaluate_policy_bytes(ref: PolicyRef, protocol: EvalProtocol, pool: Executor, *, step: int = 0
+                          ) -> tuple[SelectionResult, NDArray[np.float32]]  # + 5 on-policy rows per seed with T ≥ 1 (§2.4)
+def onpolicy_seed_count(onpolicy: NDArray[np.float32]) -> int   # n_onpolicy_seeds = rows / ONPOLICY_ROWS
+@dataclass(frozen=True)
+class GateBaseline: rule: Literal["pid", "waypoint", "none"]; reference: SelectionResult | None; anchor: SelectionResult | None
+def measure_gate_baseline(rule, protocol: EvalProtocol, pool: Executor, *, pid_submission: Path) -> GateBaseline  # waypoint: 2b
 def is_eligible(r: SelectionResult, base: GateBaseline, sel: SelectionConfig, e_ref_j: float) -> bool  # §2.4
 def rank_key(r: SelectionResult, kind: Literal["balance", "waypoint"]) -> tuple[float, ...]       # §2.4
+@dataclass(frozen=True)
+class HistoryRow: result: SelectionResult; eligible: bool; onnx_sha256: str   # required; to_json() is a §2.3 row
+    std_mean, frac_mean_outside_1, excess_penalty_mean, cpu_s, wall_s: float | None = None
+def choose_best(history, kind) -> HistoryRow | None; def best_json(row, rule) -> dict; def write_best_json(path, row, rule)
+def run_flags(history, *, health: HealthConfig | None, e_ref_j: float) -> tuple[str, ...]   # the warning flags, FLAGS order
+FLAGS; ABORT_FLAGS = ("rss_abort", "cpu_abort", "wall_clock_abort"); NOT_SHIPPABLE = {*ABORT_FLAGS, "nondeterministic"}
+class EvalTrigger: every_steps; total_timesteps: int | None; last_label   # due(n), final_due(n), resumed(every, n, total)
+def final_timesteps(cfg: TrainConfig) -> int; def eval_labels(cfg: TrainConfig) -> tuple[int, ...]   # §2.4
+def random_rows(norm: ObsNorm) -> NDArray[np.float32]; def edge_rows(norm: ObsNorm) -> NDArray[np.float32]   # §2.4 (b), (c)
+def parity_obs(onpolicy, norm) -> tuple[NDArray[np.float32], NDArray[np.uint8]]   # (a), (b), (c) and `set` labels 0, 1, 2
+# topple/export.py  (§3.3) the snapshot format's one writer and one reader
+RULE_OF = {"tanh": "clip(mean)", "relu": "tanh(mean)"}
+def build_onnx(layers: tuple[tuple[f32[out, in], f32[out]], ...], norm: ObsNorm, *, activation, challenge: Challenge) -> bytes
+    # §3.2 with the challenge's metadata and head bounds: the bytes the selection eval scores and export rebuilds
+def snapshot_files(cfg, step: int, layers, norm: ObsNorm, *, count: float, onpolicy, action_ref, onnx_sha256: str) -> dict[str, bytes]
+    # actor.npz, normalize.json, parity_ref.npz (rows from parity_obs), meta.json; byte-deterministic (npz members dated
+    # 1980-01-01); ValueError for an array of the wrong dtype or shape (export's own schemas)
+def write_snapshot(ckpt_dir: Path, step: int, files: Mapping[str, bytes], *, more: Callable[[Path], None] | None = None) -> Path
+    # §2.4's immutable step_<N>/ via .step_<N>.tmp/ (a stale one removed first); FileExistsError if it exists
+def read_run_json(path: Path, cap: int = 64 * 1024) -> object   # §3.3 step 2's strict reader (also topple train's)
+def coverage_counts(action_ref: NDArray[np.float64]) -> tuple[int, int]   # (n_unsaturated, n_saturated), §3.3 step 4
+class ExportError(Exception); class ExportWarning(UserWarning)
 # --- torch (train extra; CLI imports lazily) ---
-def train(cfg: TrainConfig, out: Path) -> Path                                   # learn.py
+def train(cfg: TrainConfig, out: Path, *, config_file_sha256: str) -> Path      # learn.py; the CLI reads the file once
 def snapshot(model, vecnorm, step: int, ckpt_root: Path, onnx_bytes: bytes, onpolicy: NDArray[np.float32]) -> Path
+    # snapshot_files (+ PPO's critic.npz, dist.npz), written by write_snapshot; more(tmp) writes model.zip, vecnormalize.pkl
 class SelectionCallback(BaseCallback); class HealthCallback(BaseCallback)        # callbacks.py
 def policy_stats(model, vecnorm, onpolicy: NDArray[np.float32]) -> PolicyStats     # callbacks.py: std_mean, frac_mean_outside_1 (§2.5)
 def resume_from(run_dir: Path) -> tuple[Model, VecNormalize]                      # learn.py; refuses files not owned by os.getuid()
@@ -264,12 +314,27 @@ differs from `model_dump(load(base))` in exactly the listed key paths:
 Rules:
 - `algo ∈ {ppo, sac}`; the other algorithm's block is forbidden, `health` is forbidden for SAC.
   There is no `checkpoint_every`: snapshots happen exactly at selection evals.
+- **Validation** (`validate_train_config`; every failure a `ConfigError`, exit 2). Types are strict
+  (no coercion: `8` is not `"8"`, `true` is not `1`). `seed` in [0, 2^32) (SB3 seeds numpy's
+  legacy RNG); `total_timesteps` 1..10^10; `n_envs` 1..16; `vec_env` ∈ {subproc, dummy};
+  `start_method` ∈ {forkserver, spawn, fork}; widths 1..256; reward weights 0..1 (sum ≤ 1, as
+  `RewardConfig`), all six written out; `action_excess.box` 1..10, `weight` 0..1, and SAC takes
+  only `{enabled: false}`; `max_drift_m` (0, 100]; `normalize.obs` MUST be true (the exported graph
+  always normalizes), `clip_obs` (0, 10^6], `epsilon` (0, 1]; `ppo.batch_size ≤ n_steps · n_envs`;
+  `sac.buffer_size` ≤ 10^7; `env.challenge` MUST exist and offer `env.preset`;
+  `selection.protocol` MUST be the canonical `<challenge>/<preset>` id (no alias) of
+  `env.challenge`; `selection.seeds` within [0, 2^52), at most `MAX_SELECTION_SEEDS` = 250;
+  `total_timesteps // selection.every_steps ≤ MAX_SELECTION_EVALS` = 40; `selection.workers`
+  1..64 (pools clamp to 4, §1); `selection.max_saturation` is optional but required by gate
+  `pid` (2b's `ppo_waypoint` omits it); `health` is optional for PPO. The selection-seed and eval
+  bounds keep `train_meta.json` under 64 KiB (§2.3).
 - **Reward.** `RewardConfig` unchanged. The u² effort term MUST NOT be replaced by a battery-energy
   cost (measured 64.9 / 0.505, 82% saturated); energy terms may only be added on top.
 - **log_std.** PPO `log_std_init` 0.0 (−0.5 and −1.0 measured worse).
-- **Learning rate.** PPO uses the linear schedule: `lr(p) = 3e-4·max(p, 0)` with SB3's
-  `progress_remaining` p. The clamp is required: p reaches 1 − 5,013,504/5,000,000 = −0.0027 on the
-  last update (lr −8e-7 would be gradient ascent). Constant LR collapsed 1 of 3 pilot seeds
+- **Learning rate.** `final ≤ initial`; a constant schedule has `final == initial`. PPO uses the
+  linear schedule: `lr(p) = 3e-4·max(p, 0)` with SB3's `progress_remaining` p. The clamp is
+  required: p reaches 1 − 5,013,504/5,000,000 = −0.0027 on the last update (lr −8e-7 would be
+  gradient ascent). Constant LR collapsed 1 of 3 pilot seeds
   after 2.3M steps (§0). A fine-tune restarts the schedule at 3e-4.
 - **SAC.** UTD 0.25 is the best of the three measured settings for this budget (§0); it is a
   shared-machine choice, not SAC's default (UTD 1).
@@ -279,7 +344,8 @@ Rules:
 
 - `PPO/SAC(seed=cfg.seed)`; env i wrapped in `TrainingSeeds(cfg.seed, i)`.
 - `train_meta.json` stores only run-relative paths:
-  - **identity:** `config_sha256` (effective config), `config_file_sha256` (raw YAML bytes),
+  - **identity:** `config_sha256` (effective config), `config_file_sha256` (raw YAML bytes, from
+    the CLI's single read, `read_train_config`, passed as `train(..., config_file_sha256=)`),
     `config` (effective, `seed` included), `git_commit`, `git_dirty`, `versions` {python, topple,
     torch, stable_baselines3, gymnasium, mujoco, numpy, onnx, onnxruntime, protobuf, psutil},
     `torch_threads` (`torch.get_num_threads()`), `mp_start_method`, `platform`, `cpu_isa`,
@@ -287,11 +353,18 @@ Rules:
     `bundle_hash`, and for a fine-tune `init_source {run, step, onnx_sha256}`;
   - **resources:** `load_avg_start`, `load_avg_end`, `wall_clock_s`, `train_s`, `selection_s`,
     `cpu_s`, `env_steps_per_s`, `peak_tree_rss_mib`, `peak_tree_rss_at_step`, `peak_procs`;
-  - **selection:** `gate_baseline` (incl. per-seed scores and fall rate), `selection_history`
-    (rows: step, all SelectionResult fields except `scores`, eligible, std_mean,
-    frac_mean_outside_1, excess_penalty_mean, cpu_s, wall_s, onnx_sha256), `best`, `flags`,
-    `num_timesteps`. Per-seed `scores` of every eval go to `selection_scores.npz` (float64
-    `[n_evals, n_seeds]`, `steps` int64), read by the 2b budget rule and the learning curves.
+  - **selection:** `gate_baseline` (`GateBaseline.to_json()`: `rule`, `reference`, `anchor`, each
+    a result with its per-seed `scores` and fall rate `extras.fell`), `selection_history` (rows
+    `HistoryRow.to_json()`: step, all SelectionResult fields except `scores`, eligible, std_mean,
+    frac_mean_outside_1, excess_penalty_mean, cpu_s, wall_s, and `onnx_sha256`, which every row
+    MUST carry: export binds it, §3.3 step 3), `best`, `flags` (a list of strings in `FLAGS`
+    order, §2.5), `num_timesteps`. Per-seed `scores` of every eval go to `selection_scores.npz`
+    (float64 `[n_evals, n_seeds]`, `steps` int64), read by the 2b budget rule and the learning
+    curves.
+- `train_meta.json` MUST be at most 64 KiB (`MAX_TRAIN_META_BYTES`, its readers' cap: §3.3 step 2,
+  and `topple train`'s exit-4 and `--retry` checks). The §2.2 bounds (≤ 250 selection seeds, ≤ 40
+  periodic evals) keep it under when written with `indent=2` (a test builds the worst case, the
+  waypoint gate's two baselines included: ≤ 56 KiB).
 - `phase2_gate.py` recomputes the selection protocol's hash (`balance-v1/standard` with seeds
   2000..2199, built with `dataclasses.replace` from `EvalProtocol.from_id`, as `topple run` builds
   its one-seed protocol) and the current `ENV_ALGO_VERSION` and fails if **any** reported run (PPO,
@@ -313,11 +386,24 @@ Rules:
   trained on. For 5M: evals at 262,144, 507,904, …, 4,751,360 (19), then the final.
 - **SAC:** in `_on_step`, when `num_timesteps // every_steps` increases **and** `num_timesteps <
   total_timesteps`. For 1.0M: 50,000 … 950,000 (19), then the final at 1,000,000.
-- **Final:** `_on_training_end` always evaluates at `model.num_timesteps`; by construction no
-  periodic label equals it. `snapshot()` raises `FileExistsError` if `ckpt/step_<N>/` exists, and
+- **Final:** `_on_training_end` evaluates at `model.num_timesteps` unless that label was already
+  evaluated (`EvalTrigger.final_due`: a hard limit seen in the callback call that ran a periodic
+  eval, or a resume point; the eval there is then the final one); otherwise no periodic label
+  equals it. `snapshot()` raises `FileExistsError` if `ckpt/step_<N>/` exists, and
   `selection_history` steps are asserted unique.
+- **Code.** `EvalTrigger(every_steps, None)` (PPO, `_on_rollout_start`) or `EvalTrigger(every_steps,
+  total_timesteps)` (SAC, `_on_step`); a resumed run uses `EvalTrigger.resumed(every_steps,
+  num_timesteps, total_timesteps)`, due at the next label, never at the resume point.
+  `eval_labels(cfg)` computes the labels arithmetically; the last is `final_timesteps(cfg)`, SB3's
+  final `num_timesteps` (whole rollouts of `n_steps · n_envs` for PPO, whole collections of
+  `train_freq · n_envs` for SAC): 5,013,504 for `ppo_balance`, 1,015,808 for the ablation,
+  `total_timesteps` for SAC and the smoke configs.
 
-`snapshot()` writes the **immutable** `ckpt/step_<N>/` via `ckpt/.step_<N>.tmp/` + `os.rename`:
+`snapshot()` writes the **immutable** `ckpt/step_<N>/` via `ckpt/.step_<N>.tmp/` + `os.rename`. Its
+torch-free files come from `topple.export.snapshot_files(cfg, step, layers, norm, *, count,
+onpolicy, action_ref, onnx_sha256)` and the directory from `topple.export.write_snapshot(ckpt_dir,
+step, files, *, more=None)` (a stale `.step_<N>.tmp/` is removed first), where `files` adds PPO's
+`critic.npz` and `dist.npz` and `more(tmp)` writes `model.zip` and `vecnormalize.pkl`:
 
 | File | Content | Read by |
 |---|---|---|
@@ -326,7 +412,7 @@ Rules:
 | `dist.npz` | PPO only: `log_std` (float32 [2]) | surgery |
 | `normalize.json` | `mean`, `var` (float64 via `repr`), `count`, `epsilon`, `clip_obs` | export, surgery |
 | `parity_ref.npz` | `obs` f32 [N,D], `action_ref` f64 [N,A], `set` u1 [N], `onnx_sha256` (U64 scalar) | export, CI |
-| `meta.json` | `step, algo, action_rule, net_arch, activation, config_sha256, onnx_sha256, n_onpolicy, n_onpolicy_seeds` | export |
+| `meta.json` | `step, algo, action_rule` (`RULE_OF[activation]`), `net_arch` (the actor's hidden widths `[h1, h2]`, `policy.net_arch.pi`), `activation, config_sha256, onnx_sha256, n_onpolicy, n_onpolicy_seeds` | export |
 | `model.zip`, `vecnormalize.pkl` | SB3 pickles | **resume only**, in `learn.py` |
 
 All files come from the live model and `VecNormalize` in the same callback call; `obs_rms` is
@@ -339,18 +425,28 @@ scored.
   allowed for T < 5), in seed order; an episode with T = 0 (e.g. `invalid_action` at step 0) contributes no rows.
   5 rows per selection seed (1,000 for the shipped configs, 10 for smoke), covering
   200 randomizations and push schedules at no extra simulation; `n_onpolicy_seeds` counts the
-  episodes with T ≥ 1;
-- (b) 1,000 random rows `f32(mean + sqrt(var + eps)·U(−12, 12))`, `default_rng(SeedSequence(0))`;
-- (c) **6·D + 4 edge rows** `f32`: for each feature j, `mean` with `x_j` ∈ {μ_j ± 10σ_j,
-  μ_j ± 10.001σ_j, ±1e6} (σ = sqrt(var + ε)), then `mean`, zeros, all +1e6, all −1e6
-  (64 rows for D = 10, 94 for D = 15).
+  episodes with T ≥ 1 (`onpolicy_seed_count`); the pool task is `submit_episodes_with_rows`
+  (§3.5);
+- (b) 1,000 random rows `f32(mean + sqrt(var + eps)·U)`, U = `−12 + 24·rng.random((1000, D))`
+  with `rng = default_rng(SeedSequence(0))` (contract §9's portable rule, never
+  `Generator.uniform`);
+- (c) **6·D + 4 edge rows** `f32`: for each feature j, `mean` with `x_j` = μ_j + 10σ_j, μ_j −
+  10σ_j, μ_j + 10.001σ_j, μ_j − 10.001σ_j, +1e6, −1e6 in that order (σ = sqrt(var + ε); float64,
+  rounded once), then `mean`, zeros, all +1e6, all −1e6 (64 rows for D = 10, 94 for D = 15).
+
+`parity_obs(onpolicy, norm)` gives the rows (a), (b), (c) in that order and their `set` labels
+0, 1, 2; export regenerates (b) and (c) from `normalize.json` and requires them bitwise (§3.3
+step 4).
 
 **Reference actions** use SB3's own pipeline on the widened rows:
 `a_ref = clip(model.predict(vecnorm.normalize_obs(obs.astype(f64)), deterministic=True)[0], -1, 1)`.
 
 **Selection eval:**
-1. Build the ONNX in memory (§3.2) and run `evaluate_policy_bytes` on the selection seeds.
-2. **Gate baseline**, measured once at train start with the same harness and seeds: `pid` →
+1. Build the ONNX in memory with `topple.export.build_onnx` (§3.2) and run
+   `evaluate_policy_bytes(PolicyRef("onnx", ...), selection_protocol(cfg.selection), pool,
+   step=N)` on the selection seeds.
+2. **Gate baseline**, measured once at train start with the same harness and seeds
+   (`measure_gate_baseline(gate, protocol, pool, pid_submission=...)`): `pid` →
    `submissions/pid_example.py`; `waypoint` → the creeper anchor and the reference driver (2b,
    §8.8); `none` → every checkpoint eligible.
 3. **Eligible** iff (`pid`): `success_rate ≥ PID's` ∧ `median_energy_j ≤ E_ref` ∧
@@ -360,7 +456,8 @@ scored.
    already enforces success ≥ PID, and score-first was never worse on held-out data in 6 runs.
 5. `best.json = {"step": N, "eligible": bool, "rule": "<gate>"}` is rewritten atomically (temp +
    `os.replace`) whenever the best changes: the top eligible checkpoint by `rank_key`, or, while
-   none is eligible, the top checkpoint with `eligible: false`.
+   none is eligible, the top checkpoint with `eligible: false`; a tie goes to the earlier step
+   (`choose_best`).
 6. Train exits 0 in both cases (4 on a hard limit). Only shipping requires `eligible: true`.
 
 Selection numbers only choose checkpoints. Reported numbers come only from fresh evaluations of
@@ -385,7 +482,9 @@ exported artifacts (§4–§5).
 - **Flags:** `std_collapse` (PPO std < 0.03 before 2M; warning), `late_regression` (PPO: a
   selection success after `regression_after_step` that is ≥ `regression_drop` (0.10) below the
   running best; warning, reported), `high_energy` (any eval above E_ref), `no_eligible`,
-  `rss_abort`, `cpu_abort`, `wall_clock_abort`, `nondeterministic` (§1).
+  `rss_abort`, `cpu_abort`, `wall_clock_abort`, `nondeterministic` (§1). `train_meta.flags` lists
+  them in `FLAGS` order, exactly this order (a tuple, never a set's hash-seed order); `run_flags`
+  computes the first four (the health ones only with a `health` block), training sets the rest.
 - **Runs:** `topple train configs/train/{ppo,sac}_balance.yaml --seed S --out runs/{algo}_s{S}`,
   seeds 0, 1, 2, one at a time, plus `ablate_nopenalty.yaml --out runs/ablate_nopenalty`.
   `runs/` is gitignored.
@@ -517,14 +616,24 @@ the builder checks `metadata` against what it builds and refuses float32 constan
 ### 3.3 Export and pack (torch-free)
 
 `topple export RUN_DIR --out DIR [--step N] [--report-only] [--test-fixture NAME] [--replace]`
-(`export_policy(run_dir, out_dir, *, step=None, report_only=False, replace=False) -> PolicyManifest`):
-1. **Resolve.** `step` = `--step` or the integer `best.json.step` (0 ≤ step < 2^53; other keys
-   ignored). Path `run_dir/"ckpt"/f"step_{step}"` MUST NOT be a symlink and MUST resolve under
-   `run_dir.resolve()`. Without `--report-only`, the step's `selection_history` row MUST have
-   `eligible: true`, `train_meta.flags` MUST hold no abort flag and no `nondeterministic`, and the
-   output MUST NOT be under `runs/`; with it, the output MUST be `run_dir/report_policy/`, which
-   is replaced if present (report-only implies `--replace` for that path only, so
-   `phase2_results.py` is idempotent). `claims.selection_eligible` records the flag.
+(`export_policy(run_dir, out_dir, *, step=None, report_only=False, replace=False,
+test_fixture=None, fixture_dir=Path("tests/data")) -> PolicyManifest`; every refusal is one
+`ExportError` line, exit 2):
+1. **Resolve.** `--test-fixture` is checked first (step 5). `step` = `--step` or the integer
+   `best.json.step` (0 ≤ step < 2^53; other keys ignored). Path `run_dir/"ckpt"/f"step_{step}"`
+   MUST be a directory by `lstat` (not a symlink, so a looping one is refused as a symlink) and
+   MUST resolve under `run_dir.resolve()`; a resolve that fails (a looping `ckpt`: Python 3.12's
+   `Path.resolve` raises `RuntimeError`, not `OSError`, on a loop) is one line, never a traceback.
+   `train_meta.flags` MUST be a list of strings and `selection_history` MUST hold exactly one row
+   for the step, with a boolean `eligible` and a string `onnx_sha256`. Without `--report-only`,
+   that row MUST have `eligible: true`, `train_meta.flags` MUST hold no abort flag and no
+   `nondeterministic`, and the output MUST NOT resolve under `<cwd>/runs/`, or under the `runs/`
+   the run directory lives in (when its parent is named `runs`), nor inside the run directory; a
+   directory named `runs` elsewhere (e.g. an ancestor of the checkout) does not count. With it,
+   the output MUST be `run_dir/report_policy/` (its resolved parent the run's) and `./runs` is
+   never resolved; `report_policy/` is replaced if present (report-only implies `--replace` for
+   that path only, so `phase2_results.py` is idempotent). `claims.selection_eligible` records the
+   flag.
 2. **Read** only `best.json`, `train_meta.json` (json ≤ 64 KiB), `meta.json`, `normalize.json`,
    `actor.npz`, `parity_ref.npz` (npz ≤ 8 MiB), each with `read_regular_file`. npz bytes go through
    the Phase 1 trajectory reader's parts (contract §14), moved from `topple/traj.py` into
@@ -535,26 +644,52 @@ the builder checks `metadata` against what it builds and refuses float32 constan
    hand-parsed npy header (never evaluated; header ≤ 4096 bytes; the exact expected dtype, C order;
    the shape checked against the expected one and needing exactly the member's bytes before any
    data is read, so a header declaring 2^42 elements allocates nothing). dtypes `<f4`, `<f8`,
-   `|u1`, `<U64` (`onnx_sha256`) only. JSON rejects NaN/Infinity.
-3. **Build and bind.** Build (§3.2); `sha256(bytes)` MUST equal `meta.json.onnx_sha256` and
-   `parity_ref.npz` `onnx_sha256`. **Constant binding**, bitwise and independent of parity (a
-   wrong ε of 1e-6 differs from SB3 by only 2.9e-6 for SAC): initializers by §3.2 position MUST
+   `|u1`, `<U64` (`onnx_sha256`) only; every member's exact shape, `parity_ref` with N =
+   `n_onpolicy + 1000 + 6·D + 4`. JSON (`read_run_json`) rejects a BOM, NaN/Infinity, duplicate
+   keys, integers over 20 digits, floats beyond float range and nesting deeper than 32 (a byte
+   scan before the parser). **Bindings:** `train_meta.config` MUST re-validate
+   (`validate_train_config`) and its `config_sha256` MUST equal `train_meta.config_sha256` and
+   `meta.json.config_sha256`; `meta.json` MUST have the resolved `step`, (`algo`, `activation`,
+   `net_arch`) equal to the config's (`algo`, `policy.activation`, `policy.net_arch.pi`) and
+   `action_rule == RULE_OF[activation]`; `normalize.json` `epsilon` and `clip_obs` MUST equal
+   the config's `normalize` block, `mean` and `var` have D entries.
+3. **Build and bind.** Build (`build_onnx`, §3.2); `sha256(bytes)` MUST equal
+   `meta.json.onnx_sha256`, `parity_ref.npz` `onnx_sha256` and the step's `selection_history` row
+   `onnx_sha256` (so "eligible" names these exact bytes). **Constant binding**, bitwise and
+   independent of parity (a wrong ε of 1e-6 differs from SB3 by only 2.9e-6 for SAC; measured on
+   synthetic runs, about 1.1e-6 with small heads): initializers by §3.2 position MUST
    equal `f32(mean)`, `f32(1/sqrt(var + ε))`, `∓f32(clip_obs)`, the `actor.npz` arrays, and
    `∓1.0` from the challenge's action spec (`TaskSpec.action.low/high`, §3.5).
    `validate_policy_bytes` MUST accept it; `smoke_test` MUST pass.
-4. **Parity (normative).** Every `parity_ref` row at batch 1 through `make_session`. `max |a_onnx
-   − a_ref| ≤ 1e-5` always MUST hold. Coverage: ≥ 300 rows with `max_i |a_ref_i| < 0.99`
+4. **Parity (normative).** The rows MUST be the §2.4 sets: `set` labels 0, 1, 2 in that order,
+   (b) and (c) bitwise equal to `random_rows` and `edge_rows` of `normalize.json`, `obs` and
+   `action_ref` finite. Every `parity_ref` row at batch 1 through `make_session`. `max |a_onnx
+   − a_ref| ≤ 1e-5` always MUST hold (a NaN difference on any row fails; a later finite row never
+   replaces it). Coverage (`coverage_counts`): ≥ 300 rows with `max_i |a_ref_i| < 0.99`
    (`n_unsaturated`), ≥ 32 rows with `max_i |a_ref_i| ≥ 0.999` (`n_saturated`; exercises the head
-   Clip / tanh), and `n_onpolicy == 5 · n_onpolicy_seeds`. Without `--report-only` coverage MUST
+   Clip / tanh), `n_onpolicy == 5 · n_onpolicy_seeds`, and `1 ≤ n_onpolicy_seeds ≤` the number of
+   selection seeds in `train_meta.config`. Without `--report-only` coverage MUST
    hold; with it, a coverage miss sets `export_parity.vacuous = true` instead of failing, so every
    G7 row exists.
-5. **Write.** `--out` MUST NOT exist, unless `--replace`: the new directory is written as a temp
-   sibling (`tempfile.mkdtemp` beside it), the old one renamed aside, the new one renamed in, the
-   old one removed; a relative `--out` through a symlinked directory exits 2 first (contract §14;
-   §5.3). Claims come from
-   `meta.json` and `train_meta.json` through a whitelist. `--test-fixture NAME`
-   (`^[a-z0-9_]{1,32}$`) writes `tests/data/NAME_parity.npz` (copy), `tests/data/NAME_parity.bin`
-   and `tests/data/NAME_parity.json` for C and JS consumers. **`.bin` layout v1**, little-endian:
+5. **Write.** The two files MUST load through `load_policy_files` (what loading the directory
+   runs) before anything is written. `--out` MUST NOT exist, unless `--replace`: the new directory
+   is written as a temp sibling (`tempfile.mkdtemp` beside it), the old one renamed aside, the new
+   one renamed in, the old one removed; a failure up to the swap puts the old one back, and
+   failing to remove the old one after it is an `ExportWarning` (printed `warning: ...`), not an
+   error. `--replace` replaces only a symlink (the link, never its target) or a directory holding
+   nothing but `policy.onnx`, `policy.json`, `README.md` (no subdirectory); anything else is
+   refused. A relative `--out` through a symlinked directory exits 2 first (contract §14; §5.3).
+   Claims come from `meta.json` and `train_meta.json` through a whitelist: `name` null; `algo`, `activation`,
+   `net_arch` from `meta.json`; `total_timesteps`, `train_seed` from the config; `git_commit` 40
+   lowercase hex or null (anything else refused), `git_dirty` a bool or null, a missing one null;
+   `versions` keeps only string values matching the claims patterns, at most 16 sorted by key.
+   `--test-fixture NAME` (`^[a-z0-9_]{1,32}$`; refused with `--report-only`) writes
+   `tests/data/NAME_parity.npz` (copy), `tests/data/NAME_parity.bin` and
+   `tests/data/NAME_parity.json` for C and JS consumers (`fixture_dir`, checked like `--out`).
+   Existing fixture files need `--replace`; a fixture target that is a directory is refused before
+   anything is written; the files are written to temp names beside their targets before the
+   `--out` swap and renamed over them after it (errors name the target; a rename failure after the
+   swap says `--out` was written). **`.bin` layout v1**, little-endian:
    `b"TPAR"`, `u32 version = 1`, `u32 N`, `u32 D`, `u32 A`, `f32 obs[N·D]`, `f32 a_ref[N·A]`,
    `u8 set[N]` (0 on-policy, 1 random, 2 edge), zero-padded to a multiple of 4 bytes (f32 a_ref
    adds about 3e-8). The JSON sidecar: `{"onnx_sha256", "n", "d", "a", "tolerance": 1e-5,
@@ -766,6 +901,13 @@ def submit_episodes(pool: Executor, ref: PolicyRef, protocol: EvalProtocol, indi
     # is pickled; indices (≤ 10,000) and pushes (≤ 16) are read once, bounded, into tuples (B16)
 def run_episodes(ref: PolicyRef, protocol: EvalProtocol, indices: Iterable[int],
                  pushes: Iterable[Push] | None = None) -> list[EpisodeResult]   # the task; checks again in the worker
+ONPOLICY_ROWS = 5
+@dataclass(frozen=True)
+class EpisodeRows: result: EpisodeResult; obs_rows: NDArray[np.float32]   # the trajectory never leaves the worker
+def onpolicy_rows(obs: NDArray[np.float32]) -> NDArray[np.float32]   # §2.4 (a): obs[linspace(0, T-1, 5).round()]; (0, D) for T = 0
+def submit_episodes_with_rows(pool: Executor, ref: PolicyRef, protocol: EvalProtocol, indices: Iterable[int]
+                              ) -> Future[list[EpisodeRows]]   # a selection eval's task; checked in the parent as above
+def run_episodes_with_rows(ref: PolicyRef, protocol: EvalProtocol, indices: Iterable[int]) -> list[EpisodeRows]
 ```
 
 - **SessionOptions:** `intra_op_num_threads=1`, `inter_op_num_threads=1`, `ORT_SEQUENTIAL`,
@@ -1037,7 +1179,9 @@ the entry ids, `lo ≤ hi`, differences in [−100, 100], `n_resamples` in 1..10
 metric name to its per-seed array: for waypoint `docked`, `fell`, `fall_cause`, `t_finish_s`,
 `course_pts`, `speed_pts`, `alive_pts`, `battery_pts` (§8.6).
 
-CLI: `topple train CONFIG --out DIR [--seed S]` (without the train extra: message + exit 2);
+CLI: `topple train CONFIG --out DIR [--seed S] [--retry]` (`--seed` in [0, 2^32); exit 2 with one
+line for a bad config, an `--out` that exists and is not an empty directory (§1) or a missing
+train extra; exit 4 when the run's `train_meta.flags` holds an abort flag);
 `topple export ...`; `topple policy pack ...`; `topple compare SUB... -p P [--seeds A..B]
 [--workers N] [--json PATH]`; `topple shove SUB... [--impulses 0.30:0.65:0.025] [--seeds 0..99]
 [--direction both|forward|backward] [--workers N]`; `topple video --side-by-side A.npz B.npz
@@ -1058,9 +1202,9 @@ train"`; torch-free):
 
 | Test file | What it checks |
 |---|---|
-| `test_train_config` | Shipped YAMLs validate. Rejected: extra keys, `n_envs` ∉ 1..16, the other algo's block, `health` on SAC, `action_excess: {enabled: false, box: 2}`, `checkpoint_every`, PPO + `relu`, `net_arch` depth 3, `qf` on PPO, `vf` on SAC, `log_std_init` on SAC, LR `final > initial`, anchors/aliases, depth 8,000 (ConfigError, no RecursionError), > 64 KiB. `lr_fn` linear: 3e-4 at p = 1, 0 at p = 0 and at p = −0.0027 (clamp), never negative. Derived YAMLs differ from their base in exactly the §2.2-listed key paths. `config_sha256` independent of key order and different per `--seed`. |
-| `test_train_wrappers` | `TrainingSeeds` seeds are `int` (`isinstance(seed, int)`, not `np.int64`), in [2^52, 2^53), deterministic per (base, index), never hit a §0 set over 10k draws. `ActionExcessPenalty` exact for (0.5, 1.5) and (2, −2), Box(−2, 2), `info["excess_penalty"]`. |
-| `test_selection` | `is_eligible` truth table (pid; waypoint incl. the fall term and docked 0.65; none); `rank_key` per kind; best.json fallback; on-policy rows: 5 per seed incl. a 3-step episode, 0 rows and no crash for a T = 0 episode, `n_onpolicy_seeds` counts T ≥ 1; edge set has 6·D + 4 rows for D = 10 and 15; `late_regression` flag on a synthetic history; trigger arithmetic: labels unique, increasing, last == total for smoke and the shipped PPO/SAC configs (pure function `eval_labels(cfg)`). |
+| `test_train_config` | Shipped YAMLs validate. Rejected: extra keys, `n_envs` ∉ 1..16, the other algo's block, `health` on SAC, `action_excess: {enabled: false, box: 2}`, `checkpoint_every`, PPO + `relu`, `net_arch` depth 3, `qf` on PPO, `vf` on SAC, `log_std_init` on SAC, LR `final > initial`, anchors/aliases, depth 8,000 (ConfigError, no RecursionError), > 64 KiB; repeated, `<<`, tagged and non-scalar keys; `action_excess.enabled: 1`; 251 selection seeds and 41 periodic evals (250 and 40 accepted); 33 nesting levels (32 read). A worst-case `train_meta.json` at those bounds (two baselines, `indent=2`) is ≤ 56 KiB. `lr_fn` linear: 3e-4 at p = 1, 0 at p = 0 and at p = −0.0027 (clamp), never negative. Derived YAMLs differ from their base in exactly the §2.2-listed key paths. `config_sha256` independent of key order and different per `--seed`. |
+| `test_train_wrappers` | `TrainingSeeds` seeds are `int` (`isinstance(seed, int)`, not `np.int64`), in [2^52, 2^53), deterministic per (base, index), never hit a §0 set over 10k draws. `ActionExcessPenalty` exact for (0.5, 1.5) and (2, −2), Box(−2, 2), `info["excess_penalty"]`. `make_train_env` layers env → Monitor → penalty → seeds (a stand-in Monitor; SB3's in a `train`-marked case). |
+| `test_selection` | `is_eligible` truth table (pid; waypoint incl. the fall term and docked 0.65; none); `rank_key` per kind; best.json fallback; on-policy rows: 5 per seed incl. a 3-step episode, 0 rows and no crash for a T = 0 episode, `n_onpolicy_seeds` counts T ≥ 1; edge set has 6·D + 4 rows for D = 10 and 15; `late_regression` flag on a synthetic history; trigger arithmetic: labels unique, increasing, last == `final_timesteps(cfg)` (SB3's final `num_timesteps`; == total for SAC and smoke) for smoke and the shipped configs (pure function `eval_labels(cfg)`, equal to a step-by-step `EvalTrigger` simulation); `final_due` after an abort at a periodic label; `EvalTrigger.resumed` continues the schedule; `FLAGS` order identical under 3 `PYTHONHASHSEED` values; the selection protocol hash known answer. |
 | `test_policy_build` | PPO 9-node and SAC 10-node sequences with the §3.2 initializer shapes (rank-0 Clip bounds), IR 8 / opset 17, canonical names, fixed point, byte-identical rebuild, `not HasField("producer_version")` and every `ListFields()` name within the check-2 allow-list, no `/Users/` `/home/` `site-packages`. Golden: the committed tiny fixture builds to a pinned sha256. `reference_actions` vs ORT ≤ 1e-5 for var ∈ {0, 1e-12, 1e-8, 1, 1e6} × \|μ\| ∈ {0, 1e3}. Head bounds come from the challenge even when the model's action space is Box(−2, 2). Named negative controls, each > 1e-3 on the fixture rows: clip_obs 5, normalization omitted, mean and var swapped, W1 transposed, head clip ±2, tanh/relu swapped, SAC head tanh omitted; and ε = 1e-6 caught by the export constant binding (not by parity). |
 | `test_policy_validate` | Accepts first-party PPO and SAC. Rejects, each at its named check: unknown field 99 on ModelProto, NodeProto and TensorProto (check 2, via `UnknownFieldSet`); one case per check-2 field (`producer_version=""`, `doc_string`, `configuration`, `quantization_annotation`, `device_configurations`, `overload`, `type.denotation`, `dim.denotation`, input `metadata_props`, initializer `metadata_props`, `ref_attr_name`, node domain, `external_data`, a named Constant value tensor); invalid UTF-8 in a node name, a metadata key, a metadata value and an initializer name (`invalid_utf8`); truncated varint and depth-40 nesting (`onnx_parse_failed`); a trailing `"\n"` in a node name, a metadata key and an op_type; a 1 KiB Constant tensor name; an extra `topple.note` key, a missing required key, a non-ASCII value; `Sin`; `Flatten`; `Identity`; `variadic_max_245k` (check 6 arity); `max4_width4096_x40`, `softplus_chain_w4096_x52`, `elu_chain_w4096_x52` (check 8 cost); width 11; initializer as input; NaN weight; 2 KB metadata; (IR 8, opset 21), (IR 10, opset 20); IR 14; `If`; function; sparse initializer; int64 tensor; Constant `value_ints`; Gemm `alpha=NaN`, `transB` as FLOAT; both payloads set; 65 nodes; 131,073 elements; > 1 MiB; `gemm_transA_outer_product`; `bcast_matmul`; `max_bcast` (Max([n,1],[1,n]), check 8); unused initializer; dead node; spoofed `value_info` (check 2); one 256×256 weight reused by 2 Gemms (check 8 cost only; 1 use passes); `static_cost == 2^17` accepted, `2^17 + 1` rejected; a canonical-looking model with a Constant node (check 9). Every failure is a fixed-code `LoadError`, never a traceback. External-data red team: `chdir` to a tmp dir holding a correctly sized `.env` and a FIFO, references to both rejected at check 2 with `InferenceSession`, `check_model`, `numpy_helper.to_array` monkeypatched to raise. `<b>` in a node name, `op_type`, domain, attribute name: no `<` in any message. |
 | `test_policy_canonical` | Fixed point; `float_data` and `raw_data` give equal bytes; renamed values/initializers canonicalize identically; Constants fold to initializers in first-use order; default-valued Gemm attributes are dropped (explicit `alpha=1.0, beta=1.0, transA=0` equals omitted); IR set from `CANONICAL_IR`; golden: a committed non-canonical fixture canonicalizes (pack mode) to a pinned sha256; non-canonical file rejected at load. |
@@ -1069,18 +1213,18 @@ train"`; torch-free):
 | `test_onnx_policy` | CPU-only providers; tuple of Python floats; LoadError on sha/metadata/challenge mismatch; one `ideal` episode via `evaluate`; smoke timer: fresh RunOptions per call, cancelled timer, terminate mapped to its message. |
 | `test_pool` | `PolicyRef` for ONNX and Python; mutating the files after the parent load leaves the compare on the original sha; a worker given a wrong sha raises. |
 | `test_loader_policy` | Detection; ambiguous kind; extra/pickle-family/hidden/subdir entries named; missing `challenge` → TypeError; hard-linked `policy.json`; `POLICY.JSON` and a non-UTF-8 name refused on every OS; a directory of 10,000 entries refused after at most 4; `Submission.sha256` == `submission_sha256(dir)` from the same single read. Red-team (Linux, macOS): symlinked `policy.onnx`, symlink to `/dev/zero`, symlinked dir, lstat/open swap to a regular file and to a FIFO (rejected, never blocks; 5 s test timeout); oversize rejected before read. |
-| `test_export_inputs` | Ignores `best.json.dir`; rejects step ≥ 2^53, symlinked or escaping step dirs, npz with 9 members / bad names / oversize / object dtype / a header declaring 2^42 elements (clean error, no allocation) / bytes prepended to the archive (contract §14 layout), NaN in `normalize.json`, bad fixture name, sha mismatch, a constant-binding mismatch, a run with an abort or `nondeterministic` flag (without `--report-only`); existing `--out` without `--replace` → exit 2; a relative `--out` under a symlinked `out` → exit 2 before any write (also `compare --json`, `policy pack`, `video`, `train`); `--report-only` twice succeeds (idempotent); vacuous coverage recorded, not failed; `.bin` v1 layout (magic, version, N, D, A, set) and `.json` sidecar fields. |
+| `test_export_inputs` | Ignores `best.json.dir`; rejects step ≥ 2^53, symlinked or escaping step dirs, npz with 9 members / bad names / oversize / object dtype / a header declaring 2^42 elements (clean error, no allocation) / bytes prepended to the archive (contract §14 layout), NaN in `normalize.json`, bad fixture name, sha mismatch, a constant-binding mismatch, a run with an abort or `nondeterministic` flag (without `--report-only`); existing `--out` without `--replace` → exit 2; a relative `--out` under a symlinked `out` → exit 2 before any write (also `compare --json`, `policy pack`, `video`, `train`); `--report-only` twice succeeds (idempotent); vacuous coverage recorded, not failed; `.bin` v1 layout (magic, version, N, D, A, set) and `.json` sidecar fields. Also the §3.3 step 1–5 rules as built: symlink loops (step dir, `ckpt`, `./runs`) give one `ExportError`, never a traceback; the `runs/` rule (a checkout under `.../runs/topple` exports); `--replace` limits; every binding; `1 ≤ n_onpolicy_seeds ≤` selection seeds; a NaN ONNX output on a middle row fails; fixture staging and the `ExportWarning`; `snapshot_files` / `write_snapshot` round-trip through export. |
 | `test_shipped_policy` (slow; parametrized over `ppo_balance` and, once it exists, `ppo_waypoint`) | The submission loads; fixture sha equals `onnx.sha256`; parity ≤ 1e-5 with ≥ 300 unsaturated and ≥ 32 saturated rows; balance: eval_v1 PPO > PID; writes `results.json` as a CI artifact. |
 | `test_c_reference` | Generates a C header from `submissions/ppo_balance/policy.onnx` initializers by §3.2 position (`float.hex` literals; `tests/c/genc.py`), compiles `tests/c/mlp.c` (about 40 lines) with the system `cc -O2`, with and without `-ffp-contract=off`, and checks every `.bin` row within 1e-5 (measured ≤ 6.6e-7). Skips locally without `cc`; CI sets `TOPPLE_REQUIRE_CC=1`. |
 | `test_harness_finite_obs` | A fake env emitting NaN makes `evaluate` raise `RuntimeError` before `act()` is called, also under `python -O`. |
 | `test_driver_golden` (2b) | Per platform tag, as `tests/test_golden.py` pins balance-v1's baselines (contract §13; physics reproduces only per platform, e.g. LQR seed 1001 scored 84.08 on darwin-arm64 and 85.40 on linux-x86_64 under E_ref 13.0): `EPISODES[platform_tag()]` holds `submissions/waypoint_pid_example.py`'s scores on `waypoint-v1/clean` seeds 0..4 (to 1e-9) and docked/fell on `standard` 0..19, for `darwin-arm64` and `linux-x86_64`; a platform without pins skips locally and fails in CI, and CI must run on `linux-x86_64` (the same `pins_for` / `check_ci_platform` rule); a re-pin updates both platforms in one change. The platform-independent `WaypointScore` dump is pinned once. |
 | `test_traj_v2` (2b) | The §8.1a cases. |
-| `test_import_hygiene` | A fresh interpreter with an import hook imports `topple.cli`, `topple.pool`, `topple.controllers.onnx_policy`, `topple.compare`, `topple.bench`, `topple.stats`, every `topple.policy.*` module it finds, and `topple.export` once it exists: no attempt to import `torch`, `stable_baselines3`, `tensorboard` or `psutil` (a guarded `try: import` counts, installed or not; positive control) and none in `sys.modules`. |
-| `test_no_unsafe_loads` | AST scan of `python/topple`, `scripts/`, `tests/`. Outside `topple/train/`: no `pickle, cloudpickle, dill, joblib, shelve, marshal, torch, stable_baselines3` imports (`__import__` / `importlib.import_module` of a literal included), except a fixed (file → names) allow-list in the test, each entry still used by its file (a stale one fails): the `train`-marked test files (`test_train_smoke`, `test_snapshot_reference`, `test_pack_torch_legacy`, `test_resources`, `test_surgery`) → `torch`, `stable_baselines3`; the merged `tests/test_contract.py` → `pickle` (its `TaskSpec` pickle round trip, contract §8); `tests/test_onnx_policy.py`, `tests/test_pool.py` → `pickle` (pickling refused, `PolicyRef` pickled); `scripts/make_thirdparty_fixtures.py` → `torch` (§3.3, run once with the train extra); `tests/test_policy_validate.py`, `tests/test_policy_canonical.py` → `numpy_helper` and `tests/test_policy_pack.py` → `numpy_helper`, `external_data_helper` (they monkeypatch the readers to raise). Torch-free tree: onnx entry point only `onnx.ModelProto.FromString`; banned any `onnx.load*` and any reference to `numpy_helper`, `external_data_helper`, `load_external_data_for_model`, `register_custom_ops_library`, `onnx.shape_inference.infer_shapes_path`, `onnx.hub`, and `check_model` given a path (a string, f-string, `/` join, `Path(…)`/`str(…)` call, or a name containing "path" or "file"). `InferenceSession(` and `add_session_config_entry` (the three §3.5 literal keys) only in `runtime.make_session`. `PPO.load`, `SAC.load`, `VecNormalize.load` (qualified or not), `load_from_zip_file` only in `learn.resume_from` (`test_snapshot_reference` reloads through it). Everywhere: no `yaml.load/full_load/unsafe_load` (and their `_all` forms), `allow_pickle=True`, `torch.load` without `weights_only=True`. Every rule has a positive control. Name-based, reading import aliases as what they import; `getattr` evasion out of scope. |
+| `test_import_hygiene` | A fresh interpreter with an import hook imports `topple.cli`, `topple.pool`, `topple.controllers.onnx_policy`, `topple.compare`, `topple.bench`, `topple.stats`, every `topple.policy.*` module it finds, `topple.export`, `topple._npz`, `topple.yamlsafe`, `topple.train` and its torch-free `config`, `wrappers`, `selection`: no attempt to import `torch`, `stable_baselines3`, `tensorboard` or `psutil` (a guarded `try: import` counts, installed or not; positive control) and none in `sys.modules`. |
+| `test_no_unsafe_loads` | AST scan of `python/topple`, `scripts/`, `tests/`. Outside `topple/train/`'s torch half (its `__init__`, `config`, `wrappers` and `selection` are scanned): no `pickle, cloudpickle, dill, joblib, shelve, marshal, torch, stable_baselines3` imports (`__import__` / `importlib.import_module` of a literal included), except a fixed (file → names) allow-list in the test, each entry still used by its file (a stale one fails): the `train`-marked test files (`test_train_smoke`, `test_snapshot_reference`, `test_pack_torch_legacy`, `test_resources`, `test_surgery`) → `torch`, `stable_baselines3`; the merged `tests/test_contract.py` → `pickle` (its `TaskSpec` pickle round trip, contract §8); `tests/test_onnx_policy.py`, `tests/test_pool.py` → `pickle` (pickling refused, `PolicyRef` pickled); `topple/train/wrappers.py`, `tests/test_train_wrappers.py` → `stable_baselines3` (`make_train_env`'s lazy `Monitor` import, its `train`-marked case); `tests/test_train_config.py`, `tests/test_selection.py` → `pickle` (`lr_fn` and `EpisodeRows` round trips); `scripts/make_thirdparty_fixtures.py` → `torch` (§3.3, run once with the train extra); `tests/test_policy_validate.py`, `tests/test_policy_canonical.py` → `numpy_helper` and `tests/test_policy_pack.py` → `numpy_helper`, `external_data_helper` (they monkeypatch the readers to raise). Torch-free tree: onnx entry point only `onnx.ModelProto.FromString`; banned any `onnx.load*` and any reference to `numpy_helper`, `external_data_helper`, `load_external_data_for_model`, `register_custom_ops_library`, `onnx.shape_inference.infer_shapes_path`, `onnx.hub`, `onnx.utils.extract_model`, and `check_model` or `onnx.reference.ReferenceEvaluator` given a path (a string, f-string, `/` join, `Path(…)`/`str(…)` call, or a name containing "path" or "file"). `InferenceSession(` and `add_session_config_entry` (the three §3.5 literal keys) only in `runtime.make_session`. `PPO.load`, `SAC.load`, `VecNormalize.load` (qualified or not), `load_from_zip_file` only in `learn.resume_from` (`test_snapshot_reference` reloads through it). Everywhere: no `yaml.load/full_load/unsafe_load` (and their `_all` forms), `allow_pickle=True`, `torch.load` without `weights_only=True`. Every rule has a positive control. Name-based, reading import aliases as what they import; `getattr` evasion out of scope. |
 | `test_repo_hygiene` | No pickle-family (`.zip` included: SB3's `model.zip`), native-code (`.so/.dylib/.pyd/.dll`), external-data (`.onnx.data`, `.onnx_data`, `.data`) or hidden files under `submissions/`, tracked or untracked and not ignored; `.gitignore` covers `runs/`, `*.pkl`, `.venv-eval/`, `.DS_Store`; `git check-ignore docs/results/phase2/hero.mp4` and `.../waypoint.mp4` return non-zero. |
 | `test_stats`, `test_compare`, `test_bench` | `paired_bootstrap` known answer pinning (mean, lo, hi) for a committed 200-element vector; n = 1; all-equal; compare round-trip, all ordered pairs on 2 `ideal` seeds; shove both directions and interpolation. |
 | `test_video_sbs` | Timeline (hold-last-frame, labels, trims), GIF ladder, frame rule; one `render`-marked 64 px smoke. |
-| `test_resource_caps` | Pools clamp to 4; shipped configs `n_envs` ≤ 8; `limits` complete; `topple train` on a non-empty `--out` exits 2; `--retry` renames only a `wall_clock_abort` attempt. |
+| `test_resource_caps` | Pools clamp to 4; shipped configs `n_envs` ≤ 8; `limits` complete; `topple train` on a non-empty `--out` exits 2; `--retry` renames only a `wall_clock_abort` attempt of the same effective config (`config_sha256`), at most twice; an abort flag exits 4; a missing train extra exits 2 with one line and moves nothing. |
 | `test_phase2_gate` | `phase2_gate.py`, `phase2b_gate.py` and `phase2_ci_check.py` on synthetic JSON: pass a good set; name each failing gate, incl. a G2b-only failure (and the §2.5 fallback picking the next candidate on it), an ubuntu-only G4 failure, each missing G10 field, a stale `selection_protocol_hash` on a SAC row, `git_dirty` on the shipped run, an untracked MP4; the CI check's four distinct messages. Uses the `SHIP_GATES` / `PASS_GATES` constants. |
 
 **Train CI job** (`-m train`, `uv sync --locked --extra train`):
