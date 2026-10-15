@@ -605,3 +605,19 @@ Superseded earlier decisions:
 | V16 | `deferred-risks.md` (b)'s suggested rule would refuse the shipped robot | LOW | accepted | Probe on `build_model(balance-v1)`: `chassis_box` and both tires have contype = conaffinity = 1, so they pair by bits, and only `filterparent` (on) keeps them apart. The rule now exempts pairs MuJoCo already filters: one weld body, parent-child, or an exclude (`deferred-risks.md`). |
 | V17 | Course acceptance with libm `cos`/`sin` is not portable bit for bit, though contract §9 promises portable scenarios | LOW | accepted | Portable arithmetic was chosen over a contract §9 exception. `pcos`/`psin` use Python float `+`, `−`, `×` only (Cody–Waite reduction, 16-term Taylor polynomials by Horner), for both acceptance and `course_points`. Measured: within 1.3e-15 of libm, the same courses as libm on 20,000 seeds, 44.0% of attempts accepted, mean accepted turn 98.1° (§8.3, §8.9 item 4). |
 | V18 | Two sync edits had no S-row | LOW | accepted | Row S22 added: the shove pushes use the trusted reset hook (§5.2), and an exhausted budget raises `RunnerError` (§10). |
+
+## Linux recalibration (2026-10-15, spec v5.3)
+
+Deferred risk (c) asked for balance-v1's calibration to be re-measured on the ranked platform before
+2a training. Measured in a cloud session on linux-x86_64 (Intel Xeon, AVX-512; mujoco 3.15.0,
+numpy 2.5.3), with the merged Phase 1 code, before any change: the linux-x86_64 golden scores of
+`tests/test_golden.py` reproduced exactly, so the machine matches CI. On `balance-v1/standard` seeds
+0..199: LQR 87.5% survival (median 3.28 J), shipped PID 65.0% (median 6.566 J); `clean`: both
+100%. Both bands hold (LQR ≥ 80%, PID 40–90%), so the push band stays. 2 × 6.566 = 13.13 rounds to
+13.1, not 13.0 (darwin-arm64: 2 × 6.49 = 12.98 → 13.0). Pranav chose to recalibrate.
+
+| # | Change | Reason |
+|---|---|---|
+| R1 | E_ref 13.0 → 13.1 J; linux-x86_64 is the calibration platform; `challenge.yaml` records both platforms' numbers; contract §10, §12 and §13 updated. New bundle `e745a4b8…a2d5d6ea`, protocol hashes ideal `78858981…`, clean `4a5af7e5…`, standard `5c6dbda4…`, selection (2000..2199) `d9731706…d8688451`, calibration (0..199) `093022cb…c1e596f7`. Linux golden scores re-pinned; the energy term moved PID 1000/1002 and LQR 1000–1002 by 0.015–0.031 points (PID 1001 spends more than E_ref, so its score is unchanged). §0 baselines re-measured on linux-x86_64. | Ranked scores come from linux-x86_64 CI (PLAN.md trust model; contract §13), so the reference energy is measured there. Nothing had been trained against the old protocol hash, so no run is stale. |
+| R2 | The darwin-arm64 golden scores in `tests/test_golden.py` stay at their E_ref 13.0 values, marked stale, until a Mac re-pins them. | Physics reproduces only per platform and no Mac was available to the cloud session. CI never checks darwin pins (only `linux-x86_64`), so CI stays green; a local Mac run fails and prints the values to pin. |
+| R3 | The §13 serializer example in the contract and `test_challenge.py` now names `5.0`, not `13.0`. | `e_ref_j` is no longer integral, so `13.0` no longer illustrates the "never `13`" rule; `5.0` (`success_energy_factor`) still does. |

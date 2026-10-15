@@ -142,9 +142,9 @@ def test_protocol_hash_follows_the_payload() -> None:
 
 
 # The payload of balance-v1/standard's public protocol, as protocol_hash serializes it (§13):
-# keys sorted at every level, no whitespace, floats in Python's repr form ("13.0", "1.0").
+# keys sorted at every level, no whitespace, floats in Python's repr form ("13.1", "5.0").
 STANDARD_PAYLOAD = (
-    '{"bundle":"a3b4846310a1a174f288da82d9532fe986a4b0428ab5069d1620e1237f5017a9",'
+    '{"bundle":"e745a4b8c878ecb2fb8d860981689ae966f8b811b23956783f722cfda2d5d6ea",'
     '"env_algo_version":1,"format":"topple.protocol/1",'
     '"preset":{"name":"standard","pushes":{"count":[1,2,3],"duration_s":0.1,"earliest_s":1.0,'
     '"impulse_ns":[0.25,0.45],"lateral_fraction_max":0.3,"latest_s":8.5,"max_force_n":50.0,'
@@ -155,7 +155,7 @@ STANDARD_PAYLOAD = (
     '"init_pitch_rad":[-0.05235987755982989,0.05235987755982989],"mass_scale":[0.9,1.1],'
     '"motor_gain_common":[0.9,1.1],"motor_gain_per_wheel":[0.95,1.05],'
     '"wheel_friction_scale":[0.9,1.1]},"randomize":true,"sensors":"full"},'
-    '"salt":0,"score":{"drift_ref_m":1.0,"e_ref_j":13.0,"success_energy_factor":5.0,'
+    '"salt":0,"score":{"drift_ref_m":1.0,"e_ref_j":13.1,"success_energy_factor":5.0,'
     '"success_max_drift_m":1.0,"tilt_ref_rad":0.2},'
     '"seeds":[1000,1001,1002,1003,1004,1005,1006,1007,1008,1009,1010,1011,1012,1013,1014,'
     "1015,1016,1017,1018,1019]}"
@@ -163,8 +163,8 @@ STANDARD_PAYLOAD = (
 
 
 def test_protocol_hash_recipe_is_reproducible_from_the_contract() -> None:
-    """§13 written out as a port would, from the exact text: a serializer that writes ``13``
-    for ``13.0`` or adds whitespace gets another hash."""
+    """§13 written out as a port would, from the exact text: a serializer that writes ``5``
+    for ``5.0`` or adds whitespace gets another hash."""
     c = load_challenge("balance-v1")
     expected = hashlib.sha256(STANDARD_PAYLOAD.encode("ascii")).hexdigest()
     assert c.protocol_hash("standard") == expected
@@ -212,7 +212,7 @@ def test_each_calibrated_value_is_bound_by_the_protocol_hashes(
     assert [name for name in presets if moved[name] != base[name]] == ["standard"]
     monkeypatch.undo()
     yaml_path = bundle / "challenge.yaml"
-    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.0", "e_ref_j: 13.1"))
+    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.1", "e_ref_j: 13.2"))
     assert all(load_challenge_dir(bundle).protocol_hash(name) != base[name] for name in presets)
 
 

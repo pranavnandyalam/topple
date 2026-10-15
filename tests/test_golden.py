@@ -61,16 +61,16 @@ CONTROLLER_SEEDS: dict[tuple[int, int], int] = {
     (0, 2**127 + 12345): 8639439415161446,
 }
 
-BUNDLE_HASH = "a3b4846310a1a174f288da82d9532fe986a4b0428ab5069d1620e1237f5017a9"
+BUNDLE_HASH = "e745a4b8c878ecb2fb8d860981689ae966f8b811b23956783f722cfda2d5d6ea"
 # Public protocols: the public seed list, salt 0 (contract §13).
 PROTOCOL_HASHES = {
-    "ideal": "6ad4cf45adfef1b813229aec1e0b899c99f8e4d7953031e70ac8bf27093cb368",
-    "clean": "f30f5119c86f1ef9196d4f4de92cf1b4fc5d7d4204458c8ffe2e5efb6f4194d6",
-    "standard": "a32517413cace0c73c300cddbaf6e480ab78a01ee68b717b67adf0fe7f59c5f4",
+    "ideal": "788589817f1ae83131705d8f25cca4cd5f55db2d4ff9dcf70040eb560f47176d",
+    "clean": "4a5af7e55c853969dd1d28931a70fefe886534ee72b065ce09da6b6b2aa7b1b4",
+    "standard": "5c6dbda432adef41ac7a79f676c818cc85d7a1f18c044d733e84571403b09fb7",
 }
 PRIVATE_SEEDS = (1, 2, 3)
 PRIVATE_SALT = 2**127 + 5
-PRIVATE_PROTOCOL_HASH = "aa7220e396ffefda76e044adbeb8f496d7bb12a45fa36c81e55e069b180c749e"
+PRIVATE_PROTOCOL_HASH = "6fbb609178659fdf83426538622f8dbba3387261134dc56ec0a7516575b17361"
 
 RANKED_PLATFORM = "linux-x86_64"
 """Where CI runs and ranked scores come from (contract §13)."""
@@ -79,6 +79,9 @@ RANKED_PLATFORM = "linux-x86_64"
 EpisodeKey = tuple[float, bool, float]
 EPISODE_SEEDS = (1000, 1001, 1002)
 EPISODES: dict[str, dict[str, dict[int, EpisodeKey]]] = {
+    # STALE until re-pinned on Apple Silicon: these darwin-arm64 values were measured under E_ref
+    # 13.0 J, before the linux-x86_64 recalibration to 13.1 J (2026-10-15), so a local run on a Mac
+    # fails here and prints the values to pin (HANDOFF.md lists this re-pin).
     "darwin-arm64": {
         "pid": {
             1000: (92.05698981231265, True, 10.0),
@@ -94,14 +97,14 @@ EPISODES: dict[str, dict[str, dict[int, EpisodeKey]]] = {
     # The CI platform (GitHub Actions ubuntu-24.04), the source of truth for ranked scores.
     "linux-x86_64": {
         "pid": {
-            1000: (92.06970433366325, True, 10.0),
+            1000: (92.08753235441824, True, 10.0),
             1001: (77.66275112229928, True, 10.0),
-            1002: (46.37032752230015, False, 5.98),
+            1002: (46.4017119240978, False, 5.98),
         },
         "lqr": {
-            1000: (91.52687435124143, True, 10.0),
-            1001: (85.40370568144897, True, 10.0),
-            1002: (83.79327852535813, True, 10.0),
+            1000: (91.54233637656888, True, 10.0),
+            1001: (85.43305302210213, True, 10.0),
+            1002: (83.81544021121424, True, 10.0),
         },
     },
 }

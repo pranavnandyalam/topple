@@ -209,7 +209,8 @@ robot at rest reads +g. The first filter update (step 3) then pulls the estimate
 of noise, an error of at most `(1 − a)·(π + |pitch|)` ≈ 12.8 mrad that decays with `tau`.
 Measured on darwin-arm64: std 7.1 mrad after control step 1 over 300 `clean` seeds (0.55 mrad
 with the tires 0.1 mm into the floor), and no effect on the calibration (§10, §12: on `standard`
-seeds 0..199, LQR 86.5% and PID 64.5% survival and E_ref 13.0 either way). Whether a contact at
+seeds 0..199, LQR 86.5% and PID 64.5% survival and PID's median energy 6.49 J either way, on
+darwin-arm64). Whether a contact at
 exactly zero distance counts rests on rounding, so this first sample can differ by platform, as
 physics may (§14). It is part of balance-v1; changing the spawn changes every score, so it needs
 a new major version (§13).
@@ -440,8 +441,10 @@ MuJoCo's data of the previous substep, so like contacts and the IMU (§5, §11) 
 by one substep (2 ms);
 impulse magnitude **[calibrated]** U(0.25, 0.45) N·s, the `standard` preset's
 `PushConfig.impulse_ns` (target: the reference LQR survives ≥ 80%
-and the shipped PID 40–90% of `standard` episodes; measured on seeds 0..199 (darwin-arm64):
-LQR 86.5%, PID 64.5%, both 100% on `clean`). Force is capped at 50 N.
+and the shipped PID 40–90% of `standard` episodes; measured on seeds 0..199 on `linux-x86_64`,
+the calibration platform (the one ranked scores come from, §13): LQR 87.5%, PID 65.0%; on
+darwin-arm64: LQR 86.5%, PID 64.5%; both 100% on `clean` on both platforms). Force is capped at
+50 N.
 
 ## 11. Termination, stability
 
@@ -502,8 +505,9 @@ Episode score (0–100):
 
 `success = survived ∧ drift_m < 1 ∧ energy_j ≤ 5·E_ref`. `E_ref` **[calibrated]** = 2× the PID
 baseline's median energy on `balance-v1/standard` (seeds 0..199, all episodes), rounded to 0.1 J,
-frozen: 2 × 6.49 J → `E_ref = 13.0` J (measured on darwin-arm64; physics, unlike scenarios, is
-only reproducible per platform, §14).
+frozen: 2 × 6.566 J → `E_ref = 13.1` J, measured on `linux-x86_64`, the calibration platform
+because ranked scores come from it (§13). Physics, unlike scenarios, is only reproducible per
+platform (§14): darwin-arm64 measures 6.49 J, which would round to 13.0 J.
 
 Protocol score = `fsum` of episode scores in seed order / N, and success rate = successes / N,
 where N is the number of episodes the protocol expects: a missing or errored episode counts as 0.
@@ -539,7 +543,7 @@ change.
   directory do not count; a listed file outside the bundle directory is an error.
 - `protocol_hash(preset, seeds, salt)` = sha256 of the canonical JSON (UTF-8; keys sorted at
   every level; separators `,` and `:` with no whitespace; floats in Python's shortest round-trip
-  form, so `13.0` is written `13.0`, never `13`: Python's
+  form, so `5.0` is written `5.0`, never `5`: Python's
   `json.dumps(…, sort_keys=True, separators=(",", ":"), allow_nan=False)`; the standard
   protocol's text is pinned in `tests/test_challenge.py`) of
   `{format: "topple.protocol/1", env_algo_version, bundle: bundle_hash,

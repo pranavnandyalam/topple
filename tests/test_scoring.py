@@ -180,9 +180,9 @@ def test_energy_cap_blocks_success() -> None:
 
 def test_success_boundaries() -> None:
     """§12: success needs ``drift_m < 1`` (strict) and ``energy_j <= 5·E_ref`` (inclusive), so an
-    episode that ends exactly 1 m out fails and one that used exactly 65 J succeeds."""
+    episode that ends exactly 1 m out fails and one that used exactly 65.5 J succeeds."""
     limit = CFG.success_energy_factor * CFG.e_ref_j
-    assert limit == 65.0
+    assert limit == 65.5
     at_one_metre = episode_metrics(synthetic(10, x_end=CFG.success_max_drift_m), MOTOR)
     assert (at_one_metre.survived, at_one_metre.drift_m) == (True, 1.0)
     assert not episode_success(at_one_metre, CFG)
@@ -267,4 +267,4 @@ def test_rms_tilt_is_a_root_mean_square() -> None:
 
 def test_score_config_is_frozen_constant() -> None:
     assert ScoreConfig.model_fields.keys() >= {"e_ref_j", "tilt_ref_rad", "drift_ref_m"}
-    assert CFG.e_ref_j == pytest.approx(13.0)
+    assert CFG.e_ref_j == pytest.approx(13.1)

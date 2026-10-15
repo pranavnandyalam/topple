@@ -61,6 +61,14 @@ final rule and logs it.
 
 ## (c) Calibration and E_ref were measured on darwin-arm64 only
 
+**Status (2026-10-15): closed for balance-v1.** Re-measured on linux-x86_64 before any Phase 2
+training: both bands hold (LQR 87.5%, PID 65.0% survival; both 100% on `clean`), and 2× PID's
+median energy (6.566 J) rounds to 13.1, so E_ref moved 13.0 → 13.1 J and linux-x86_64 is now the
+calibration platform (`challenge.yaml`, contract §10 and §12; decision log rows R1–R3). Left open:
+the darwin-arm64 golden scores in `tests/test_golden.py` must be re-pinned on a Mac. The text
+below is the original risk, kept for its rule: every future challenge is calibrated on the ranked
+platform.
+
 - **Risk.** balance-v1's calibrated values, the push band U(0.25, 0.45) N·s and E_ref = 13.0 J,
   and the bands they were checked against (LQR ≥ 80% and PID 40–90% survival on `standard` seeds
   0..199) were measured on darwin-arm64. Ranked scores come from linux-x86_64 CI (contract §13),

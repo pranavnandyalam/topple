@@ -1,10 +1,12 @@
-# Phase 2 design: Learn (v5.2, normative)
+# Phase 2 design: Learn (v5.3, normative)
 
 v5 resolves re-critique round 3. Every issue from the six critiques (`wf_3f0c2a9a-a51`,
 `wf_2fb93652-cd0`, `wf_bc1d1edf-2dc`) and the three re-critiques is decided in
 `docs/design/phase-2-decisions.md`. v5.1 syncs the spec with the merged Phase 1 (main `f997394`,
 PR #3); its changes are rows S1–S22 of the log's "Sync with merged Phase 1". v5.2 fixes the 18
 findings of the sync's adversarial verification (rows V1–V18 of the log's "Sync verification").
+v5.3 records the linux-x86_64 recalibration (E_ref 13.0 → 13.1; row R1 of the log's
+"Linux recalibration").
 
 The design builds on the merged Phase 1 code and `docs/contract.md` ("contract §n", also for a
 list such as "contract §9, §14"; a bare §n is this spec): `controller_obs(obs_arr, t)`,
@@ -24,7 +26,8 @@ review gate:
   starts after 2a passes.
 
 **No literals for E_ref.** E_ref means `challenge.config.score.e_ref_j` of the protocol in use
-(balance-v1: 13.0 J = 2 × PID's median 6.49 J; 13.3 before the Phase 1 recalibration). Code reads
+(balance-v1: 13.1 J = 2 × PID's median 6.566 J on linux-x86_64, the calibration platform since
+2026-10-15; 13.0 when it was measured on darwin-arm64, 13.3 before the Phase 1 recalibration). Code reads
 it from the `ScoreConfig`; `train_meta.json` and `phase2.json` record the value used. Every number
 this spec quotes from a pilot is replaced in `phase2.md` by a template filled from `phase2.json`
 (§5.1).
@@ -32,22 +35,27 @@ this spec quotes from a pilot is replaced in `phase2.md` by a template filled fr
 ## 0. Facts used
 
 Balance-v1/standard. Gates compare against baselines **measured in the same run**. Baselines on the
-merged Phase 1 env (E_ref 13.0, darwin-arm64; survival equals success in every row; mean saturation
-on 0..199: PID 0.074, LQR 0.046):
+merged Phase 1 env after the linux-x86_64 recalibration (E_ref 13.1, measured 2026-10-15 on
+linux-x86_64, Xeon with AVX-512; survival equals success in every row; mean saturation on 0..199:
+PID 0.074, LQR 0.046):
 
 | Controller | Seeds | Score | Success | Median energy |
 |---|---|---|---|---|
-| PID (`submissions/pid_example.py`) | 0..199 | 68.70 | 0.645 | 6.49 J |
-| PID | 2000..2199 | 70.63 | 0.655 | 5.89 J |
-| PID | eval_v1 (1000..1019) | 73.05 | 0.75 | 7.38 J |
-| LQR (`submissions/lqr_example.py`) | 0..199 | 80.06 | 0.865 | 3.26 J |
-| LQR | 2000..2199 | 82.51 | 0.90 | 2.76 J |
-| LQR | eval_v1 | 85.42 | 0.95 | 2.84 J |
+| PID (`submissions/pid_example.py`) | 0..199 | 68.67 | 0.650 | 6.57 J |
+| PID | 2000..2199 | 70.90 | 0.660 | 5.99 J |
+| PID | eval_v1 (1000..1019) | 72.82 | 0.75 | 7.36 J |
+| LQR (`submissions/lqr_example.py`) | 0..199 | 80.36 | 0.875 | 3.28 J |
+| LQR | 2000..2199 | 82.77 | 0.905 | 2.77 J |
+| LQR | eval_v1 | 85.48 | 0.95 | 3.03 J |
+
+The same rows on darwin-arm64 under E_ref 13.0 (before the recalibration): PID 68.70 / 0.645 /
+6.49 J, 70.63 / 0.655 / 5.89 J, 73.05 / 0.75 / 7.38 J; LQR 80.06 / 0.865 / 3.26 J, 82.51 / 0.90 /
+2.76 J, 85.42 / 0.95 / 2.84 J.
 
 Every PPO and SAC number below is a pilot on the Phase 1 fix branch before the merge (E_ref 13.3;
 there LQR scored 80.14 / 0.865 on 0..199 and PID 70.29 / 0.64 on 2000..2199). It motivates the
 recipe only: every gate bar is relative to PID, LQR or E_ref measured in the same run (§2.4, §4),
-so the bars follow the recalibration without edits; the energy bar is now 13.0 J.
+so the bars follow the recalibration without edits; the energy bar is now 13.1 J.
 
 - **PPO** (pilot env, 8 envs × 2048, batch 2048, 10 epochs, penalty box 2 / weight 0.1, 5M
   steps; pick by selection on 2000..2199, fresh score / success on 0..199, PPO − LQR paired 95% CI):
@@ -285,9 +293,10 @@ Rules:
   2000..2199, built with `dataclasses.replace` from `EvalProtocol.from_id`, as `topple run` builds
   its one-seed protocol) and the current `ENV_ALGO_VERSION` and fails if **any** reported run (PPO,
   SAC, ablation) differs, or if the shipped run has `git_dirty: true`. Known answers at v5.1 (they
-  move only with a reviewed re-pin, contract §13): selection `148b7b6b9ec392c09f32e2a053df3894c4d2d93e820bdac00b786db6dc9e9ea6`,
-  calibration 0..199 `c7b0a50cdb33c55dd26bff880232d5c1ab37f57eb371f69a35ee13d50a4156c1`, bundle
-  `a3b4846310a1a174f288da82d9532fe986a4b0428ab5069d1620e1237f5017a9`, `ENV_ALGO_VERSION` 1.
+  move only with a reviewed re-pin, contract §13; these are after the E_ref 13.1 recalibration):
+  selection `d97317062fd668d4d461beb75dfe55e99c067fca7d4614de1c23bed1d8688451`,
+  calibration 0..199 `093022cb551010be2ad6189120f8b49229d40ee47ed02e10b07bdbc5c1e596f7`, bundle
+  `e745a4b8c878ecb2fb8d860981689ae966f8b811b23956783f722cfda2d5d6ea`, `ENV_ALGO_VERSION` 1.
 - **Determinism per (config, seed, platform, start_method) is required and tested** (CLAUDE.md:
   seeded runs are deterministic per platform). `test_train_smoke` runs each smoke config twice
   with the same seed and asserts identical sha256 of every `actor.npz` / `critic.npz`, identical
@@ -1083,8 +1092,9 @@ metric keys may be added (`fall_cause`, §8.5). Golden tests pin the existing ke
   call is unchanged), `make_scenario(seed, preset, *, timestep, control_dt, episode_seconds,
   course: CourseConfig | None = None)`, `load_npz` / `Trajectory._check_shapes` / `save_npz`
   (§8.1a), the CLI's upload loaders and `video.py`.
-- **Golden tests.** Phase 1's pass unchanged: `tests/test_golden.py` (bundle `a3b48463…7f5017a9`;
-  `protocol_hash` ideal `6ad4cf45…`, clean `f30f5119…`, standard `a3251741…`, a salted private one;
+- **Golden tests.** Phase 1's pass unchanged: `tests/test_golden.py` (bundle `e745a4b8…a2d5d6ea`;
+  `protocol_hash` ideal `78858981…0f47176d`, clean `4a5af7e5…2aa7b1b4`, standard
+  `5c6dbda4…03b09fb7`, a salted private one;
   `ENV_ALGO_VERSION` 1; scenarios of seeds 0, 1000, 2**53−1 per preset; PID/LQR scores per platform)
   and `tests/test_challenge.py` (the standard payload text, `ScoreConfig` dump included). New:
   `make_scenario` for standard seeds 1000..1019; an AST test forbidding `PRESETS[` in
@@ -1513,7 +1523,7 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
 
 | Risk | Mitigation |
 |---|---|
-| Phase 1 changes move PID/LQR/E_ref (the merge moved E_ref 13.3 → 13.0, §0) | Baselines measured in the same run; E_ref from ScoreConfig; env version and protocol hash bound in train_meta (G10); a Phase 3 recalibration on linux-x86_64 (`deferred-risks.md` (c)) means re-running or excluding stale runs. |
+| Phase 1 changes move PID/LQR/E_ref (the merge moved E_ref 13.3 → 13.0, the linux-x86_64 recalibration 13.0 → 13.1, §0) | Baselines measured in the same run; E_ref from ScoreConfig; env version and protocol hash bound in train_meta (G10); a Phase 3 recalibration on linux-x86_64 (`deferred-risks.md` (c)) means re-running or excluding stale runs. |
 | A seed lands low | Linear LR decay (constant LR collapsed 1 of 3 seeds), 3 seeds, 200 selection seeds, eligibility mirrors G3/G4, `late_regression` flag, fallback to the next run on any `SHIP_GATES` failure; G11 and the recipe row expose a broken recipe. |
 | Training silently loses determinism | Twice-run smoke test with sha equality; retries must reproduce the aborted attempt's `onnx_sha256` (`nondeterministic` flag). |
 | Mac-only evidence flips on the ranking platform | G2–G4 evaluated on both the Mac and the ubuntu CI compare. |

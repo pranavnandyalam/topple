@@ -913,7 +913,7 @@ def test_evaluate_runs_on_the_protocols_challenge_object(tmp_path: Path) -> None
     root = tmp_path / "balance-v1"
     shutil.copytree(challenge_dir("balance-v1"), root)
     yaml_path = root / "challenge.yaml"
-    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.0", "e_ref_j: 0.001"))
+    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.1", "e_ref_j: 0.001"))
     base = protocol("clean", 1)
     custom = replace(base, challenge=load_challenge_dir(root))
     a = evaluate(base, pid, INFO)
