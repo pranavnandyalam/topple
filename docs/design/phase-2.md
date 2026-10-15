@@ -5,7 +5,8 @@ v5 resolves re-critique round 3. Every issue from the six critiques (`wf_3f0c2a9
 `docs/design/phase-2-decisions.md`. v5.1 syncs the spec with the merged Phase 1 (main `f997394`,
 PR #3); its changes are rows S1–S22 of the log's "Sync with merged Phase 1". v5.2 fixes the 18
 findings of the sync's adversarial verification (rows V1–V18 of the log's "Sync verification").
-v5.3 records slice 1a's resolved deviations (rows B1–B11 of the log's "Slice 1a build") and the linux-x86_64 recalibration (E_ref 13.0 → 13.1; rows R1–R6 of the log's
+v5.3 records slices 1a and 1b's resolved deviations (rows B1–B12 of the log's "Slice 1a build",
+B13–B16 of "Slice 1b build") and the linux-x86_64 recalibration (E_ref 13.0 → 13.1; rows R1–R6 of the log's
 "Linux recalibration") and Pranav's answers to the open questions (rows A1–A8 of "Owner answers"),
 which keep the waypoint scene identical to balance-v1's (§8.2).
 
@@ -409,16 +410,21 @@ by the CLI), all regular files with `st_nlink == 1`.
   files (`.DS_Store`), FIFOs, sockets and `.py/.pyc/.so/.pkl/.pickle/.zip/.pt/.pth/.joblib/.ckpt/
   .onnx.data`. `policy.json` plus any `.py` is `LoadError("ambiguous submission kind")`.
 - As contract §8 rules for `controller.py`: names match exactly as `os.scandir` returns them
-  (`POLICY.JSON` is unexpected on macOS too), non-UTF-8 names are refused, the listing stops at the
+  (a directory whose only manifest is `POLICY.JSON` is no policy on any OS: it gets the no-entry
+  error), non-UTF-8 names are refused, the listing stops at the
   4th entry (a bounded walk), and a path that cannot be examined is a `LoadError`, never `OSError`.
 - **Read once.** Each file is read once (`read_regular_file`); `submission_sha256` (contract §8's
   recipe) is computed from those bytes, and those `policy.onnx` bytes are validated and run.
-- The loader checks for `policy.json` before `controller.py`. Python submissions are unchanged but
+- The loader checks for `policy.json` before `controller.py`, by exact name: an `lstat`, then a
+  listing capped at 101 top-level entries that must contain the name `policy.json` (reaching the
+  cap stays a policy); a `policy.json` that cannot be examined does not make a policy (B13).
+  Python submissions are unchanged but
   for one case: a Python directory with a top-level `policy.json` asset, which contract §8 allows
   today, becomes ambiguous and is refused; the §8 update (§3.6) states this.
 
 `policy.json` is the normative manifest (onnxruntime-web cannot read `metadata_props`).
-**Parsing:** `read_regular_file(cap=16 KiB)`; reject a BOM; a rejection-only pre-pass
+**Parsing:** `read_regular_file(cap=16 KiB)`; reject a BOM; a byte scan refusing nesting deeper
+than 32 levels (`manifest_too_deep`, before any JSON parser, B13); a rejection-only pre-pass
 `json.loads(data.decode("utf-8"), object_pairs_hook=_reject_duplicates, parse_constant=_reject)`
 that also rejects any key or string that fails `.encode("utf-8")` (lone surrogates); then
 `PolicyManifest.model_validate_json(data)` (JSON mode: arrays become tuples, strict scalars, int
@@ -742,6 +748,7 @@ class ONNXPolicy:                                             # implements Contr
     def act(self, obs: Observation) -> tuple[float, ...]
 @dataclass(frozen=True)
 class LoadedPolicy: manifest: PolicyManifest | None; validated: ValidatedPolicy; session: ort.InferenceSession
+    # property policy_sha256 = validated.policy_sha256; never pickled or copied
 def load_policy_dir(path: Path, *, challenge: Challenge) -> LoadedPolicy        # full validation + smoke
 def policy_from_bytes(data: bytes, *, challenge: Challenge, expected_sha256: str | None = None) -> LoadedPolicy
 # topple/pool.py
@@ -750,6 +757,8 @@ class PolicyRef: kind: Literal["onnx", "python"]; payload: bytes | str; sha256: 
 def policy_ref(sub: Path, *, challenge: Challenge) -> PolicyRef   # parent: reads + validates ONCE
 def worker_factory(ref: PolicyRef) -> ControllerFactory           # worker: re-checks sha256 before the first episode
 def eval_pool(workers: int) -> ProcessPoolExecutor
+def submit_episodes(pool: Executor, ref: PolicyRef, protocol: EvalProtocol, indices: Sequence[int]) -> Future[list[EpisodeResult]]
+    # refuses a private protocol, another challenge or bad indices in the PARENT, before anything is pickled
 ```
 
 - **SessionOptions:** `intra_op_num_threads=1`, `inter_op_num_threads=1`, `ORT_SEQUENTIAL`,
@@ -774,20 +783,25 @@ def eval_pool(workers: int) -> ProcessPoolExecutor
   caller without an env reads them from the kind entry, §8.1). Any failure is one `LoadError`.
 - **Pools.** The parent builds a `PolicyRef` once: ONNX → (canonical bytes ≤ 1 MiB,
   `policy_sha256`); Python → (path, `submission_sha256`). A worker calls `policy_from_bytes(...,
-  expected_sha256=...)` or re-hashes the Python submission and raises on mismatch before its
-  first episode. `LoadedPolicy`, sessions and factories are never pickled. Results return by
+  expected_sha256=...)` or `load_submission(path, challenge=..., expected_sha256=...)`, which
+  compares the hash of its single read before compiling anything, and raises on mismatch before
+  its first episode (files the submission reads later are not covered, B13). `LoadedPolicy`, sessions and factories are never pickled. Results return by
   pickle; this is acceptable locally only (local eval is not a security boundary; §10 (iii)).
   Workers receive public protocols only (Phase 2 never runs a private one; a private
-  `EvalProtocol`'s salt would reach every worker, and only its `repr` is redacted, contract §8).
+  `EvalProtocol`'s salt would reach every worker, and only its `repr` is redacted, contract §8):
+  `submit_episodes` refuses a private protocol in the parent.
 - **Determinism** (contract §17): bit-exact per (os, arch, `cpu_isa`, onnxruntime version);
   across runtimes within 1e-5, never bit-exact, so replays play stored trajectories. No test pins
   an ONNX episode score; tests compare orderings only (PPO > PID).
 
 ### 3.6 Loader, results, contract
 
-- **Loader.** `load_submission(path, *, challenge: Challenge | None = None)` (Phase 1 takes
-  `path` only): `challenge` is required for `kind == "onnx"` (`TypeError` if missing). CLI `eval`,
-  `run`, `compare` pass the protocol's challenge. `Submission.sha256` is §3.1's read-once hash.
+- **Loader.** `load_submission(path, *, challenge: Challenge | None = None, expected_sha256: str
+  | None = None)` (Phase 1 takes `path` only): `challenge` is required for `kind == "onnx"`
+  (`TypeError` if missing, raised after the directory is listed and read). CLI `eval`, `run`,
+  `compare` pass the protocol's challenge. `Submission.sha256` is §3.1's read-once hash.
+  `topple verify --submission` records `policy_sha256` through `loader.submission_hashes`, which
+  reads a policy directory under the policy entry rules (B13).
 - **Results** (before `topple.results/1` is published; contract §15's strict reader stays as is):
   `Versions` gains `onnxruntime`, `onnx`, `cpu_isa` (`avx512f` / `avx2` / `sse4` from
   `/proc/cpuinfo` on Linux; `arm64-sme` / `arm64-neon` from `sysctl hw.optional` on macOS), each

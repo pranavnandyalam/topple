@@ -670,3 +670,19 @@ fixer's tightenings are decided here; §3.2–§3.4 now state them.
 | B10 | Default-attribute table adds LeakyRelu `alpha = float32(0.01)`, Elu `alpha = 1.0`; tested against `onnx.defs` for opsets 17–21. | Same rule as Gemm's defaults. |
 | B11 | Slice 1b: pack refuses a node that repeats an attribute name (`duplicate_attribute`), in both modes. | Re-review RR-2: pack resolved a duplicated `alpha` that the checker and ORT reject. |
 | B12 | BLOCKER for any PR/merge: `onnx>=1.23.2,<1.24` and `protobuf>=7.36,<8` must move to base dependencies (§7) and `uv.lock` be regenerated; until then the default CI jobs (mypy, pytest, slow) cannot import `topple.policy`. A strict xfail (`test_onnx_and_protobuf_are_base_dependencies`) flips when it lands. | The cloud environment blocks download.pytorch.org, which `uv lock` needs; no workaround that hides the failure. |
+
+## Slice 1b build (2026-10-15, spec v5.3)
+
+Slice 1b (commits `0da4ce6`, `9e2153f`): manifest, policy directories, `ONNXPolicy`, pools, loader
+and results integration, contract §8/§15/§16/§17. Same review gate as 1a. Confirmed: one HIGH (the
+`policy.json` probe changed Python-submission errors for a directory that can be listed but not
+searched, failing four Phase 1 tests on CI's non-root runner) and one MEDIUM (`topple verify
+--submission <policy dir>` recorded `policy_sha256` null); both fixed with regression tests, and
+the re-review ran the fast suite without DAC override (2,523 passed). Decided here:
+
+| # | Change | Reason |
+|---|---|---|
+| B13 | Detection by exact name (`lstat`, then a listing capped at 101 entries); an unexaminable `policy.json` stays Python; manifest nesting > 32 refused by a byte scan before any parser (`manifest_too_deep`); `load_submission(..., expected_sha256=)` checks the single read before compiling (pool workers use it); `submit_episodes` refuses private protocols in the parent; the no-entry error names both kinds; `verify --submission` records `policy_sha256` via `submission_hashes` under the policy entry rules; Phase 1's `_read_capped` opens non-blocking and requires a regular file. | Review fixes: SPEC-1/2/3/5, PR-1/2/7/8, RT-1/2/3/4. A 16 KiB manifest of nested brackets crashed a small-stack thread with SIGSEGV in the C JSON scanner; case-insensitive file systems made kind detection differ per OS. |
+| B14 | Manifest parsing: integer literals over 20 digits refused in the pre-pass (independent of `PYTHONINTMAXSTRDIGITS`); every `Claims` key required but nullable; extra bounds (ids ≤ 64 and their grammar, feature names `[a-z][a-z0-9_]{0,63}`, dims 1..4096, ir/opset 1..64, counts in [0, 2^53), `control_dt` > 0, tolerance > 0); metadata compared as canonical JSON text (type-exact: `1.0 != true`). | Stricter is cheap now and a format bump later (§3.4); Python `==` equates `1.0` and `True`. |
+| B15 | Ambiguity: `controller.py` is probed directly (always "ambiguous submission kind"); another `.py` is ambiguous only among the first 4 listed entries, else "unexpected entry". The directory's identity is re-checked after its files are read. `policy_from_bytes` runs full validation, compares metadata with the challenge (action rule from the graph structure) and smokes. | The bounded listing cannot see every `.py`; both outcomes refuse. The re-check closes a directory swap between listing and reading. |
+| B16 | Dims come from `policy_task(challenge)` (`Challenge.task_spec` with placeholder geometry) until the §8.1 kind registry exists (2b). `Versions.onnxruntime`/`onnx` are recorded for Python controllers too (package metadata, no import); Linux `cpu_isa` reads x86 flags only (arm64 Linux → None). Slice 1c: `submit_episodes`/`run_episodes` must materialize `indices` once (re-review RR-1: a one-shot iterable passed the check and ran zero episodes). | No registry yet; geometry does not change features or bounds. |
