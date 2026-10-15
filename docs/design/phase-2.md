@@ -5,7 +5,7 @@ v5 resolves re-critique round 3. Every issue from the six critiques (`wf_3f0c2a9
 `docs/design/phase-2-decisions.md`. v5.1 syncs the spec with the merged Phase 1 (main `f997394`,
 PR #3); its changes are rows S1–S22 of the log's "Sync with merged Phase 1". v5.2 fixes the 18
 findings of the sync's adversarial verification (rows V1–V18 of the log's "Sync verification").
-v5.3 records the linux-x86_64 recalibration (E_ref 13.0 → 13.1; rows R1–R6 of the log's
+v5.3 records slice 1a's resolved deviations (rows B1–B11 of the log's "Slice 1a build") and the linux-x86_64 recalibration (E_ref 13.0 → 13.1; rows R1–R6 of the log's
 "Linux recalibration") and Pranav's answers to the open questions (rows A1–A8 of "Owner answers"),
 which keep the waypoint scene identical to balance-v1's (§8.2).
 
@@ -469,9 +469,14 @@ graph is built with `onnx.helper` from `actor.npz` + `normalize.json`.
 ```python
 @dataclass(frozen=True) class ObsNorm: mean: NDArray[f64]; var: NDArray[f64]; epsilon: float; clip: float
 @dataclass(frozen=True) class MlpWeights: layers: tuple[tuple[NDArray[f32], NDArray[f32]], ...]; activation: Literal["tanh", "relu"]
-def build_policy_onnx(w: MlpWeights, norm: ObsNorm, *, action_rule: str, metadata: Mapping[str, str]) -> bytes
-def reference_actions(w: MlpWeights, norm: ObsNorm, action_rule: str, obs: NDArray[f32]) -> NDArray[f64]
+def build_policy_onnx(w: MlpWeights, norm: ObsNorm, *, action_rule: str, metadata: Mapping[str, str], action: ActionSpec) -> bytes
+def reference_actions(w: MlpWeights, norm: ObsNorm, action_rule: str, obs: NDArray[f32], *, action: ActionSpec) -> NDArray[f64]
+def policy_metadata(spec: TaskSpec, action_rule: str) -> dict[str, str]   # the 7 topple.* values (json.dumps, ASCII)
 ```
+
+`action` is the challenge's `TaskSpec.action` (head bounds, action dim; decision log B1). Only the
+pairings (tanh, `clip(mean)`) and (relu, `tanh(mean)`) with exactly two hidden layers are built;
+the builder checks `metadata` against what it builds and refuses float32 constants that overflow.
 
 - **Normalization** = SB3 `normalize_obs`: `z = clip((x − μ)/sqrt(σ² + ε), −c, c)`, ε =
   `VecNormalize.epsilon` = 1e-8, c = `clip_obs`. Constants are computed in f64 and rounded once:
@@ -559,7 +564,8 @@ Export never imports torch or calls `PPO/SAC/VecNormalize.load`, `pickle`, `clou
    `Identity` nodes by rewiring, renames the single input/output to `obs`/`action`, turns a
    static batch dim of 1 into `dim_param "batch"`, and sets IR to `CANONICAL_IR[opset]`; it still
    rejects external data first;
-3. add exactly the 7 `topple.*` metadata keys from the challenge; checks 1–9 on the result;
+3. set exactly the 7 `topple.*` metadata keys from the challenge, replacing any the input
+   carried; checks 1–9 on the result;
    `smoke_test`;
 4. write `policy.onnx` + `policy.json` with `action_rule` from the structure match (§3.4) and
    `claims.export_parity = None`.
@@ -586,11 +592,13 @@ OP_WEIGHT = {**dict.fromkeys(("Add", "Sub", "Mul", "Div", "Neg", "Relu", "LeakyR
 def read_regular_file(path: Path, cap: int) -> bytes
 @dataclass(frozen=True)
 class ValidatedPolicy: canonical: bytes; policy_sha256: str; cost: int; obs_dim: int; action_dim: int
-    # constructible only inside validate.py (module-private sentinel checked in __post_init__)
-def validate_policy_bytes(data: bytes, obs_dim: int, action_dim: int) -> ValidatedPolicy | list[str]
+    # constructible only inside validate.py (module-private sentinel checked in __post_init__);
+    # keyword-only and final (no subclass); make_session requires the exact type
+def validate_policy_bytes(data: bytes, obs_dim: int, action_dim: int) -> ValidatedPolicy | list[str]   # data: exact bytes
 def canonicalize(proto: onnx.ModelProto, *, pack: bool = False) -> bytes
 def static_cost(proto: onnx.ModelProto) -> int
-def smoke_test(v: ValidatedPolicy) -> list[str]
+def smoke_test(v: ValidatedPolicy) -> list[str]       # = smoke_run(v).errors
+def smoke_run(v: ValidatedPolicy) -> SmokeReport       # SmokeReport(errors: tuple[str, ...], latency_p99_us: float | None)
 def safe(s: str | bytes) -> str    # bytes -> decode("utf-8", "replace"); re.sub(r"[^A-Za-z0-9_.:/-]", "?", s)[:64]
 def structure_match(proto: onnx.ModelProto) -> Literal["clip(mean)", "tanh(mean)", "other"]
 ```
@@ -614,7 +622,8 @@ C++ checker, shape inference, `numpy_helper`, `onnx.external_data_helper` or ORT
 bytes that failed checks 1–7.
 1. **Size and parse.** ≤ 1 MiB (a [64,64] export is about 21 KB); `onnx.ModelProto.FromString`;
    `google.protobuf.message.DecodeError` (incl. nesting deeper than about 35 levels) →
-   `onnx_parse_failed`. Never `onnx.load(path)`, `check_model(path)` or `version_converter`.
+   `onnx_parse_failed`. (protobuf 7.36's limit is 100 message levels; about 34 nested subgraphs
+   reach it, B4.) Never `onnx.load(path)`, `check_model(path)` or `version_converter`.
 2. **Field allow-list.** Walk the proto recursively with `ListFields()` (repeated fields via
    `fd.is_repeated`; protobuf 7 has no `fd.label`). On every visited message reject
    `len(google.protobuf.unknown_fields.UnknownFieldSet(msg)) > 0` (`msg.UnknownFields()` raises
@@ -635,7 +644,8 @@ bytes that failed checks 1–7.
    9/10 features are excluded by check 2, so lowering IR in pack is safe; checker and ORT accept
    IR 8 with opsets 18 and 21); no `functions`, `training_info`, `sparse_initializer`.
 4. **Strings.** Node, value, initializer, graph and every TensorProto name match
-   `^[A-Za-z0-9_.:/-]{1,128}$`; `op_type` and attribute names match `^[A-Za-z]{1,32}$`; exactly
+   `^[A-Za-z0-9_.:/-]{1,128}$`; `op_type` matches `^[A-Za-z]{1,32}$` and attribute names
+   `^[A-Za-z_]{1,32}$` (so `value_float` and `value_floats` reach check 6, B2); exactly
    the 7 §3.2 `metadata_props` keys (`^topple\.[a-z_]{1,32}$`), each value ASCII and ≤ 1,024
    bytes; `producer_name` ≤ 128 chars.
 5. **I/O.** One input `obs` float32 `[sym, obs_dim]`, one output `action` float32
@@ -654,8 +664,9 @@ bytes that failed checks 1–7.
    Values are read with `struct`/`np.frombuffer` on the raw fields only.
 8. **Structure and cost.** `check_model(proto, full_check=True)`; `infer_shapes(proto,
    strict_mode=True, check_type=True)`. Every node output except Constant outputs MUST be
-   float32, rank 2, dim0 the `obs` batch symbol, dim1 static ≤ 4096. Every initializer is used and
-   every node reaches `action`. `static_cost = Σ_{Gemm,MatMul} K·N + Σ_{other} OP_WEIGHT[op]·max(1,
+   float32, rank 2, dim0 the `obs` batch symbol, dim1 static ≤ 4096. Every initializer is used,
+   every node reaches `action`, and a node other than a Constant computes `action`
+   (`output_not_computed`, B9). `static_cost = Σ_{Gemm,MatMul} K·N + Σ_{other} OP_WEIGHT[op]·max(1,
    n_inputs − 1)·dim1(output) ≤ 2^17`. First-party PPO ≈ 5,200 weighted (25× headroom). The
    variadic term closes the 245,000-input `Max` bomb (89 ms per act); the weights close compute-
    heavy unary chains: at cost 2^18 unweighted, 52 Softplus nodes at width 4096 took 1,060 µs per
@@ -663,10 +674,13 @@ bytes that failed checks 1–7.
    case measured 16.3–21.1 µs per act on M5, ≤ 8.4 s per 400k acts. ORT's
    `session.set_denormal_as_zero` is never enabled in-process (it would set FTZ/DAZ on the
    calling thread on x86 and change MuJoCo arithmetic).
-9. **Canonical.** `canonicalize(proto) == data`, else `"policy.onnx is not canonical; run topple
-   policy pack"`.
+9. **Canonical.** `canonicalize(proto) == data`, else `"not_canonical: policy.onnx is not
+   canonical; run topple policy pack"`.
 
-**Error text** is fixed vocabulary plus `safe(s)`. Pydantic errors render only `'.'.join(safe(str(p))
+**Error text** is fixed vocabulary plus `safe(s)`. Every validator message has the form
+`code: detail` (a fixed code, then fixed text and `safe` names); `CHECK_OF` maps each code to its
+check. An exception inside a check becomes `<code>: raised during check N`; every `Exception` is
+caught there, not only the classes below; at most 8 messages are returned per rejection (B3). Pydantic errors render only `'.'.join(safe(str(p))
 for p in loc)` and `type` (never `msg`, `input` or `ctx`). onnx/ORT exceptions become fixed codes
 (`onnx_parse_failed`, `invalid_utf8`, `onnx_checker_failed`, `shape_inference_failed`,
 `ort_load_failed`). `validate_policy_bytes`, `read_manifest` and `load_policy_dir` wrap their
@@ -684,7 +698,14 @@ metadata keys in key order (pack drops all others; load rejects them at check 4)
 as little-endian `raw_data` with no `name` inside attributes. It **folds every `Constant`** node
 (value tensor, `value_float`, `value_floats`) into an initializer `c{j}` in first-use order, and
 **drops every attribute equal to its schema default** (Gemm `alpha = 1.0`, `beta = 1.0`,
-`transA = 0`, `transB = 0`), ordering the rest by name. Then
+`transA = 0`, `transB = 0`; also LeakyRelu `alpha = float32(0.01)` and Elu `alpha = 1.0`, B10),
+deciding default-ness on the attribute it emits, ordering the rest by name. Outside pack mode it
+raises on any field off the allow-list instead of dropping it, and keeps unused initializers and
+folded Constants so check 8 still sees them. Pack mode keeps the input's 7 `topple.*` keys and
+drops every other metadata key (so `topple policy pack` **replaces** those keys with the
+challenge's, never appends); it refuses nodes in a non-default domain, Identity cycles, nodes with
+two outputs, undefined or duplicate values, tensors with both payloads, Constants it cannot fold,
+invalid UTF-8 it would copy and (slice 1b) a node that repeats an attribute name (B8, B11). Then
 `SerializeToString(deterministic=True)`. Node order is kept (ONNX requires topological order).
 It is a fixed point; canonical bytes contain no `Constant` node, so a model with one fails check
 9 at load ("run topple policy pack"). ORT only ever sees canonical bytes.
@@ -692,16 +713,19 @@ It is a fixed point; canonical bytes contain no `Constant` node, so a model with
 **smoke_test:** 32 batch-1 calls (zeros, then `default_rng(1)` normals) through `make_session`;
 each output float32 `(1, action_dim)` and finite. Per call: a fresh `ort.RunOptions()`, a
 `threading.Timer(1.0)` that sets `terminate = True`, `run`, `Timer.cancel()` in `finally`. A
-terminate error is `"smoke call exceeded 1 s"`, anything else `"smoke call failed: ort_run_failed"`.
+terminate error is `"smoke call exceeded 1 s"`, anything else `"smoke call failed: ort_run_failed"`
+(also `smoke call failed: bad_output` for a wrong dtype or shape, `smoke call failed:
+non_finite_output`, and `ort_load_failed` when no session can be made; B6).
 ORT checks `terminate` only between kernels, so it is not a bound; the static cost is the
 acceptance bound and the Phase 3 process kill the runtime bound. The p99 is recorded as
-`latency_p99_us` (never an acceptance criterion). `ONNXPolicy.act` uses no RunOptions.
+`latency_p99_us` in `smoke_run`'s `SmokeReport` (never an acceptance criterion). `ONNXPolicy.act` uses no RunOptions.
 
 **Structure match** (`structure_match`, on canonical bytes). A graph matches a §3.2 sequence iff
 op types **and** attributes (after default dropping: only Gemm `transB = 1`) **and** the exact
-initializer shapes listed in §3.2 (with D, H1, H2, A from the shapes, A = `action_dim`) are
-equal, the head Clip bounds are bitwise `−1.0` / `+1.0`, and the normalization Clip bounds are
-symmetric (`lo == −hi`, finite). Then `action_rule` MUST be the sequence's head (`clip(mean)`
+initializer shapes listed in §3.2 (with D, H1, H2, A from the shapes, A = `action_dim`) **and**
+each node's exact inputs and outputs (so `Sub(c0, obs)`, mean − obs, does not match) are equal,
+every initializer is float32 `raw_data`, the head Clip bounds are bitwise `−1.0` / `+1.0`, and the
+normalization Clip bounds are symmetric (`lo == −hi`), finite and `hi > 0` (B7). Then `action_rule` MUST be the sequence's head (`clip(mean)`
 or `tanh(mean)`); otherwise it MUST be `"other"`. A dynamo export with a rank-0 normalization
 scale is `other`; broadcasting that scale to `[D]` makes it `clip(mean)`. The Phase 8 C path
 accepts only the two matching sequences and reads initializers by position.

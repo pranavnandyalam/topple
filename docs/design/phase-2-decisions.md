@@ -645,3 +645,28 @@ Pranav's answers to the open questions in `HANDOFF.md` (defaults unless stated).
 | A6 | Drop `EvalProtocol.is_named` (S12)? | Yes | §5.3 as written (no `is_named`). |
 | A7 | Commit the round-1/2 critique JSON files? | Skip | They exist only on the old Mac session. |
 | A8 | Where does the old Phase 3 draft live? | On `phase-3-design` only | Cherry-pick only its docs later. |
+
+## Slice 1a build (2026-10-15, spec v5.3)
+
+Slice 1a (commits `08a47b7`, `c0469d6`) builds §3.2, §3.4 and §3.5's `make_session`. Its review
+gate: one builder, three reviewers (spec conformance, security red team, code quality), two
+skeptics (correctness and reproduction lenses) over every MEDIUM+ finding, one fixer, one
+re-review. Confirmed: one MEDIUM root cause (pack mode kept a schema-default attribute that also
+carried a field pack drops, so pack output failed check 9; fixed, with a 1,200-case pack fuzzer
+in the re-review) and one HIGH that is blocked (B12). The builder's declared deviations and the
+fixer's tightenings are decided here; §3.2–§3.4 now state them.
+
+| # | Change | Reason |
+|---|---|---|
+| B1 | `build_policy_onnx` and `reference_actions` take a keyword `action: ActionSpec`; `policy_metadata(spec, rule)` derives the 7 keys; only (tanh, `clip(mean)`) and (relu, `tanh(mean)`) with two hidden layers; float32 overflow refused. | The §3.2 signature had no way to get the head bounds from the challenge; other pairings would build metadata that `structure_match` contradicts (review SPEC-2). |
+| B2 | Check 4: attribute names `^[A-Za-z_]{1,32}$`. | The old pattern refused `value_float` / `value_floats`, which check 6 allows and check 9 is meant to reject. |
+| B3 | Messages are `code: detail`; check 9's is `not_canonical: …`; exceptions inside a check are `<code>: raised during check N`; every `Exception` caught; ≤ 8 messages. | One machine-readable form for every rejection (review SPEC-4 accepted as a spec change). |
+| B4 | "Depth-40 nesting" means nested subgraphs: protobuf 7.36 stops at 100 message levels, reached by about 34 nested subgraphs. | Measured; matches the spec's "about 35". |
+| B5 | Function, sparse initializer, `If` with branches, Constant `value_ints` and `int64_data` are rejected at check 2; `If` without branches at check 6; int64 via `raw_data` at check 7. Check 3's function/training/sparse clause is unreachable after check 2 but kept and tested directly. | The spec named no check for these cases. |
+| B6 | `smoke_run(v) -> SmokeReport(errors, latency_p99_us)`; `smoke_test` returns its errors. Extra messages `bad_output`, `non_finite_output`, `ort_load_failed`. Each timer is joined after cancel. | The spec recorded the p99 nowhere. |
+| B7 | `structure_match` also compares each node's exact wiring and requires float32 `raw_data` payloads and normalization bound `hi > 0`. | Without wiring, `Sub(c0, obs)` matched the PPO sequence; inverted or zero bounds are not a normalization (review F8). |
+| B8 | `canonicalize` outside pack raises on off-list fields; keeps unused initializers and folded Constants; pack keeps only the 7 `topple.*` keys (pack CLI replaces them) and refuses the listed malformed inputs. | §3.3 ("drops all metadata") and §3.4 ("7 keys") disagreed; keeping them makes packing a first-party build the identity. |
+| B9 | New check-8 code `output_not_computed`: `action` must come from a non-Constant node. | A graph whose output was a Constant reached check 9 only through an exception (review F9). |
+| B10 | Default-attribute table adds LeakyRelu `alpha = float32(0.01)`, Elu `alpha = 1.0`; tested against `onnx.defs` for opsets 17–21. | Same rule as Gemm's defaults. |
+| B11 | Slice 1b: pack refuses a node that repeats an attribute name (`duplicate_attribute`), in both modes. | Re-review RR-2: pack resolved a duplicated `alpha` that the checker and ORT reject. |
+| B12 | BLOCKER for any PR/merge: `onnx>=1.23.2,<1.24` and `protobuf>=7.36,<8` must move to base dependencies (§7) and `uv.lock` be regenerated; until then the default CI jobs (mypy, pytest, slow) cannot import `topple.policy`. A strict xfail (`test_onnx_and_protobuf_are_base_dependencies`) flips when it lands. | The cloud environment blocks download.pytorch.org, which `uv lock` needs; no workaround that hides the failure. |
