@@ -84,7 +84,8 @@ from topple._atomic import (
     write_new_file,
 )
 from topple._inputs import read_regular_file
-from topple._npz import read_npz_bytes
+from topple._npz import read_header, read_npz_bytes
+from topple._zip import Archive
 from topple.loader import LoadError
 from topple.policy.build import Activation, MlpWeights, ObsNorm, build_policy_onnx
 from topple.policy.manifest import (
@@ -870,19 +871,31 @@ def _check_rows(snap: _Snapshot) -> None:
         _fail("parity_ref.npz: the random and edge rows are not those of normalize.json")
 
 
+def batch1_max_abs_diff(validated: ValidatedPolicy, obs: F32, action_ref: F64) -> float:
+    """``max |a_onnx - a_ref|`` over every row of ``obs``, each run alone (batch 1) through
+    ``make_session``; NaN if any difference is NaN. ``ValueError`` for an output that is not
+    float32 ``(1, A)`` (A from ``action_ref``)."""
+    session = make_session(validated)
+    a = action_ref.shape[1]
+    worst = 0.0
+    for i in range(obs.shape[0]):
+        out = session.run(None, {INPUT_NAME: obs[i : i + 1]})[0]
+        if not (isinstance(out, np.ndarray) and out.dtype == np.float32 and out.shape == (1, a)):
+            raise ValueError("parity row output is not float32 (1, action_dim)")
+        diff = float(np.max(np.abs(out[0].astype(np.float64) - action_ref[i])))
+        if math.isnan(diff) or diff > worst:  # a NaN sticks (nothing is > NaN) and fails below
+            worst = diff
+    return worst
+
+
 def _parity(snap: _Snapshot, validated: ValidatedPolicy) -> ParityReport:
     """Step 4: every row at batch 1 through ``make_session``, and the coverage counts."""
     _check_rows(snap)
-    session = make_session(validated)
-    n, a = snap.obs.shape[0], snap.task.action_dim
-    worst = 0.0
-    for i in range(n):
-        out = session.run(None, {INPUT_NAME: snap.obs[i : i + 1]})[0]
-        if not (isinstance(out, np.ndarray) and out.dtype == np.float32 and out.shape == (1, a)):
-            _fail("policy.onnx: parity row output is not float32 (1, action_dim)")
-        diff = float(np.max(np.abs(out[0].astype(np.float64) - snap.action_ref[i])))
-        if math.isnan(diff) or diff > worst:  # a NaN sticks (nothing is > NaN) and fails below
-            worst = diff
+    n = snap.obs.shape[0]
+    try:
+        worst = batch1_max_abs_diff(validated, snap.obs, snap.action_ref)
+    except ValueError as exc:
+        _fail(f"policy.onnx: {exc}")
     if not worst <= PARITY_TOLERANCE:
         _fail(f"parity: max |a_onnx - a_ref| is {worst:.3g}, above {PARITY_TOLERANCE:g}")
     unsaturated, saturated = coverage_counts(snap.action_ref)
@@ -1094,6 +1107,51 @@ def parity_bin(obs: F32, action_ref: F64, sets: npt.NDArray[np.uint8]) -> bytes:
         )
     )
     return body + b"\0" * (-len(body) % 4)
+
+
+@dataclass(frozen=True)
+class ParityFixture:
+    """A ``--test-fixture`` ``NAME_parity.npz`` (a copy of ``parity_ref.npz``): the rows, their
+    reference actions and set labels, and the sha256 of the ONNX bytes they were made for."""
+
+    obs: F32
+    action_ref: F64
+    sets: npt.NDArray[np.uint8]
+    onnx_sha256: str
+
+
+def read_parity_fixture(data: bytes, *, obs_dim: int, action_dim: int) -> ParityFixture:
+    """The parity fixture ``data`` (at most 8 MiB, already read) for a policy of ``obs_dim``
+    inputs and ``action_dim`` outputs, read as export reads ``parity_ref.npz``: the canonical
+    layout with exactly its four members and exact dtypes and shapes. The row count N comes
+    from the ``obs`` member's header (parsed by hand, nothing read before it is checked); the
+    archive is then read with the exact schema for N, so every member must agree with it.
+    ``ValueError`` for anything else (G5, docs/design/phase-2.md §4)."""
+    schema = _parity_schema(0, obs_dim, action_dim)
+    try:
+        if len(data) > MAX_NPZ_BYTES:
+            raise ValueError(f"the file has {len(data)} bytes, more than {MAX_NPZ_BYTES}")
+        archive = Archive(
+            io.BytesIO(data),
+            len(data),
+            frozenset(f"{key}.npy" for key in schema),
+            max_directory_bytes=16 * 1024,
+            max_member_bytes=MAX_NPZ_BYTES,
+        )
+        shape = read_header(archive.open("obs.npy"), "obs", np.dtype("<f4"))
+        if len(shape) != 2 or shape[0] < 1:
+            raise ValueError(f"obs must be [N, {obs_dim}] with N >= 1, got header shape {shape}")
+        arrays = read_npz_bytes(
+            data, _parity_schema(shape[0], obs_dim, action_dim), max_bytes=MAX_NPZ_BYTES
+        )
+    except ValueError:
+        raise
+    except Exception as exc:  # struct.error, zlib.error, ...: never a traceback
+        raise ValueError(f"not a readable npz file ({type(exc).__name__})") from None
+    sha = str(arrays["onnx_sha256"][()])
+    if not HEX64.fullmatch(sha):
+        raise ValueError("onnx_sha256 is not a sha256")
+    return ParityFixture(arrays["obs"], arrays["action_ref"], arrays["set"], sha)
 
 
 def _fixture_paths(fixture_dir: Path, name: str) -> dict[str, Path]:

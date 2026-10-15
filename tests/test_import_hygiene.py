@@ -11,6 +11,7 @@ not the package is installed.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,10 @@ MODULES = (
     "topple.train.config",
     "topple.train.wrappers",
     "topple.train.selection",
+    # scripts/: the done-when gates (docs/design/phase-2.md §4), run in .venv-eval and CI
+    "phase2_common",
+    "phase2_gate",
+    "phase2_ci_check",
 )
 PROBE = """
 import importlib, importlib.abc, json, pkgutil, sys
@@ -64,6 +69,7 @@ def test_torch_free_modules_import_nothing_heavy() -> None:
         text=True,
         timeout=120,
         cwd=REPO,
+        env={**os.environ, "PYTHONPATH": str(REPO / "scripts")},
         check=False,
     )
     assert done.returncode == 0, done.stderr[-2000:]

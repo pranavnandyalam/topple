@@ -71,6 +71,7 @@ explicit = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["scripts"]  # the Phase 2 scripts (phase2_common, phase2_gate, ...) for their tests
 addopts = "-ra --strict-markers"
 markers = [
     "render: needs a headless OpenGL backend (cgl on macOS, osmesa/egl on Linux)",
@@ -81,6 +82,15 @@ markers = [
 [tool.coverage.run]
 source = ["topple"]
 branch = true
+# The torch modules (train extra) are measured by the python-train job (.coveragerc-train), so
+# the default job's 80% scope and the train job's are disjoint (docs/design/phase-2.md §7).
+omit = [
+    "*/topple/train/learn.py",
+    "*/topple/train/snapshot.py",
+    "*/topple/train/callbacks.py",
+    "*/topple/train/surgery.py",
+    "*/topple/train/resources.py",
+]
 
 [tool.coverage.report]
 fail_under = 80
@@ -94,7 +104,7 @@ exclude_also = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["python", "tests"]
+src = ["python", "scripts", "tests"]
 
 [tool.ruff.format]
 exclude = ["*.md"]
@@ -104,7 +114,7 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N", "PT", "NPY", "C4", "
 
 [tool.mypy]
 python_version = "3.12"
-files = ["python/topple"]
+files = ["python/topple", "scripts"]
 strict = true
 warn_unreachable = true
 

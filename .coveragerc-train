@@ -1,0 +1,19 @@
+# Coverage scope of the python-train CI job (docs/design/phase-2.md §7):
+#   pytest -m train --cov=topple.train --cov-config=.coveragerc-train
+# The report (and fail_under) includes exactly the five torch modules that pyproject's
+# [tool.coverage.run] omits from the default job's scope, so the two 80% scopes are disjoint.
+# The include sits under [report]: --cov sets the measured source, and coverage ignores (with a
+# warning) a [run] include whenever a source is set.
+[run]
+branch = True
+
+[report]
+include =
+    */topple/train/learn.py
+    */topple/train/snapshot.py
+    */topple/train/callbacks.py
+    */topple/train/surgery.py
+    */topple/train/resources.py
+fail_under = 80
+show_missing = True
+skip_covered = True
