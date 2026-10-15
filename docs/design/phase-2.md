@@ -26,7 +26,7 @@ review gate:
   starts after 2a passes.
 
 **No literals for E_ref.** E_ref means `challenge.config.score.e_ref_j` of the protocol in use
-(balance-v1: 13.1 J = 2 × PID's median 6.566 J on linux-x86_64, the calibration platform since
+(balance-v1: 13.1 J = 2 × PID's median 6.5655 J on linux-x86_64, the calibration platform since
 2026-10-15; 13.0 when it was measured on darwin-arm64, 13.3 before the Phase 1 recalibration). Code reads
 it from the `ScoreConfig`; `train_meta.json` and `phase2.json` record the value used. Every number
 this spec quotes from a pilot is replaced in `phase2.md` by a template filled from `phase2.json`
@@ -69,7 +69,7 @@ so the bars follow the recalibration without edits; the energy bar is now 13.1 J
   0.108–0.149 from 3.5M (ineligible); policy std 0.057–0.073 by 5M. Linear LR: every checkpoint
   from 1.5–1.75M on is eligible, mean saturation ≤ 0.029, no regression after the peak. The
   pick's selection → calibration shrinkage was −0.75 to −1.33 points in all 6 runs; selection
-  seeds are easier (merged: LQR 82.51 vs 80.06, PID 70.63 vs 68.70). With the original, unfixed
+  seeds are easier (merged, linux-x86_64: LQR 82.77 vs 80.36, PID 70.90 vs 68.67). With the original, unfixed
   Phase 1 env at 1–1.5M steps: 14–23 J, 12–24% saturated, success 0.49–0.60.
 - **Determinism:** two seed-1 runs (311,296 steps, 8 forkserver workers, torch 1 thread) gave the
   same params + `obs_rms` sha at loads 6.9 and 5.9; a seed-1 5M run matched bit-for-bit where
@@ -292,11 +292,11 @@ Rules:
 - `phase2_gate.py` recomputes the selection protocol's hash (`balance-v1/standard` with seeds
   2000..2199, built with `dataclasses.replace` from `EvalProtocol.from_id`, as `topple run` builds
   its one-seed protocol) and the current `ENV_ALGO_VERSION` and fails if **any** reported run (PPO,
-  SAC, ablation) differs, or if the shipped run has `git_dirty: true`. Known answers at v5.1 (they
+  SAC, ablation) differs, or if the shipped run has `git_dirty: true`. Known answers at v5.3 (they
   move only with a reviewed re-pin, contract §13; these are after the E_ref 13.1 recalibration):
-  selection `d97317062fd668d4d461beb75dfe55e99c067fca7d4614de1c23bed1d8688451`,
-  calibration 0..199 `093022cb551010be2ad6189120f8b49229d40ee47ed02e10b07bdbc5c1e596f7`, bundle
-  `e745a4b8c878ecb2fb8d860981689ae966f8b811b23956783f722cfda2d5d6ea`, `ENV_ALGO_VERSION` 1.
+  selection `f30ef19048989c9b6edf34e5711b5c116ecd386568a5a1e6673360fc4fcf6287`,
+  calibration 0..199 `9d3630d321a70821c754a9c64ae121edb8e6847f28a9862f6b4139c5bde59d5e`, bundle
+  `89a62007e2f56e61b3a87f3e30034dafc5e6bde4d6c675c07cd79c8d0bbaedd0`, `ENV_ALGO_VERSION` 1.
 - **Determinism per (config, seed, platform, start_method) is required and tested** (CLAUDE.md:
   seeded runs are deterministic per platform). `test_train_smoke` runs each smoke config twice
   with the same seed and asserts identical sha256 of every `actor.npz` / `critic.npz`, identical
@@ -992,7 +992,7 @@ train"`; torch-free):
 | `test_shipped_policy` (slow; parametrized over `ppo_balance` and, once it exists, `ppo_waypoint`) | The submission loads; fixture sha equals `onnx.sha256`; parity ≤ 1e-5 with ≥ 300 unsaturated and ≥ 32 saturated rows; balance: eval_v1 PPO > PID; writes `results.json` as a CI artifact. |
 | `test_c_reference` | Generates a C header from `submissions/ppo_balance/policy.onnx` initializers by §3.2 position (`float.hex` literals; `tests/c/genc.py`), compiles `tests/c/mlp.c` (about 40 lines) with the system `cc -O2`, with and without `-ffp-contract=off`, and checks every `.bin` row within 1e-5 (measured ≤ 6.6e-7). Skips locally without `cc`; CI sets `TOPPLE_REQUIRE_CC=1`. |
 | `test_harness_finite_obs` | A fake env emitting NaN makes `evaluate` raise `RuntimeError` before `act()` is called, also under `python -O`. |
-| `test_driver_golden` (2b) | Per platform tag, as `tests/test_golden.py` pins balance-v1's baselines (contract §13; physics reproduces only per platform, e.g. LQR seed 1001 scores 84.08 on darwin-arm64 and 85.40 on linux-x86_64): `EPISODES[platform_tag()]` holds `submissions/waypoint_pid_example.py`'s scores on `waypoint-v1/clean` seeds 0..4 (to 1e-9) and docked/fell on `standard` 0..19, for `darwin-arm64` and `linux-x86_64`; a platform without pins skips locally and fails in CI, and CI must run on `linux-x86_64` (the same `pins_for` / `check_ci_platform` rule); a re-pin updates both platforms in one change. The platform-independent `WaypointScore` dump is pinned once. |
+| `test_driver_golden` (2b) | Per platform tag, as `tests/test_golden.py` pins balance-v1's baselines (contract §13; physics reproduces only per platform, e.g. LQR seed 1001 scored 84.08 on darwin-arm64 and 85.40 on linux-x86_64 under E_ref 13.0): `EPISODES[platform_tag()]` holds `submissions/waypoint_pid_example.py`'s scores on `waypoint-v1/clean` seeds 0..4 (to 1e-9) and docked/fell on `standard` 0..19, for `darwin-arm64` and `linux-x86_64`; a platform without pins skips locally and fails in CI, and CI must run on `linux-x86_64` (the same `pins_for` / `check_ci_platform` rule); a re-pin updates both platforms in one change. The platform-independent `WaypointScore` dump is pinned once. |
 | `test_traj_v2` (2b) | The §8.1a cases. |
 | `test_import_hygiene` | Importing `topple.cli`, `topple.export`, `topple.policy.*`, `topple.pool`, `topple.controllers.onnx_policy` leaves no `torch`, `stable_baselines3`, `tensorboard`, `psutil` in `sys.modules`. |
 | `test_no_unsafe_loads` | AST scan of `python/topple`, `scripts/`, `tests/`. Outside `topple/train/`: no `pickle, cloudpickle, dill, joblib, shelve, marshal, torch, stable_baselines3` imports, except a fixed (file → modules) allow-list in the test: the `train`-marked test files (`test_train_smoke`, `test_snapshot_reference`, `test_pack_torch_legacy`, `test_resources`, `test_surgery`) → `torch`, `stable_baselines3`; the merged `tests/test_contract.py` → `pickle` (its `TaskSpec` pickle round trip, contract §8); `scripts/make_thirdparty_fixtures.py` → `torch` (§3.3, run once with the train extra). Torch-free tree: onnx entry point only `onnx.ModelProto.FromString`; banned `onnx.load(`, `load_external_data_for_model`, `onnx.external_data_helper`, `numpy_helper.to_array`, `register_custom_ops_library`; `InferenceSession(` and `add_session_config_entry` (the three §3.5 literal keys) only in `runtime.make_session`. `PPO.load`, `SAC.load`, `VecNormalize.load`, `load_from_zip_file` only in `learn.resume_from` (`test_snapshot_reference` reloads through it). Everywhere: no `yaml.load/full_load/unsafe_load`, `allow_pickle=True`, `torch.load` without `weights_only=True`. Name-based; `getattr` evasion out of scope. |
@@ -1092,9 +1092,9 @@ metric keys may be added (`fall_cause`, §8.5). Golden tests pin the existing ke
   call is unchanged), `make_scenario(seed, preset, *, timestep, control_dt, episode_seconds,
   course: CourseConfig | None = None)`, `load_npz` / `Trajectory._check_shapes` / `save_npz`
   (§8.1a), the CLI's upload loaders and `video.py`.
-- **Golden tests.** Phase 1's pass unchanged: `tests/test_golden.py` (bundle `e745a4b8…a2d5d6ea`;
-  `protocol_hash` ideal `78858981…0f47176d`, clean `4a5af7e5…2aa7b1b4`, standard
-  `5c6dbda4…03b09fb7`, a salted private one;
+- **Golden tests.** Phase 1's pass unchanged: `tests/test_golden.py` (bundle `89a62007…0bbaedd0`;
+  `protocol_hash` ideal `79450098…d309c30c`, clean `3f27d1c9…f406e3c2`, standard
+  `b2436063…36bd1ea3`, a salted private one;
   `ENV_ALGO_VERSION` 1; scenarios of seeds 0, 1000, 2**53−1 per preset; PID/LQR scores per platform)
   and `tests/test_challenge.py` (the standard payload text, `ScoreConfig` dump included). New:
   `make_scenario` for standard seeds 1000..1019; an AST test forbidding `PRESETS[` in
@@ -1304,7 +1304,8 @@ The driver is a baseline, not an optimum (k_v = 2.0 scores about 1.2 points high
 reverse rule it falls 8.0% instead of 3.5%).
 
 **Calibration** (recorded in a `challenge.yaml` comment and `phase2.json`; all on `standard`
-0..399), in this order:
+0..399, measured on linux-x86_64, the calibration platform (decision log R1), with each other
+platform's numbers recorded beside them; the §8.9 item-1 band check runs there too), in this order:
 1. **impulse_hi.** Measure the driver at impulse_hi ∈ 0.300:0.500:0.025 (9 values). Among values
    with falls ∈ [3%, 10%] and docked ≥ 88%, choose the one minimising |falls − 6%|, ties to the
    lower value; if none qualifies, 2b stops for an owner decision. Record the curve with Wilson
@@ -1523,7 +1524,7 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
 
 | Risk | Mitigation |
 |---|---|
-| Phase 1 changes move PID/LQR/E_ref (the merge moved E_ref 13.3 → 13.0, the linux-x86_64 recalibration 13.0 → 13.1, §0) | Baselines measured in the same run; E_ref from ScoreConfig; env version and protocol hash bound in train_meta (G10); a Phase 3 recalibration on linux-x86_64 (`deferred-risks.md` (c)) means re-running or excluding stale runs. |
+| Phase 1 changes move PID/LQR/E_ref (the merge moved E_ref 13.3 → 13.0, the linux-x86_64 recalibration 13.0 → 13.1, §0) | Baselines measured in the same run; E_ref from ScoreConfig; env version and protocol hash bound in train_meta (G10); the linux-x86_64 recalibration (decision log R1) preceded all training, and any later re-pin means re-running or excluding runs bound to the old protocol hash. |
 | A seed lands low | Linear LR decay (constant LR collapsed 1 of 3 seeds), 3 seeds, 200 selection seeds, eligibility mirrors G3/G4, `late_regression` flag, fallback to the next run on any `SHIP_GATES` failure; G11 and the recipe row expose a broken recipe. |
 | Training silently loses determinism | Twice-run smoke test with sha equality; retries must reproduce the aborted attempt's `onnx_sha256` (`nondeterministic` flag). |
 | Mac-only evidence flips on the ranking platform | G2–G4 evaluated on both the Mac and the ubuntu CI compare. |
@@ -1590,8 +1591,8 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
     len(obs_features)) bytes; waypoint 128 B).
 - **Phases 3 and 5 (display).** `claims`, README, metadata and errors are untrusted: escaped or not
   rendered; `claims` labelled self-reported.
-- **Residual Phase 1 risks** (robot validation gaps, darwin-only calibration, sensor-noise
-  portability): `docs/design/deferred-risks.md`, each with its owning phases (Phase 3 first for
+- **Residual Phase 1 risks** (robot validation gaps, the pending darwin-arm64 golden re-pin
+  (decision log R2), sensor-noise portability): `docs/design/deferred-risks.md`, each with its owning phases (Phase 3 first for
   the robot validation gaps, since robot-ci scores users' own robots).
 - **Phase 5 (Arena).** Pin `onnxruntime-web@1.30.0` exactly (lockfile; measured: PPO 7.7e-7, SAC
   4.9e-7 vs SB3 for IR 8–11; 1.20.1 also passes IR 8–10). Canonical bytes from R2 by sha256 in a

@@ -4,7 +4,8 @@ Source: `docs/design/phase-2-critiques.json`. It holds 6 critiques with 68 issue
 issue appears below exactly once. The re-critique of v2 (round 1, 54 issues) is decided in
 "Re-critique round 1", and the re-critique of v3 (round 2, 54 issues) in "Re-critique round 2", and
 the re-critique of v4 (round 3, 52 issues) in "Re-critique round 3". The sync with the merged
-Phase 1 (v5.1) and its adversarial verification (v5.2, 18 findings) follow at the end. Later rounds
+Phase 1 (v5.1), its adversarial verification (v5.2, 18 findings) and the Linux recalibration
+(v5.3) follow at the end. Later rounds
 supersede earlier rows where they conflict; each superseded row is named in the later round's
 preamble. The round-1 and round-2 critique texts were supplied inline to the designer and are not
 yet committed as JSON (see round 2, consistency #15, and round 3, consistency #16).
@@ -612,12 +613,19 @@ Deferred risk (c) asked for balance-v1's calibration to be re-measured on the ra
 2a training. Measured in a cloud session on linux-x86_64 (Intel Xeon, AVX-512; mujoco 3.15.0,
 numpy 2.5.3), with the merged Phase 1 code, before any change: the linux-x86_64 golden scores of
 `tests/test_golden.py` reproduced exactly, so the machine matches CI. On `balance-v1/standard` seeds
-0..199: LQR 87.5% survival (median 3.28 J), shipped PID 65.0% (median 6.566 J); `clean`: both
-100%. Both bands hold (LQR ≥ 80%, PID 40–90%), so the push band stays. 2 × 6.566 = 13.13 rounds to
+0..199: LQR 87.5% survival (median 3.28 J), shipped PID 65.0% (median 6.5655 J); `clean`: both
+100%. Both bands hold (LQR ≥ 80%, PID 40–90%), so the push band stays. 2 × 6.5655 = 13.131 rounds to
 13.1, not 13.0 (darwin-arm64: 2 × 6.49 = 12.98 → 13.0). Pranav chose to recalibrate.
+
+Superseded earlier decisions: S1 (E_ref 13.0), S2 (§0 baselines measured on darwin-arm64) and S5
+(the known-answer hashes) → R1. The adversarial review of the recalibration (2 reviewers, 2
+skeptics) confirmed two findings, fixed in R4 and R5.
 
 | # | Change | Reason |
 |---|---|---|
-| R1 | E_ref 13.0 → 13.1 J; linux-x86_64 is the calibration platform; `challenge.yaml` records both platforms' numbers; contract §10, §12 and §13 updated. New bundle `e745a4b8…a2d5d6ea`, protocol hashes ideal `78858981…`, clean `4a5af7e5…`, standard `5c6dbda4…`, selection (2000..2199) `d9731706…d8688451`, calibration (0..199) `093022cb…c1e596f7`. Linux golden scores re-pinned; the energy term moved PID 1000/1002 and LQR 1000–1002 by 0.015–0.031 points (PID 1001 spends more than E_ref, so its score is unchanged). §0 baselines re-measured on linux-x86_64. | Ranked scores come from linux-x86_64 CI (PLAN.md trust model; contract §13), so the reference energy is measured there. Nothing had been trained against the old protocol hash, so no run is stale. |
+| R1 | E_ref 13.0 → 13.1 J; linux-x86_64 is the calibration platform; `challenge.yaml` records both platforms' numbers; contract §10, §12 and §13 updated. New bundle `89a62007…0bbaedd0`, protocol hashes ideal `79450098…`, clean `3f27d1c9…`, standard `b2436063…`, selection (2000..2199) `f30ef190…4fcf6287`, calibration (0..199) `9d3630d3…bde59d5e`. Linux golden scores re-pinned; the energy term moved PID 1000/1002 and LQR 1000–1002 by 0.015–0.031 points (PID 1001 spends more than E_ref, so its score is unchanged). §0 baselines re-measured on linux-x86_64. | Ranked scores come from linux-x86_64 CI (PLAN.md trust model; contract §13), so the reference energy is measured there. Nothing had been trained against the old protocol hash, so no run is stale. |
 | R2 | The darwin-arm64 golden scores in `tests/test_golden.py` stay at their E_ref 13.0 values, marked stale, until a Mac re-pins them. | Physics reproduces only per platform and no Mac was available to the cloud session. CI never checks darwin pins (only `linux-x86_64`), so CI stays green; a local Mac run fails and prints the values to pin. |
 | R3 | The §13 serializer example in the contract and `test_challenge.py` now names `5.0`, not `13.0`. | `e_ref_j` is no longer integral, so `13.0` no longer illustrates the "never `13`" rule; `5.0` (`success_energy_factor`) still does. |
+| R4 | The PID median is written 6.5655 J, not 6.566 J (a double rounding of 6.565462 J), in `challenge.yaml`, the contract, the spec, this log and `deferred-risks.md`. The yaml comment is hashed, so the bundle and protocol hashes moved again before any run bound to them: bundle `89a62007…0bbaedd0`, ideal `79450098…`, clean `3f27d1c9…`, standard `b2436063…`, selection `f30ef190…4fcf6287`, calibration `9d3630d3…bde59d5e` (the values R1 cites are these). | Review finding C1 (confirmed). A frozen file must be right before publication; no training had started. |
+| R5 | Contract preamble and §13: calibrated values freeze when their challenge is **published**; before that, a change is a reviewed re-pin of hashes and goldens (as R1). Contract §12 notes that 2 × 6.5655 J sits 0.019 J below the 13.15 boundary and that E_ref stays 13.1 regardless of later re-measurements. | Review finding C2 (confirmed): the contract said "frozen at the end of Phase 1" and "E_ref needs balance-v2", which contradicted R1. The boundary note answers the reproduction reviewer's robustness finding. |
+| R6 | Spec consistency (LOW findings C4–C8): §0's selection-vs-calibration example uses the linux numbers; known answers labelled v5.3; the `test_driver_golden` example names E_ref 13.0; §8.7 waypoint calibration runs on linux-x86_64; §9/§10 no longer list darwin-only calibration as open, only the darwin golden re-pin (R2). | Keeps the spec consistent with R1. |

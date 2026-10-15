@@ -3,8 +3,10 @@
 This document defines what a Topple controller sees, what it returns, how an episode runs and how it
 is scored. Python (`topple/`), the browser arena, the GitHub Action and robot firmware all implement
 exactly this. Anything that could change a fixed controller's score on a fixed seed is versioned
-(see §13). Values marked **[calibrated]** are frozen at the end of Phase 1 and never edited
-afterwards. `E_ref` (§12) lives in `challenges/balance-v1/challenge.yaml`, which `bundle_hash`
+(see §13). Values marked **[calibrated]** are frozen once their challenge is published (balance-v1:
+at the Phase 3 release) and never edited afterwards; before that, a recalibration is a reviewed
+re-pin of the bundle and protocol hashes and the golden scores (balance-v1's E_ref moved 13.0 → 13.1
+J this way on 2026-10-15, when it was re-measured on the ranked platform, §12). `E_ref` (§12) lives in `challenges/balance-v1/challenge.yaml`, which `bundle_hash`
 covers. The push impulse band (§10) lives in the `standard` preset's push config
 (`topple.disturbances.PRESETS`, shared env code), which `protocol_hash` covers as part of the full
 preset definition. So an edit to `E_ref` moves every balance-v1 protocol hash, and an edit to the
@@ -505,9 +507,12 @@ Episode score (0–100):
 
 `success = survived ∧ drift_m < 1 ∧ energy_j ≤ 5·E_ref`. `E_ref` **[calibrated]** = 2× the PID
 baseline's median energy on `balance-v1/standard` (seeds 0..199, all episodes), rounded to 0.1 J,
-frozen: 2 × 6.566 J → `E_ref = 13.1` J, measured on `linux-x86_64`, the calibration platform
+frozen: 2 × 6.5655 J → `E_ref = 13.1` J, measured on `linux-x86_64`, the calibration platform
 because ranked scores come from it (§13). Physics, unlike scenarios, is only reproducible per
-platform (§14): darwin-arm64 measures 6.49 J, which would round to 13.0 J.
+platform (§14): darwin-arm64 measures 6.49 J, which would round to 13.0 J. 2 × 6.5655 J sits
+0.019 J below the 13.15 rounding boundary (the median averages two seeds' energies 0.093 J apart),
+so a later re-measurement after a physics or dependency change could round elsewhere: E_ref stays
+13.1 regardless, and only a new challenge version recalibrates it.
 
 Protocol score = `fsum` of episode scores in seed order / N, and success rate = successes / N,
 where N is the number of episodes the protocol expects: a missing or errored episode counts as 0.
@@ -516,9 +521,11 @@ Mean time upright is averaged over the episodes present (those with metrics). Ra
 
 ## 13. Bump rule and hashes
 
-Anything that can change a fixed controller's score on a fixed seed requires a new challenge
-major version (`balance-v2`): MJCF, robot params, physics options, presets, scorer, E_ref, seeds,
-episode length, control rate, observation semantics. Reward shaping and training configs never bump.
+Once a challenge is published, anything that can change a fixed controller's score on a fixed
+seed requires a new challenge major version (`balance-v2`): MJCF, robot params, physics options,
+presets, scorer, E_ref, seeds, episode length, control rate, observation semantics. Before
+publication such a change is a reviewed re-pin of the hashes and golden scores instead (balance-v1's
+E_ref recalibration, §12). Reward shaping and training configs never bump.
 
 Env code is shared by all challenges. A code change that can change a fixed controller's results
 on a fixed seed (sensing, estimation, termination, pushes, model overrides) must bump

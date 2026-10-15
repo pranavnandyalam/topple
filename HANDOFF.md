@@ -4,7 +4,7 @@ This file moves work between Claude Code sessions (local Mac ⇄ cloud at claude
 **Whoever stops working must update it, commit it and push before stopping.** Nothing else
 carries over: local memory, scratch files and workflow scripts stay on the machine that made them.
 
-Last updated: 2026-10-14 by the local session (handing off to cloud).
+Last updated: 2026-10-15 by the cloud session (in progress; see "Where things stand").
 
 ## Where things stand
 
@@ -12,7 +12,10 @@ Last updated: 2026-10-14 by the local session (handing off to cloud).
 |---|---|
 | Phase 0 (setup) | Merged to `main` (fcc2b13) |
 | Phase 1 (sim core, balance-v1) | Merged to `main` as **f997394** (PR #3). Passed two review gates (the second all-Opus); every confirmed finding fixed; CI green (1,806 tests, 98.9% coverage) |
-| Phase 2 (learn) | **Designed, not built.** Spec v5.2 in `docs/design/phase-2.md` (synced with merged Phase 1 and verified against the code); decision log `docs/design/phase-2-decisions.md` |
+| Phase 2 (learn) | **Building 2a.** Spec v5.3 in `docs/design/phase-2.md`; decision log `docs/design/phase-2-decisions.md` (Linux recalibration rows R1–R6). Slice 1a (ONNX builder, validator, canonical form) in progress |
+| Linux recalibration | **Done** (2026-10-15, Pranav chose it): E_ref 13.0 → **13.1 J** on linux-x86_64, now the calibration platform. Bands hold (LQR 87.5%, PID 65.0%). New bundle `89a62007…`, protocol hashes and linux golden scores re-pinned. Reviewed (2 reviewers + 2 skeptics), findings fixed |
+| Darwin golden pins | **Stale** in `tests/test_golden.py` (`EPISODES["darwin-arm64"]`, measured under E_ref 13.0). The Mac session must re-pin them: run `uv run pytest tests/test_golden.py` on the Mac and copy the measured values (decision log R2). CI only checks linux pins |
+| Network (cloud) | The cloud environment's policy blocks `download.pytorch.org` and `download-r2.pytorch.org`, so torch cannot be installed and `uv lock` cannot run (it resolves the train extra). Asked Pranav to allow both hosts. Until then: no training, no PPO probe, no pyproject dependency changes; `onnx==1.23.2` and `protobuf==7.36.2` are installed into `.venv` by hand (`uv pip install`) for the torch-free slices |
 | Direction update | `PLAN.md` section 0 (2026-10-11): workbench for people's own robot projects, Studio (desktop + browser), Arena with FRC drive practice, revised build order |
 | Deferred risks | `docs/design/deferred-risks.md`: things later phases must fix (e.g. a hidden mass below the floor makes any robot a passive pendulum) |
 | Phase 3 design inputs | Branch `phase-3-design`: draft `docs/design/phase-3.md` + `phase-3-critiques.json` (55 issues, 7 BLOCKER, 21 HIGH), not yet revised. Never merge that branch wholesale; cherry-pick only the phase-3 docs |
@@ -21,11 +24,9 @@ Work branch: **`phase-2-learn`** (based on `main`). Its PR should be opened when
 
 ## Next steps, in order
 
-1. **Ask Pranav the open questions below** (or use the stated default if he says "use defaults").
-2. **Linux re-measure of calibration** (deferred risk (c)). The cloud machine is linux-x86_64, so
-   do it there first: re-run the PID/LQR calibration sweeps on seeds 0..199 for `balance-v1/standard`
-   and compare with `challenge.yaml` (E_ref 13.0 J; darwin: LQR 86.5%, PID 64.5% survival). If E_ref
-   would change, stop and tell Pranav before training anything (it would stale every protocol hash).
+1. ~~Ask Pranav the open questions~~ (answered 2026-10-15; see below).
+2. ~~Linux re-measure of calibration~~ (done: E_ref 13.1, see the table). **Mac session: re-pin the
+   darwin-arm64 golden scores** in `tests/test_golden.py` (the STALE comment there points here).
 3. **Build Phase 2a** from `docs/design/phase-2.md`, in small slices, each with its own review:
    1. ONNX validator + canonicalization, data-only `topple.policy/1` submissions, hardened
       `ONNXPolicy` runtime (no training needed);
@@ -35,9 +36,13 @@ Work branch: **`phase-2-learn`** (based on `main`). Its PR should be opened when
 4. Phase 2a review gate (below), fix, merge. Then Phase 2b (waypoint-v1, `topple.traj/2`).
 5. Then follow the revised build order in `PLAN.md` section 0.
 
-## Open questions for Pranav
+## Answers from Pranav (2026-10-15)
 
-From the Phase 2 spec sync (defaults in brackets):
+Q1–Q8 took the defaults in brackets (Q1: re-measured, and E_ref changed, so he chose to recalibrate
+to 13.1). Q9: all of the above (makers, students/FRC, researchers). Q10: any robot. Q11: hardware
+optional. Q12: FRC season still open. PLAN.md section 0 and decisions 9–10 record them.
+
+The original questions, for reference (defaults in brackets):
 1. Re-measure E_ref on Linux before 2a training? [yes, step 2 above]
 2. Keep `topple.traj/1` frozen for balance-v1 and use `topple.traj/2` for other challenges? [yes]
 3. Waypoint scene needs `offheight=960` for the 960×960 video; OK, or render ≤1280×720 so the scene

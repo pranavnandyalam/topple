@@ -144,7 +144,7 @@ def test_protocol_hash_follows_the_payload() -> None:
 # The payload of balance-v1/standard's public protocol, as protocol_hash serializes it (§13):
 # keys sorted at every level, no whitespace, floats in Python's repr form ("13.1", "5.0").
 STANDARD_PAYLOAD = (
-    '{"bundle":"e745a4b8c878ecb2fb8d860981689ae966f8b811b23956783f722cfda2d5d6ea",'
+    '{"bundle":"89a62007e2f56e61b3a87f3e30034dafc5e6bde4d6c675c07cd79c8d0bbaedd0",'
     '"env_algo_version":1,"format":"topple.protocol/1",'
     '"preset":{"name":"standard","pushes":{"count":[1,2,3],"duration_s":0.1,"earliest_s":1.0,'
     '"impulse_ns":[0.25,0.45],"lateral_fraction_max":0.3,"latest_s":8.5,"max_force_n":50.0,'

@@ -61,16 +61,16 @@ CONTROLLER_SEEDS: dict[tuple[int, int], int] = {
     (0, 2**127 + 12345): 8639439415161446,
 }
 
-BUNDLE_HASH = "e745a4b8c878ecb2fb8d860981689ae966f8b811b23956783f722cfda2d5d6ea"
+BUNDLE_HASH = "89a62007e2f56e61b3a87f3e30034dafc5e6bde4d6c675c07cd79c8d0bbaedd0"
 # Public protocols: the public seed list, salt 0 (contract §13).
 PROTOCOL_HASHES = {
-    "ideal": "788589817f1ae83131705d8f25cca4cd5f55db2d4ff9dcf70040eb560f47176d",
-    "clean": "4a5af7e55c853969dd1d28931a70fefe886534ee72b065ce09da6b6b2aa7b1b4",
-    "standard": "5c6dbda432adef41ac7a79f676c818cc85d7a1f18c044d733e84571403b09fb7",
+    "ideal": "79450098ce9ad069f7d812e451ff1403e38d3e597fd7166bcb643b66d309c30c",
+    "clean": "3f27d1c91d9e2eaaacddf4609b47c6d582342a6bc23b31524751c679f406e3c2",
+    "standard": "b243606351363f966776bd618f15df12dfdaf7103fcc67e87864139436bd1ea3",
 }
 PRIVATE_SEEDS = (1, 2, 3)
 PRIVATE_SALT = 2**127 + 5
-PRIVATE_PROTOCOL_HASH = "6fbb609178659fdf83426538622f8dbba3387261134dc56ec0a7516575b17361"
+PRIVATE_PROTOCOL_HASH = "8db2d33e96f576cc2e2f62bd4815c8f156097450a17098b09de28ad0592ea193"
 
 RANKED_PLATFORM = "linux-x86_64"
 """Where CI runs and ranked scores come from (contract §13)."""
