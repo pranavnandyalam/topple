@@ -7,8 +7,11 @@ the golden tests pin the sha256 of the bytes built from them.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from math import prod
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -218,3 +221,99 @@ def chain_model(
 
 def canonical(proto: onnx.ModelProto, *, pack: bool = False) -> bytes:
     return canonicalize(proto, pack=pack)
+
+
+# --- topple.policy/1 directories (§3.1) ------------------------------------------------------
+
+
+def first_party_claims() -> dict[str, Any]:
+    """Claims as the exporter writes them (every key present; self-reported)."""
+    return {
+        "name": "tiny ppo",
+        "algo": "ppo",
+        "activation": "tanh",
+        "net_arch": [8, 8],
+        "total_timesteps": 2048,
+        "selected_step": 1024,
+        "train_seed": 0,
+        "train_config_sha256": "ab" * 32,
+        "git_commit": "c" * 40,
+        "git_dirty": False,
+        "selection_eligible": True,
+        "versions": {"topple": "0.1.0", "onnxruntime": "1.31.0"},
+        "export_parity": {
+            "reference": "sb3.predict",
+            "n": 1074,
+            "n_onpolicy": 10,
+            "n_onpolicy_seeds": 2,
+            "n_unsaturated": 400,
+            "n_saturated": 40,
+            "max_abs_diff": 2.4e-7,
+            "tolerance": 1e-5,
+            "vacuous": False,
+        },
+    }
+
+
+def first_party_manifest(
+    data: bytes, *, action_rule: str = "clip(mean)", claims: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """The ``policy.json`` of balance-v1 policy ``data`` (§3.1), as a JSON-ready dict."""
+    spec = balance_spec()
+    proto = parse(data)
+    dim = [d.dim_value for d in proto.graph.input[0].type.tensor_type.shape.dim][1]
+    out = [d.dim_value for d in proto.graph.output[0].type.tensor_type.shape.dim][1]
+    return {
+        "format": "topple.policy/1",
+        "kind": "onnx",
+        "challenge": spec.challenge,
+        "obs_schema": spec.obs_schema,
+        "obs_features": list(spec.obs_features),
+        "action_spec": spec.action.id,
+        "action_dim": spec.action.dim,
+        "control_dt": spec.control_dt,
+        "action_rule": action_rule,
+        "onnx": {
+            "file": "policy.onnx",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "ir_version": proto.ir_version,
+            "opset": proto.opset_import[0].version,
+            "input": {"name": "obs", "dtype": "float32", "shape": ["batch", dim]},
+            "output": {"name": "action", "dtype": "float32", "shape": ["batch", out]},
+        },
+        "claims": dict(first_party_claims() if claims is None else claims),
+    }
+
+
+def manifest_bytes(manifest: Mapping[str, Any]) -> bytes:
+    return (json.dumps(manifest, indent=2) + "\n").encode("ascii")
+
+
+def write_policy_dir(
+    root: Path,
+    data: bytes | None = None,
+    *,
+    manifest: Mapping[str, Any] | bytes | None = None,
+    readme: bytes | None = None,
+) -> Path:
+    """A ``topple.policy/1`` directory at ``root``: ``policy.onnx`` (default: the tiny PPO
+    build), its ``policy.json`` (default: ``first_party_manifest``) and optionally README.md."""
+    data = ppo_bytes() if data is None else data
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "policy.onnx").write_bytes(data)
+    if manifest is None:
+        manifest = first_party_manifest(data)
+    raw = manifest if isinstance(manifest, bytes) else manifest_bytes(manifest)
+    (root / "policy.json").write_bytes(raw)
+    if readme is not None:
+        (root / "README.md").write_bytes(readme)
+    return root
+
+
+def sha_of_files(files: Mapping[str, bytes]) -> str:
+    """Contract §8's ``submission_sha256`` recipe over ``files`` (name -> bytes)."""
+    digest = hashlib.sha256(b"topple.submission/1\n")
+    for name in sorted(files):
+        for part in (name.encode("utf-8"), files[name]):
+            digest.update(len(part).to_bytes(8, "big") + part)
+    return digest.hexdigest()

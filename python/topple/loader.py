@@ -1,12 +1,15 @@
-"""Load a submission: a ``.py`` file, or a directory with ``controller.py`` plus assets.
+"""Load a submission: a ``.py`` file, a directory with ``controller.py`` plus assets, or a
+``topple.policy/1`` directory (``policy.onnx`` + ``policy.json``, data only; contract §8, §17).
 
-In-process loading runs the submission's code inside this interpreter, so it is for trusted code
-only (your own controllers, the shipped examples). Untrusted submissions go through the
-subprocess/container runner (Phase 3).
+In-process loading runs a Python submission's code inside this interpreter, so it is for trusted
+code only (your own controllers, the shipped examples). Untrusted submissions go through the
+subprocess/container runner (Phase 3). A policy directory runs no submitted code: its graph is
+validated and run by ONNX Runtime (docs/design/phase-2.md §3.4, §3.5).
 
 The entry file is read once: those bytes are hashed and those bytes are compiled and run, so the
 submission sha256 always covers the code that runs (no bytecode cache is consulted and no second
-read can see a swapped file).
+read can see a swapped file). A policy directory's files are read once too, and the sha256 and
+the validated graph come from those same bytes.
 """
 
 from __future__ import annotations
@@ -16,15 +19,23 @@ import importlib.util
 import inspect
 import os
 import sys
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from topple.contract import Controller, TaskSpec, class_name, describe_exception
 
+if TYPE_CHECKING:
+    from topple.challenge import Challenge
+    from topple.policy.runtime import LoadedPolicy
+
+SubmissionKind = Literal["python", "onnx"]
 ENTRY_FILE = "controller.py"
+POLICY_MANIFEST = "policy.json"
+"""A directory holding a file of this exact name is a ``topple.policy/1`` submission: the
+loader looks for it before ``controller.py`` (docs/design/phase-2.md §3.1)."""
 _NO_ENTRY = f"expected a .py file or a directory containing {ENTRY_FILE}"
 FACTORY = "make_controller"
 MAX_FILES = 50
@@ -41,10 +52,23 @@ class LoadError(Exception):
 
 @dataclass(frozen=True)
 class Submission:
+    """A loaded submission: its id, its submission sha256 (contract §8), its entry file
+    (``controller.py``, the ``.py`` file, or a policy's ``policy.onnx``) and a factory.
+
+    A ``topple.policy/1`` submission also carries its ``LoadedPolicy``; ``policy_sha256`` is
+    then sha256(policy.onnx), the policy's identity (``None`` for a Python submission).
+    """
+
     id: str
     sha256: str
     entry: Path
     factory: Callable[[TaskSpec], Controller[Any]]
+    kind: SubmissionKind = "python"
+    policy: LoadedPolicy | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def policy_sha256(self) -> str | None:
+        return None if self.policy is None else self.policy.validated.policy_sha256
 
 
 def _rel(path: Path, root: Path) -> str:
@@ -132,6 +156,16 @@ def _read_capped(path: Path, budget: int) -> bytes:
 
 def _framed(data: bytes) -> bytes:
     return len(data).to_bytes(8, "big") + data
+
+
+def _records_sha256(records: Iterable[tuple[str, bytes]]) -> str:
+    """The submission sha256 (contract §8) of (POSIX relpath, bytes) records already read, in
+    POSIX-path string order: the same recipe ``submission_sha256`` applies while it reads."""
+    digest = hashlib.sha256(SHA_TAG)
+    for name, data in sorted(records):
+        digest.update(_framed(_utf8_name(name)))
+        digest.update(_framed(data))
+    return digest.hexdigest()
 
 
 def _utf8_name(rel: str) -> bytes:
@@ -280,9 +314,18 @@ def submission_id(path: Path) -> str:
     return resolved.stem if resolved.is_file() else resolved.name
 
 
-def load_submission(path: Path) -> Submission:
+def load_submission(path: Path, *, challenge: Challenge | None = None) -> Submission:
+    """The submission at ``path``, else ``LoadError``.
+
+    A directory with a ``policy.json`` is a ``topple.policy/1`` policy (checked before
+    ``controller.py``; one that also holds Python is ``ambiguous submission kind``). A policy
+    is validated for ``challenge``, which is then required (``TypeError`` without it): its dims
+    and action bounds come from the challenge, never from the submission.
+    """
     _utf8_name(path.name)  # the name becomes the controller id
-    path, entry = _locate(path)
+    path, entry, kind = _locate(path)
+    if kind == "onnx":
+        return _load_policy(path, challenge)
     sha, source = _digest(path, entry)
     if source is None:
         # No hashed file is named exactly ENTRY_FILE: a case-insensitive file system (macOS,
@@ -299,8 +342,8 @@ def load_submission(path: Path) -> Submission:
     return Submission(id=sub_id, sha256=sha, entry=entry, factory=factory)
 
 
-def _locate(path: Path) -> tuple[Path, Path]:
-    """The resolved submission and its entry file, else ``LoadError``.
+def _locate(path: Path) -> tuple[Path, Path, SubmissionKind]:
+    """The resolved submission, its entry file and its kind, else ``LoadError``.
 
     Every probe is inside one ``OSError`` guard: Python 3.12's ``Path.is_symlink``, ``exists``,
     ``is_dir`` and ``is_file`` re-raise every error but ENOENT, ENOTDIR, EBADF and ELOOP (so a
@@ -316,12 +359,51 @@ def _locate(path: Path) -> tuple[Path, Path]:
             raise LoadError(f"cannot resolve {str(path)!r}: {exc}") from exc
         if not path.exists():
             raise LoadError(f"{str(path)!r} does not exist")
+        if path.is_dir() and _has_manifest(path):
+            return path, path / "policy.onnx", "onnx"
         entry = path / ENTRY_FILE if path.is_dir() else path
         if entry.suffix != ".py" or not entry.is_file():
             raise LoadError(_NO_ENTRY)
     except OSError as exc:
         raise _unreadable(exc, path) from exc
-    return path, entry
+    return path, entry, "python"
+
+
+def _has_manifest(directory: Path) -> bool:
+    """Whether anything is named ``policy.json`` in ``directory`` (without following a symlink:
+    a symlinked manifest is still a policy directory, and refused as one). A case-insensitive
+    file system also finds ``POLICY.JSON`` here; the policy loader's exact-name listing then
+    refuses it. ``OSError`` if the entry cannot be examined."""
+    try:
+        os.lstat(directory / POLICY_MANIFEST)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _load_policy(path: Path, challenge: Challenge | None) -> Submission:
+    """A ``topple.policy/1`` submission: its files read once (directory rules first, so an
+    ambiguous directory is refused whether or not a challenge was given), the submission
+    sha256 from those bytes, then the full validation for ``challenge``."""
+    from topple.controllers.onnx_policy import policy_factory
+    from topple.policy.runtime import load_policy_files, read_policy_dir
+
+    files = read_policy_dir(path)
+    if challenge is None:
+        raise TypeError(
+            "a topple.policy/1 submission is loaded for a challenge: "
+            "load_submission(path, challenge=...)"
+        )
+    sha = _records_sha256(files.items())
+    loaded = load_policy_files(files, challenge=challenge)
+    return Submission(
+        id=path.name,
+        sha256=sha,
+        entry=path / "policy.onnx",
+        factory=policy_factory(loaded),
+        kind="onnx",
+        policy=loaded,
+    )
 
 
 def _factory(module: ModuleType, entry: Path) -> Callable[[TaskSpec], Controller[Any]]:

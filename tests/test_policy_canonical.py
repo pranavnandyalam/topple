@@ -4,9 +4,8 @@
 field, Constant nodes, default attributes, field order, metadata order) must collapse to one
 byte string, built constructively from allow-listed parts only.
 
-Deferred to slice 1b: "non-canonical file rejected at load" through ``load_policy_dir`` (here
-``validate_policy_bytes`` rejects it at check 9), and the third-party torch fixtures of
-``test_policy_pack``.
+"Non-canonical file rejected at load" runs through ``load_policy_dir`` (slice 1b); the
+third-party torch fixtures belong to ``test_policy_pack`` (slice 1c).
 """
 
 from __future__ import annotations
@@ -27,6 +26,7 @@ from policy_support import (
     A,
     D,
     build,
+    first_party_manifest,
     graph_model,
     node,
     parse,
@@ -38,7 +38,11 @@ from policy_support import (
     tiny_weights,
     validated,
     value_info,
+    write_policy_dir,
 )
+from topple.challenge import load_challenge
+from topple.loader import LoadError
+from topple.policy.runtime import load_policy_dir
 from topple.policy.validate import (
     CANONICAL_IR,
     METADATA_KEYS,
@@ -402,6 +406,18 @@ def test_non_canonical_bytes_are_rejected_at_check_9(
     assert result == ["not_canonical: policy.onnx is not canonical; run topple policy pack"]
 
 
+def test_a_non_canonical_file_is_rejected_at_load(tmp_path: Path) -> None:
+    data = serialize(edited(PPO, lambda p: setattr(p.graph.node[0], "name", "first")))
+    manifest = first_party_manifest(PPO)
+    manifest["onnx"]["sha256"] = hashlib.sha256(data).hexdigest()
+    root = write_policy_dir(tmp_path / "bot", data, manifest=manifest)
+    with pytest.raises(LoadError) as info:
+        load_policy_dir(root, challenge=load_challenge("balance-v1"))
+    assert str(info.value) == (
+        "policy.onnx: not_canonical: policy.onnx is not canonical; run topple policy pack"
+    )
+
+
 # --- pack mode -------------------------------------------------------------------------------
 
 
@@ -543,6 +559,28 @@ def initializer_shadows_a_node_output(p: onnx.ModelProto) -> None:
     p.graph.initializer.append(tensor("v3", np.zeros((1, 8))))
 
 
+def duplicate_attribute(p: onnx.ModelProto) -> None:
+    """B11: two ``alpha`` on one Gemm. The checker and ORT refuse it; pack must not pick one."""
+    gemm = p.graph.node[3]
+    gemm.attribute.extend(
+        [helper.make_attribute("alpha", 2.0), helper.make_attribute("alpha", 3.0)]
+    )
+
+
+def duplicate_default_attribute(p: onnx.ModelProto) -> None:
+    """B11: the default ``alpha = 1.0`` (dropped alone) next to ``alpha = 2.0`` (kept alone)."""
+    gemm = p.graph.node[3]
+    gemm.attribute.extend(
+        [helper.make_attribute("alpha", 1.0), helper.make_attribute("alpha", 2.0)]
+    )
+
+
+def duplicate_constant_attribute(p: onnx.ModelProto) -> None:
+    constant = helper.make_node("Constant", [], ["k"], value_float=1.0)
+    constant.attribute.append(helper.make_attribute("value_float", 2.0))
+    p.graph.node.insert(0, constant)
+
+
 # edit -> (code without pack, code with pack): the fixed code each refusal must carry
 REFUSALS: dict[Callable[[onnx.ModelProto], None], tuple[str, str]] = {
     two_inputs: ("io_count", "io_count"),
@@ -557,6 +595,9 @@ REFUSALS: dict[Callable[[onnx.ModelProto], None], tuple[str, str]] = {
     no_default_opset: ("opset_domain_not_allowed", "bad_opset_import"),
     duplicate_initializer: ("duplicate_value", "duplicate_value"),
     initializer_shadows_a_node_output: ("duplicate_value", "duplicate_value"),
+    duplicate_attribute: ("duplicate_attribute", "duplicate_attribute"),
+    duplicate_default_attribute: ("duplicate_attribute", "duplicate_attribute"),
+    duplicate_constant_attribute: ("duplicate_attribute", "duplicate_attribute"),
 }
 
 
@@ -567,6 +608,11 @@ def test_canonicalize_refuses(edit: Callable[[onnx.ModelProto], None], pack: boo
     proto = edited(PPO, edit)
     with pytest.raises(ValueError, match=f"^{code}:"):
         canonicalize(proto, pack=pack)
+
+
+def test_a_duplicate_attribute_is_rejected_at_check_6_on_load() -> None:
+    result = validate_policy_bytes(serialize(edited(PPO, duplicate_attribute)), D, A)
+    assert rejected_at(result) == (6, "duplicate_attribute")
 
 
 def test_pack_refuses_an_identity_cycle() -> None:

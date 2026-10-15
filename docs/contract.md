@@ -331,8 +331,16 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   `KeyboardInterrupt`, including `SystemExit`), `load_submission` raises `LoadError` with the
   same `Type: message` detail, and the CLI exits 2 with that message, never a traceback. A load
   that fails leaves no submission module behind in `sys.modules`.
-- Submission kinds: a `.py` file, or a directory with `controller.py` plus assets located via
-  `Path(__file__).parent` (ONNX policies arrive in Phase 2). The entry file is named exactly
+- Submission kinds: a `.py` file; a directory with `controller.py` plus assets located via
+  `Path(__file__).parent`; or a `topple.policy/1` directory (§17), which is data only. The loader
+  checks a directory for `policy.json` before `controller.py`: a directory with a `policy.json`
+  is a policy, and one that also holds Python (`controller.py`, or any `.py` among the entries
+  its bounded listing reads) is refused with `ambiguous submission kind`. That is the one change
+  for Python submissions: a Python directory with a top-level `policy.json` asset, which loaded
+  before, is now refused (rename the asset). A policy is loaded for a challenge
+  (`load_submission(path, challenge=...)`, a `TypeError` without one), because its dimensions
+  and action bounds come from the challenge's `TaskSpec`, never from the submission; `topple
+  eval` and `topple run` pass their protocol's challenge. The entry file is named exactly
   `controller.py` on every file system: a case-insensitive one (macOS, Windows) also finds
   `Controller.py` under that name, and such a directory is refused there as on Linux. A
   directory may hold at most 50 regular files in at most 50 subdirectories (at any depth) and
@@ -353,6 +361,9 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   for every file in POSIX-path string order, `len(path)‖path‖len(bytes)‖bytes` (8-byte
   big-endian lengths; `path` is the UTF-8 POSIX path relative to the submission directory, or
   the file's name for a single-file submission; `bytes` exactly as on disk, never normalized).
+  A policy directory follows its own, stricter entry rules (§17), and its sha256 is this same
+  recipe over the bytes its files were read as, once: the bytes hashed are the bytes validated
+  and run.
 - **The sha256 covers the code that runs.** The entry file (the `.py` file, or `controller.py`)
   is read once: those bytes are hashed, and those bytes are compiled (as Python compiles a
   module, inheriting no `__future__` flags from the loader) and run as the submission's module.
@@ -661,9 +672,18 @@ else, including unreadable, truncated or missing files and corrupted members:
 
 `results.json` (pydantic, `extra="forbid"`, no NaN/Inf): format, challenge, protocol,
 protocol_hash, seed_set (`public`/`private`), versions (topple, mujoco, numpy, obs schema, action
-spec), platform, robot_hash, controller {id, sha256}, isolation, complete,
+spec; optional onnxruntime, onnx, cpu_isa), platform, robot_hash, controller {id, sha256,
+optional policy_sha256}, isolation, complete,
 episodes [{index, seed, success, score, metrics, error {code, step, detail}}],
 aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
+
+- **Optional fields.** `versions.onnxruntime` and `versions.onnx` are the installed
+  distributions' versions and `versions.cpu_isa` the widest vector extension of the machine
+  (`avx512f`, `avx2` or `sse4` from `/proc/cpuinfo` on Linux; `arm64-sme` or `arm64-neon` from
+  `sysctl hw.optional` on macOS), each null when unknown; `topple` records them for every run.
+  `controller.policy_sha256` is sha256(`policy.onnx`) for a `topple.policy/1` submission (§17)
+  and null for a Python one. Each may be absent: a file written before they existed reads as
+  before.
 
 - **Error codes.** A run records `exception`, `invalid_action`, `timeout`, `crash`, `protocol`,
   `output_limit`, `load_error` or `sim_unstable`. Only trusted verification (§16) assigns
@@ -680,9 +700,10 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
 - **`isolation`** (`inprocess`/`subprocess`/`container`) records how the controller ran. It does
   not make a run rankable: Phase 3 ranks only results produced by its trusted CI jobs.
 - **Bounds.** `controller.id`, `challenge` and `protocol`: 1–200 characters; `platform` and each
-  version string ≤ 64; `controller.sha256`, `protocol_hash` and `robot_hash`: 64 lowercase hex
-  digits; at most 10,000 episodes, each `index` below 10,000 and each `seed` an integer in
-  `[0, 2**53)` (§9); an error's `step` at most 10⁷ (far beyond any episode);
+  version string (`cpu_isa` included) ≤ 64; `controller.sha256`, `controller.policy_sha256`,
+  `protocol_hash` and `robot_hash`: 64 lowercase hex digits; at most 10,000 episodes, each
+  `index` below 10,000 and each `seed` an integer in `[0, 2**53)` (§9); an error's `step` at
+  most 10⁷ (far beyond any episode);
   `aggregate.episodes` and `aggregate.errors` at most 10,000, with `errors ≤ episodes`; at most
   32 metrics per episode, each name 1–64 characters and each string value ≤ 64.
 - **Untrusted text.** Every string in an uploaded file is chosen by whoever wrote it.
@@ -886,3 +907,56 @@ terminal nor start a GitHub Actions workflow command.
   verdict (so `seed` is null for a private protocol). Exit 1 if not ok (the score is then 0); an
   errored episode prints score 0.
 - `--seed` (here and in `topple run`) must be an integer in `[0, 2**53)`; `--index` ≥ 0.
+
+## 17. Policies `topple.policy/1`
+
+A policy submission is a trained network as data: an ONNX graph and its manifest, no code. The
+normative definition is `docs/design/phase-2.md` §3.1–§3.5 (layout, manifest, graph
+construction, acceptance policy, canonical form and runtime); this section states what a
+submitter and a runtime rely on.
+
+- **Layout.** A real directory (not a symlink) holding exactly `policy.onnx`, `policy.json` and
+  optionally `README.md` (≤ 64 KiB, untrusted, never printed by the CLI), all regular files with
+  one link each: `policy.onnx` ≤ 1 MiB, `policy.json` ≤ 16 KiB. Names match exactly as the
+  directory lists them (`POLICY.JSON` is not `policy.json`, on any file system), names that are
+  not UTF-8 are refused, and the listing stops at the fourth entry. Anything else (a hidden
+  file, a subdirectory, a FIFO, a pickle, external tensor data) is `unexpected entry: '<name>'`,
+  and Python beside `policy.json` is `ambiguous submission kind` (§8). Each file is read once,
+  never following a symlink and never blocking; a path that cannot be examined is a load error.
+- **Manifest** (`policy.json`, normative: ONNX Runtime Web cannot read model metadata): UTF-8
+  JSON without a BOM, duplicate keys, `NaN`/`Infinity`, numbers beyond float range, integer
+  literals of more than 20 digits or lone surrogates; every object closed (`extra` keys are
+  refused); exact JSON types (an integer is accepted for a float, never the reverse). It names
+  `format` (`topple.policy/1`), `kind` (`onnx`), the canonical `challenge`, `obs_schema`,
+  `obs_features`, `action_spec`, `action_dim` and `control_dt` (all equal to the challenge's),
+  the head `action_rule` (`clip(mean)`, `tanh(mean)` or `other`, equal to what the graph's
+  structure is), the graph (`onnx`: file, sha256, IR version, opset, input `obs` and output
+  `action`, float32 `["batch", dim]`, equal to the model's) and `claims`, which are
+  **self-reported**: shown as such, never used for ranking, divisions or "verified". The graph's
+  seven `topple.*` metadata values restate the manifest and must agree with it, type for type.
+- **Identity.** `policy_sha256 = sha256(policy.onnx)` (= `onnx.sha256`). The loader accepts only
+  canonical bytes (a model rebuilt from allow-listed parts, run through `topple policy pack`
+  first), so the hash identifies the bytes that run; two functionally equal graphs can still
+  differ. `submission_sha256` (§8) records the whole directory.
+- **Acceptance.** Only a small allow-list of ops, attributes, tensor types and fields is
+  accepted, within size, element, node and static-cost bounds, and every message is a fixed code
+  plus sanitized names: a load error never echoes the submission's bytes. Dimensions and the
+  action bounds come from the challenge, never from the submission or a training action space.
+  A loaded policy has passed a 32-call smoke test.
+- **Runtime.** ONNX Runtime on the CPU provider only, one thread, sequential, no graph
+  optimizations, deterministic compute, from bytes (never a path). `act` feeds the observation's
+  float32 feature row at batch 1 and returns the float32 `(1, action_dim)` output as floats; the
+  harness validates them like any action (§7). Results are bit-exact per (OS, architecture,
+  `cpu_isa`, onnxruntime version) and agree across runtimes only within about 1e-5, which the
+  closed loop amplifies, so replays play stored trajectories (§14, §16) and results record
+  `versions.onnxruntime` and `versions.cpu_isa` (§15).
+- **Non-finite observations are outside the policy domain.** Runtimes disagree on NaN inputs
+  (ONNX Runtime 1.31 on arm64 maps an all-NaN observation to finite actions; ONNX Runtime Web
+  returns NaN). The env never emits one (`sim_unstable` rolls the bad substep back and ends the
+  episode; a non-finite reset raises, §9, §11), and the harness checks every observation, as the
+  controller would receive it, before every `act` call: a non-finite one raises `RuntimeError`,
+  a harness bug like an episode that outlasts `max_steps` (§8), checked even under `python -O`.
+  Mapping a non-finite action to `invalid_action` therefore matters only for runtimes that
+  propagate NaN.
+- **Versioning.** Loosening a rule is additive; tightening one is a new format,
+  `topple.policy/2`.

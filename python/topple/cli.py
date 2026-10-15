@@ -126,11 +126,13 @@ def smoke(
     typer.echo(f"smoke ok: {result.steps} steps -> {result.image_path}")
 
 
-def _load(path: Path) -> Submission:
+def _load(path: Path, protocol: EvalProtocol) -> Submission:
+    """The submission at ``path``, validated for ``protocol``'s challenge (a policy's dims and
+    bounds come from it); exit 2 with one line if it does not load."""
     from topple.loader import LoadError, load_submission
 
     try:
-        return load_submission(path)
+        return load_submission(path, challenge=protocol.challenge)
     except LoadError as exc:
         _fail(str(exc))
 
@@ -189,7 +191,7 @@ def _evaluate(
     """Run, save the trajectories and ``results.json``; ``complete=False`` marks a partial run."""
     from topple.evaluate import evaluate
 
-    info = _controller(sub.id, sub.sha256)
+    info = _controller(sub.id, sub.sha256, sub.policy_sha256)
     try:
         results = evaluate(protocol, sub.factory, info, traj_dir=out)
     except OSError as exc:
@@ -211,7 +213,9 @@ def _write(results: EvalResults, path: Path) -> None:
 
 @app.command()
 def run(
-    controller: Annotated[Path, typer.Argument(help="Submission .py file or directory.")],
+    controller: Annotated[
+        Path, typer.Argument(help="Submission .py file, directory or topple.policy/1 directory.")
+    ],
     protocol: ProtocolOpt = "balance-v1/standard",
     seed: SeedOpt = None,
     out: OutOpt = Path("out/run"),
@@ -224,8 +228,8 @@ def run(
     It runs the controller's code in this process, with your privileges: only run code you trust.
     """
     _check_output(out)
-    sub = _load(controller)
     proto = _protocol(protocol)
+    sub = _load(controller, proto)
     proto = replace(proto, seeds=(proto.seeds[0] if seed is None else seed,))
     results = _evaluate(sub, proto, out, complete=False)
     _print_results(results)
@@ -235,7 +239,9 @@ def run(
 
 @app.command("eval")
 def eval_cmd(
-    controller: Annotated[Path, typer.Argument(help="Submission .py file or directory.")],
+    controller: Annotated[
+        Path, typer.Argument(help="Submission .py file, directory or topple.policy/1 directory.")
+    ],
     protocol: ProtocolOpt = "balance-v1/standard",
     out: OutOpt = Path("out/eval"),
     videos: Annotated[Videos, typer.Option(help="Which episodes to render.")] = Videos.worst,
@@ -246,8 +252,8 @@ def eval_cmd(
     It runs the controller's code in this process, with your privileges: only run code you trust.
     """
     _check_output(out)
-    sub = _load(controller)
     proto = _protocol(protocol)
+    sub = _load(controller, proto)
     results = _evaluate(sub, proto, out)
     _print_results(results)
     episodes = results.episodes or []
@@ -365,15 +371,20 @@ def _verify_file(
         _fail(f"verification crashed: {describe_exception(exc)}")
 
 
-def _controller(name: str, sha256: str) -> ControllerInfo:
-    """The recorded identity of a submission; exit 2 if its name cannot be a controller id."""
+def _controller(name: str, sha256: str, policy_sha256: str | None = None) -> ControllerInfo:
+    """The recorded identity of a submission (with its ``policy_sha256`` if it is a policy);
+    exit 2 if its name cannot be a controller id."""
     from topple.results import MAX_ID_CHARS, ControllerInfo
 
     try:
         name.encode("utf-8")
     except UnicodeEncodeError:  # a file name that is not valid UTF-8 decodes to lone surrogates
         _fail(f"the submission name {name!r} is not valid UTF-8; rename it")
-    return ControllerInfo(id=(name or UNKNOWN_CONTROLLER_ID)[:MAX_ID_CHARS], sha256=sha256)
+    return ControllerInfo(
+        id=(name or UNKNOWN_CONTROLLER_ID)[:MAX_ID_CHARS],
+        sha256=sha256,
+        policy_sha256=policy_sha256,
+    )
 
 
 def _controller_info(submission: Path | None) -> ControllerInfo:

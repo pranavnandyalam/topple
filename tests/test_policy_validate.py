@@ -4,9 +4,9 @@ Every rejection is pinned to the check that must catch it (checks run in order a
 check with any message returns), and every message is fixed vocabulary plus ``safe`` text: no
 traceback, no raw exception text, no markup.
 
-Deferred to slice 1b: "every failure is a fixed-code ``LoadError``" needs ``load_policy_dir``
-(here the fixed-code strings that it will wrap are checked), and the smoke-timer cases of the
-§6 ``test_onnx_policy`` row are covered here because ``smoke_test`` is a slice 1a function.
+"Every failure is a fixed-code ``LoadError``" is checked through ``load_policy_dir`` in
+``test_onnx_policy`` (here the fixed-code strings it wraps are checked); the smoke-timer cases
+of the §6 ``test_onnx_policy`` row live here because ``smoke_test`` is a slice 1a function.
 """
 
 from __future__ import annotations

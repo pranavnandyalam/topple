@@ -167,16 +167,29 @@ class Aggregate(_Strict):
 
 
 class Versions(_Strict):
+    """What produced the run. ``onnxruntime``, ``onnx`` and ``cpu_isa`` (``avx512f``,
+    ``avx2``, ``sse4``, ``arm64-sme``, ``arm64-neon``) are optional, so files written before
+    they existed still read; ONNX results are bit-exact only per (platform, ``cpu_isa``,
+    ``onnxruntime``) (contract §17)."""
+
     topple: VersionStr
     mujoco: VersionStr
     numpy: VersionStr
     obs_schema: VersionStr
     action_spec: VersionStr
+    onnxruntime: VersionStr | None = None
+    onnx: VersionStr | None = None
+    cpu_isa: VersionStr | None = None
 
 
 class ControllerInfo(_Strict):
+    """The submission: its id, its submission sha256 (contract §8) and, for a
+    ``topple.policy/1`` submission, ``policy_sha256`` = sha256(policy.onnx) (``None`` for a
+    Python one)."""
+
     id: Identifier  # untrusted: a submission's name; sanitized, escape before rendering
     sha256: Sha256
+    policy_sha256: Sha256 | None = None
 
     @field_validator("id", mode="before")
     @classmethod

@@ -822,7 +822,7 @@ def canonicalize(proto: onnx.ModelProto, *, pack: bool = False) -> bytes:
     nodes, renames the I/O to ``obs``/``action`` and turns a static batch of 1 into ``batch``.
     Either way external data is refused first; anything the form cannot represent (two
     outputs on a node, an undefined or twice-defined value, a node in another domain, an
-    unfoldable ``Constant``) is a ``ValueError`` with a fixed code.
+    unfoldable ``Constant``, a repeated attribute name) is a ``ValueError`` with a fixed code.
     """
     reject_external_data(proto)
     if not pack:
@@ -914,7 +914,12 @@ def _unique(by_name: dict[str, TensorProto], count: int) -> dict[str, TensorProt
 def _fold(
     nodes: Iterable[onnx.NodeProto], pack: bool
 ) -> tuple[dict[str, str], dict[str, TensorProto], list[onnx.NodeProto]]:
-    """(Identity output -> its input, Constant output -> its value, the other nodes)."""
+    """(Identity output -> its input, Constant output -> its value, the other nodes).
+
+    A node that repeats an attribute name is refused in both modes (B11): the checker and ONNX
+    Runtime reject it, and keeping one of the values (or dropping a default one) would turn an
+    invalid model into a valid one with a meaning the author never wrote.
+    """
     alias: dict[str, str] = {}
     folded: dict[str, TensorProto] = {}
     kept: list[onnx.NodeProto] = []
@@ -923,6 +928,9 @@ def _fold(
             raise ValueError("custom_domain: a node is outside the default ONNX domain")
         if len(n.output) != 1:
             raise ValueError("node_outputs: every node must have exactly one output")
+        names = [a.name for a in n.attribute]
+        if len(set(names)) != len(names):
+            raise ValueError("duplicate_attribute: a node repeats an attribute name")
         if n.op_type == "Constant":
             folded[n.output[0]] = _constant_value(n)
         elif pack and n.op_type == "Identity" and len(n.input) == 1:
