@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
@@ -23,6 +24,10 @@ if TYPE_CHECKING:
     from topple.verify import EpisodeVerdict, RunVerdict
 
 app = typer.Typer(help="Topple: CI for robots.", no_args_is_help=True)
+policy_app = typer.Typer(
+    help="topple.policy/1 policies (ONNX networks as data).", no_args_is_help=True
+)
+app.add_typer(policy_app, name="policy")
 
 
 class Videos(StrEnum):
@@ -41,6 +46,19 @@ class IsolationChoice(StrEnum):
     inprocess = "inprocess"
     subprocess = "subprocess"
     container = "container"
+
+
+class Direction(StrEnum):
+    both = "both"
+    forward = "forward"
+    backward = "backward"
+
+
+FORWARD_SIGNS: Mapping[Direction, tuple[int, ...]] = {
+    Direction.both: (1, -1),
+    Direction.forward: (1,),
+    Direction.backward: (-1,),
+}
 
 
 MAX_MESSAGE_CHARS = 500  # error messages can quote untrusted file contents
@@ -65,6 +83,17 @@ BindProtocolOpt = Annotated[
     str | None,
     typer.Option("--protocol", "-p", help="Protocol id (default: the file's challenge/preset)."),
 ]
+RequiredProtocolOpt = Annotated[
+    str, typer.Option("--protocol", "-p", help="Protocol id, e.g. balance-v1/standard or eval_v1.")
+]
+SubmissionsArg = Annotated[
+    list[Path],
+    typer.Argument(help="Submissions: .py files, directories or topple.policy/1 directories."),
+]
+WorkersOpt = Annotated[
+    int, typer.Option(min=1, help="Evaluation processes (at most 4 and the CPU count are used).")
+]
+SEED_RANGE = re.compile(r"([0-9]{1,16})\.\.([0-9]{1,16})")
 
 
 def _printable(text: str) -> str:
@@ -100,6 +129,37 @@ def _check_output(directory: Path) -> None:
         _fail(str(exc))
     except OSError as exc:
         _fail(f"cannot write to {directory}: {exc.strerror or type(exc).__name__}")
+
+
+def _write_text(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically (``_atomic.replacement``), or exit 2."""
+    from topple._atomic import replacement
+
+    try:
+        with replacement(path, suffix=".tmp") as tmp:
+            tmp.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        _fail(f"cannot write {path}: {exc.strerror or type(exc).__name__}")
+
+
+def _seed_range(text: str) -> tuple[int, ...]:
+    """``A..B``: the seeds A to B inclusive, each in [0, 2**53), at most 10,000 of them (a
+    protocol's limit, contract §8); exit 2 for anything else."""
+    from topple.results import MAX_EPISODES
+
+    match = SEED_RANGE.fullmatch(text)
+    first, last = (int(match.group(1)), int(match.group(2))) if match else (1, 0)
+    if not (match and first <= last < MAX_SEED and last - first < MAX_EPISODES):
+        _fail(
+            f"--seeds must be A..B with 0 <= A <= B < 2**53 and at most {MAX_EPISODES} seeds, "
+            f"got {text!r}"
+        )
+    return tuple(range(first, last + 1))
+
+
+def _with_seeds(protocol: EvalProtocol, seeds: str | None) -> EvalProtocol:
+    """``protocol`` with ``--seeds`` in place of its own (``protocol_hash`` covers them)."""
+    return protocol if seeds is None else replace(protocol, seeds=_seed_range(seeds))
 
 
 @app.command()
@@ -623,3 +683,191 @@ def score(
     typer.echo(json.dumps(payload, indent=2))
     if not verdict.ok:
         raise typer.Exit(code=1)
+
+
+# ------------------------------------------------------------------ comparisons and benches
+
+
+@app.command("compare")
+def compare_cmd(
+    submissions: SubmissionsArg,
+    protocol: RequiredProtocolOpt,
+    seeds: Annotated[
+        str | None,
+        typer.Option(help="Seeds A..B (inclusive) in place of the protocol's own."),
+    ] = None,
+    workers: WorkersOpt = 4,
+    json_path: Annotated[
+        Path | None, typer.Option("--json", help="Also write the topple.compare/1 file here.")
+    ] = None,
+) -> None:
+    """Run several submissions on the same seeds and compare them pairwise (Markdown report;
+    paired bootstrap 95% intervals of score differences).
+
+    It runs the submissions' code on this machine, with your privileges: only run code you
+    trust.
+    """
+    from concurrent.futures.process import BrokenProcessPool
+
+    from topple.compare import compare, to_json, to_markdown
+    from topple.loader import LoadError
+
+    if json_path is not None:
+        _check_output(json_path.parent)
+    proto = _with_seeds(_protocol(protocol), seeds)
+    try:
+        result = compare(submissions, proto, workers=workers)
+    except (LoadError, ValueError) as exc:
+        _fail(str(exc))
+    except BrokenProcessPool as exc:
+        _fail(f"an evaluation worker died: {exc}")
+    typer.echo(to_markdown(result), nl=False)
+    if json_path is not None:
+        _write_text(json_path, to_json(result))
+
+
+@app.command()
+def shove(
+    submissions: SubmissionsArg,
+    impulses: Annotated[
+        str, typer.Option(help="Impulse levels START:STOP:STEP in N·s, STOP included.")
+    ] = "0.30:0.65:0.025",
+    seeds: Annotated[str, typer.Option(help="Seeds A..B (inclusive) of balance-v1/clean.")] = (
+        "0..99"
+    ),
+    direction: Annotated[
+        Direction, typer.Option(help="Push along the heading (forward), against it, or both.")
+    ] = Direction.both,
+    workers: WorkersOpt = 4,
+) -> None:
+    """Survival vs push impulse: one push at 2.0 s (0.1 s pulse, no lateral part) on every
+    balance-v1/clean seed, at each impulse level, and the impulse where survival first falls
+    through 50% (i50).
+
+    It runs the submissions' code on this machine, with your privileges: only run code you
+    trust.
+    """
+    from concurrent.futures.process import BrokenProcessPool
+
+    from topple import bench
+    from topple.loader import LoadError
+
+    try:
+        levels = bench.parse_impulses(impulses)
+    except ValueError as exc:
+        _fail(f"--{exc}")
+    seed_list = _seed_range(seeds)
+    try:
+        results = bench.run_shoves(
+            submissions, levels, seed_list, FORWARD_SIGNS[direction], workers
+        )
+    except (LoadError, ValueError) as exc:
+        _fail(str(exc))
+    except BrokenProcessPool as exc:
+        _fail(f"an evaluation worker died: {exc}")
+    typer.echo("\n".join(bench.to_markdown(curves) for curves in results), nl=False)
+
+
+@app.command("video")
+def video_cmd(
+    side_by_side: Annotated[
+        tuple[Path, Path],
+        typer.Option("--side-by-side", help="Two traj_*.npz files: the left pane, then the right."),
+    ],
+    labels: Annotated[tuple[str, str], typer.Option(help="A label for each pane.")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="The .mp4 or .gif to write.")],
+    fps: Annotated[
+        int, typer.Option(help="Frames per second; must divide the 100 Hz control rate.")
+    ] = 50,
+    size: Annotated[
+        int, typer.Option(help="Pane size in px (each pane is SIZE x SIZE; a multiple of 16).")
+    ] = 480,
+) -> None:
+    """Replay two stored trajectories side by side on one clock (nothing is re-simulated): a
+    pane that fell or errored plays its epilogue, then holds its last frame, stamped."""
+    from topple.rendering import RenderingUnavailableError
+    from topple.video import render_side_by_side
+
+    _check_output(out.parent)
+    trajs = [_load_trajectory(path) for path in side_by_side]
+    try:
+        frames = render_side_by_side(trajs, list(labels), out, pane=size, fps=fps)
+    except (ValueError, RenderingUnavailableError) as exc:
+        _fail(str(exc))
+    except OSError as exc:
+        _fail(f"cannot write {out}: {exc.strerror or type(exc).__name__}")
+    typer.echo(f"wrote {out}: {frames} frames at {fps} fps, {2 * size}x{size}")
+
+
+def _load_trajectory(path: Path) -> Trajectory:
+    """A stored trajectory, loaded with ``load_npz`` bounded by its own challenge's episode
+    length (the challenge it names, a bundle Topple ships); exit 2 for anything else."""
+    from topple.challenge import load_challenge
+    from topple.traj import load_npz
+
+    challenge_id = _read_meta(path).get("challenge")
+    if not isinstance(challenge_id, str):
+        _fail(f"{path.name}: the trajectory does not name its challenge")
+    try:
+        cfg = load_challenge(challenge_id).config
+    except (ValueError, OSError) as exc:
+        _fail(f"{path.name}: {exc}")
+    try:
+        return load_npz(path, max_steps=round(cfg.episode_seconds / cfg.control_dt))
+    except ValueError as exc:
+        _fail(str(exc))
+
+
+# ------------------------------------------------------------------ policies
+
+
+@policy_app.command("pack")
+def policy_pack(
+    model: Annotated[Path, typer.Argument(help="An ONNX model exported elsewhere (<= 1 MiB).")],
+    challenge: Annotated[str, typer.Option(help="The challenge it is for, e.g. balance-v1.")],
+    out: Annotated[
+        Path, typer.Option("--out", "-o", help="The policy directory to create (must not exist).")
+    ],
+) -> None:
+    """Pack a third-party ONNX model into a topple.policy/1 directory: canonical policy.onnx
+    (doc strings, value_info, foreign metadata, Identity and Constant nodes removed; I/O named
+    obs/action, batch dimension symbolic) and policy.json, checked and smoke-tested exactly as
+    loading it will be. Claims are left empty."""
+    from topple import _atomic
+    from topple._inputs import open_regular
+    from topple.challenge import load_challenge
+    from topple.loader import LoadError
+    from topple.policy.pack import pack_policy
+    from topple.policy.validate import MAX_ONNX_BYTES, safe
+
+    _check_output(out)
+    if os.path.lexists(out):
+        _fail(f"{out} already exists: pack writes a new directory, never into an existing one")
+    try:
+        target = load_challenge(challenge)
+    except (ValueError, OSError) as exc:
+        _fail(str(exc))
+    name = safe(model.name)
+    try:
+        fh, _ = open_regular(model, MAX_ONNX_BYTES)
+        with fh:
+            data = fh.read(MAX_ONNX_BYTES + 1)
+    except ValueError as exc:
+        _fail(f"cannot pack {name!r}: {exc}")
+    except OSError as exc:
+        _cannot_read(model, exc)
+    try:
+        files = pack_policy(data, challenge=target)
+    except LoadError as exc:
+        _fail(f"cannot pack {name!r}: {exc}")
+    try:
+        with _atomic.new_directory(out) as tmp:
+            for file_name, content in files.items():
+                _atomic.write_new_file(tmp / file_name, content)
+    except OSError as exc:
+        _fail(f"cannot write {out}: {exc.strerror or type(exc).__name__}")
+    manifest = json.loads(files["policy.json"])
+    typer.echo(
+        f"packed {name} -> {out}: {manifest['challenge']}, action_rule {manifest['action_rule']}, "
+        f"policy_sha256 {manifest['onnx']['sha256'][:12]}"
+    )

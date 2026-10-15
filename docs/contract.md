@@ -422,7 +422,8 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   well inside these bounds; `reset(options={"scenario": dict})` goes through this check with the
   env's clock. In-process `Scenario` objects and the `pushes`/`init_pitch_rad`/`init_pitch_rate`
   reset options are trusted test hooks and skip the other bounds (robustness tests use absurd
-  pushes), but every reset path still requires the initial pitch and rate inside theirs and
+  pushes; `topple shove` injects its one calibrated push through `pushes`, in place of the
+  seed's own), but every reset path still requires the initial pitch and rate inside theirs and
   pushes sorted by `start_step` that never overlap. From about 1e84 rad/s MuJoCo cannot compute
   the reset (its accelerations come out NaN), and the float32 records cannot hold a rate beyond
   3.4e38 rad/s; the env runs one push at a time, so two at one step, or one starting while
@@ -605,13 +606,18 @@ verifies and re-scores it by replay (§16).
 in the target directory (created exclusively, under a random name), mode 0644 whatever the umask,
 then renamed over `path`. An output directory can come from someone else's checkout, so a symlink
 at `path` is replaced, never written through; a failed write leaves `path` as it was. Replay
-videos, and the image `topple smoke` writes (`smoke.png` in the current directory by default),
-are written the same way.
+videos (side-by-side ones from `topple video` included), the image `topple smoke` writes
+(`smoke.png` in the current directory by default) and the `topple.compare/1` file of `topple
+compare --json` are written the same way. `topple policy pack` writes a whole directory this
+way: its files go into a new private sibling directory, which is renamed to `--out` once
+complete; `--out` must not exist (exit 2), so a pack never writes into or replaces an existing
+directory, and a failed pack leaves nothing behind.
 
 A checkout can also commit a directory as a symlink (`out -> ~/project`), which would send the
 default `out/run` and `out/eval` elsewhere. So the commands' output paths (the `--out` of
-`topple run`, `eval`, `verify` and `smoke`, and of `python -m topple.smoke`) are checked before
-anything runs: a **relative** path never passes through a symlink. Each of its directories that
+`topple run`, `eval`, `verify`, `smoke`, `video` and `policy pack`, the `--json` of `topple
+compare`, and the `--out` of `python -m topple.smoke`) are checked before anything runs: a
+**relative** path never passes through a symlink. Each of its directories that
 exists, the output directory itself included (for a file, the directory it goes in), is
 examined without following links (`lstat`), and a symlink among them exits 2 with `refusing to
 write through the symlink '<prefix>'`; one that cannot be examined (a component that is a file)

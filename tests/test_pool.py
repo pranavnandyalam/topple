@@ -12,6 +12,7 @@ a worker, and pools are spawn-based and clamped to ``min(workers, 4, cpus)``.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import multiprocessing
 import pickle
 import shutil
@@ -26,6 +27,7 @@ import topple.pool as pool_module
 from policy_support import first_party_manifest, sac_bytes, write_policy_dir
 from topple.challenge import load_challenge
 from topple.contract import Controller
+from topple.disturbances import Push
 from topple.envs.balance import BalanceEnv
 from topple.evaluate import EvalProtocol, run_episode
 from topple.loader import LoadError, load_submission, submission_sha256
@@ -36,6 +38,7 @@ from topple.pool import (
     policy_ref,
     pool_size,
     run_episodes,
+    submission_ref,
     submit_episodes,
     worker_factory,
 )
@@ -221,7 +224,7 @@ def test_submit_episodes_refuses_a_private_protocol_before_anything_is_pickled(
         submit_episodes(pool, ref, ideal(1), [1])
     assert pool.submitted == []
     submit_episodes(pool, ref, ideal(1), [0])
-    assert pool.submitted == [(run_episodes, ref, ideal(1), (0,))]
+    assert pool.submitted == [(run_episodes, ref, ideal(1), (0,), None)]
 
 
 def test_run_episodes_refuses_another_challenge(tmp_path: Path) -> None:
@@ -310,3 +313,120 @@ def test_eval_pool_is_spawn_based_and_clamped(monkeypatch: pytest.MonkeyPatch) -
         assert isinstance(context, multiprocessing.context.SpawnContext)
     finally:
         pool.shutdown()
+
+
+# --- indices are materialized once (decision log B16) ----------------------------------------
+
+
+def test_submit_episodes_materializes_a_generator_once(tmp_path: Path) -> None:
+    """B16: a one-shot iterable used to pass the check (which consumed it) and run nothing."""
+    ref = policy_ref(write_policy_dir(tmp_path / "bot"), challenge=BALANCE)
+    pool = _RecordingPool()
+    submit_episodes(pool, ref, ideal(2), (i for i in (1, 0)))
+    assert pool.submitted == [(run_episodes, ref, ideal(2), (1, 0), None)]
+
+
+def test_submit_episodes_checks_a_generator_it_materializes(tmp_path: Path) -> None:
+    ref = policy_ref(write_policy_dir(tmp_path / "bot"), challenge=BALANCE)
+    pool = _RecordingPool()
+    with pytest.raises(ValueError, match="indices"):
+        submit_episodes(pool, ref, ideal(2), (i for i in (0, 2)))
+    assert pool.submitted == []
+
+
+def test_an_endless_iterable_of_indices_is_refused_after_a_bounded_read(tmp_path: Path) -> None:
+    """Materializing reads at most one more index than a task may run, so an endless iterator
+    is refused instead of being read until memory runs out."""
+    ref = policy_ref(write_policy_dir(tmp_path / "bot"), challenge=BALANCE)
+    endless = itertools.repeat(0)
+    with pytest.raises(ValueError, match="at most"):
+        submit_episodes(_RecordingPool(), ref, ideal(1), endless)
+    with pytest.raises(ValueError, match="at most"):
+        run_episodes(ref, ideal(1), itertools.repeat(0))
+
+
+def test_run_episodes_runs_a_generator_of_indices(tmp_path: Path) -> None:
+    sub = tmp_path / "pid.py"
+    shutil.copyfile(PID, sub)
+    ref = policy_ref(sub, challenge=BALANCE)
+    protocol = ideal(2)
+    results = run_episodes(ref, protocol, (i for i in (0, 1)))
+    assert [r.index for r in results] == [0, 1]
+    assert results == run_episodes(ref, protocol, [0, 1])
+
+
+# --- injected pushes (the trusted reset hook, contract §9) -----------------------------------
+
+SHOVE = Push(start_step=100, n_substeps=50, magnitude_n=40.0, forward_sign=1.0, lateral_ratio=0.0)
+
+
+def test_pushes_reach_the_worker_as_a_tuple(tmp_path: Path) -> None:
+    ref = policy_ref(write_policy_dir(tmp_path / "bot"), challenge=BALANCE)
+    pool = _RecordingPool()
+    submit_episodes(pool, ref, ideal(1), [0], pushes=[SHOVE])
+    assert pool.submitted == [(run_episodes, ref, ideal(1), (0,), (SHOVE,))]
+    submit_episodes(pool, ref, ideal(1), [0], pushes=())
+    assert pool.submitted[-1][-1] == ()
+
+
+@pytest.mark.parametrize(
+    "pushes",
+    [
+        [{"start_step": 100}],
+        [replace(SHOVE, start_step=300), SHOVE],  # unsorted
+        [SHOVE, SHOVE],  # two at one step
+        itertools.repeat(SHOVE),
+        [replace(SHOVE, magnitude_n=float("nan"))],
+        [replace(SHOVE, lateral_ratio=float("inf"))],
+    ],
+    ids=["not-a-push", "unsorted", "repeated", "endless", "nan-force", "inf-lateral"],
+)
+def test_bad_pushes_are_refused_in_the_parent(tmp_path: Path, pushes: Any) -> None:
+    ref = policy_ref(write_policy_dir(tmp_path / "bot"), challenge=BALANCE)
+    pool = _RecordingPool()
+    with pytest.raises(ValueError, match="push"):
+        submit_episodes(pool, ref, ideal(1), [0], pushes=pushes)
+    assert pool.submitted == []
+
+
+def test_injected_pushes_replace_the_scenario_pushes(tmp_path: Path) -> None:
+    """A 4 N·s shove topples PID on an ideal seed it otherwise survives; ``pushes=None`` keeps
+    the protocol's own scenario (``ideal`` has none)."""
+    sub = tmp_path / "pid.py"
+    shutil.copyfile(PID, sub)
+    ref = policy_ref(sub, challenge=BALANCE)
+    (calm,) = run_episodes(ref, ideal(), [0])
+    (shoved,) = run_episodes(ref, ideal(), [0], (SHOVE,))
+    (none,) = run_episodes(ref, ideal(), [0], ())
+    assert calm.metrics is not None
+    assert calm.metrics["survived"] is True
+    assert shoved.metrics is not None
+    assert shoved.metrics["termination"] in ("fell", "floor_contact")
+    assert none == calm
+
+
+def test_run_episode_without_pushes_is_unchanged() -> None:
+    env = BalanceEnv("ideal", challenge=BALANCE, record=True)
+    try:
+        factory = load_submission(PID).factory
+        plain = run_episode(env, factory, 1000, 0)
+        explicit = run_episode(env, factory, 1000, 0, pushes=None)
+    finally:
+        env.close()
+    assert plain.result == explicit.result
+
+
+# --- one load serves the record and the reference --------------------------------------------
+
+
+def test_submission_ref_returns_the_load_and_its_ref(tmp_path: Path) -> None:
+    root = write_policy_dir(tmp_path / "bot")
+    loaded, ref = submission_ref(root, challenge=BALANCE)
+    assert loaded.kind == "onnx"
+    assert loaded.policy_sha256 == ref.sha256
+    assert loaded.sha256 == submission_sha256(root)
+    assert ref == policy_ref(root, challenge=BALANCE)
+    sub = tmp_path / "pid.py"
+    shutil.copyfile(PID, sub)
+    loaded, ref = submission_ref(sub, challenge=BALANCE)
+    assert (loaded.kind, loaded.sha256, loaded.policy_sha256) == ("python", ref.sha256, None)

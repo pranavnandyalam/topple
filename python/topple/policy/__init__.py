@@ -5,7 +5,9 @@
 - ``manifest``: ``policy.json``, parsed as hostile input, and its checks against the model and
   the challenge (§3.1);
 - ``runtime``: policy directories and bytes to a ``LoadedPolicy``, and the one place an ONNX
-  Runtime session is created, from validated bytes (§3.5).
+  Runtime session is created, from validated bytes (§3.5);
+- ``pack``: a third-party ONNX model to a ``topple.policy/1`` directory's files
+  (``topple policy pack``, §3.3).
 
 Nothing here imports torch: eval and CI never need it.
 """

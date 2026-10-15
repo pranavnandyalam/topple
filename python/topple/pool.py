@@ -19,25 +19,36 @@ boundary).
 
 Workers receive public protocols only: submitting a task pickles its protocol, salt included
 (only its ``repr`` is redacted), so ``submit_episodes`` refuses a private one in the parent,
-before anything is sent, and ``run_episodes`` checks again in the worker.
+before anything is sent, and ``run_episodes`` checks again in the worker. A task's indices (and
+pushes) are read once, bounded, into a tuple before they are checked (decision log B16): a
+one-shot iterator checked first and sent afterwards would run nothing, and an endless one is
+refused after ``MAX_TASK_EPISODES + 1`` items instead of being read until memory runs out.
+
+A task may replace its episodes' pushes (``pushes``): the trusted ``reset(options={"pushes":
+...})`` hook (contract §9) that robustness benches such as ``topple shove`` use; ``None`` keeps
+each seed's own scenario.
 """
 
 from __future__ import annotations
 
+import itertools
+import math
 import multiprocessing
 import os
-from collections.abc import Sequence
+from collections.abc import Iterable
 from concurrent.futures import Executor, Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, cast
 
+from topple.disturbances import Push, check_push_schedule
 from topple.envs.balance import BalanceEnv
 from topple.evaluate import ControllerFactory, EvalProtocol, run_episode
 from topple.ids import validate_challenge_id
-from topple.loader import load_submission
+from topple.loader import Submission, load_submission
 from topple.policy.manifest import HEX64
 from topple.policy.validate import MAX_ONNX_BYTES
+from topple.results import MAX_EPISODES
 
 if TYPE_CHECKING:
     from topple.challenge import Challenge
@@ -45,6 +56,8 @@ if TYPE_CHECKING:
 
 POOL_MAX_WORKERS: Final = 4
 START_METHOD: Final = "spawn"  # a fresh interpreter: no inherited sessions, threads or locks
+MAX_TASK_EPISODES: Final = MAX_EPISODES  # a results file lists at most this many (contract §15)
+MAX_TASK_PUSHES: Final = 16  # an episode of 1,000 steps holds a handful; a bench uses one
 
 
 @dataclass(frozen=True)
@@ -76,11 +89,19 @@ class PolicyRef:
 def policy_ref(sub: Path, *, challenge: Challenge) -> PolicyRef:
     """The parent's side: load ``sub`` once (``load_submission``: a policy is fully validated
     and smoke-tested for ``challenge``, a Python submission imported) and reference it."""
+    return submission_ref(sub, challenge=challenge)[1]
+
+
+def submission_ref(sub: Path, *, challenge: Challenge) -> tuple[Submission, PolicyRef]:
+    """``policy_ref`` with the load it came from: a report records the submission's id, its
+    submission sha256 and its ``policy_sha256`` from the same single read the workers' sha256
+    checks are bound to (``topple compare``, ``topple shove``)."""
     loaded = load_submission(sub, challenge=challenge)
     policy = loaded.policy  # set exactly when ``loaded.kind == "onnx"`` (Submission checks)
     if policy is not None:
-        return PolicyRef("onnx", policy.validated.canonical, policy.policy_sha256, challenge.id)
-    return PolicyRef("python", str(sub.resolve()), loaded.sha256, challenge.id)
+        ref = PolicyRef("onnx", policy.validated.canonical, policy.policy_sha256, challenge.id)
+        return loaded, ref
+    return loaded, PolicyRef("python", str(sub.resolve()), loaded.sha256, challenge.id)
 
 
 def worker_factory(ref: PolicyRef) -> ControllerFactory:
@@ -106,16 +127,29 @@ def worker_factory(ref: PolicyRef) -> ControllerFactory:
 
 
 def submit_episodes(
-    pool: Executor, ref: PolicyRef, protocol: EvalProtocol, indices: Sequence[int]
+    pool: Executor,
+    ref: PolicyRef,
+    protocol: EvalProtocol,
+    indices: Iterable[int],
+    *,
+    pushes: Iterable[Push] | None = None,
 ) -> Future[list[EpisodeResult]]:
-    """Submit ``run_episodes(ref, protocol, indices)`` to ``pool``, after checking its
+    """Submit ``run_episodes(ref, protocol, indices, pushes)`` to ``pool``, after checking its
     arguments here in the parent: submitting pickles them to a worker, so a private protocol
-    (its salt) must be refused before ``submit``, not by the worker that already received it."""
-    _check_task(ref, protocol, indices)
-    return pool.submit(run_episodes, ref, protocol, tuple(indices))
+    (its salt) must be refused before ``submit``, not by the worker that already received it.
+    ``indices`` and ``pushes`` are read once into tuples (B16), and those tuples are sent."""
+    checked, injected = _check_task(ref, protocol, indices, pushes)
+    return pool.submit(run_episodes, ref, protocol, checked, injected)
 
 
-def _check_task(ref: PolicyRef, protocol: EvalProtocol, indices: Sequence[int]) -> None:
+def _check_task(
+    ref: PolicyRef,
+    protocol: EvalProtocol,
+    indices: Iterable[int],
+    pushes: Iterable[Push] | None,
+) -> tuple[tuple[int, ...], tuple[Push, ...] | None]:
+    """The task's indices and pushes, each read once (at most one item past its cap) into a
+    tuple and checked; ``ValueError`` for anything a worker must not receive."""
     if protocol.seed_set != "public":
         raise ValueError("pool workers run public protocols only: a private salt stays home")
     if protocol.challenge.id != ref.challenge_id:
@@ -123,23 +157,48 @@ def _check_task(ref: PolicyRef, protocol: EvalProtocol, indices: Sequence[int]) 
             f"the policy was validated for {ref.challenge_id}, not {protocol.challenge.id}"
         )
     n = len(protocol.seeds)
-    if not all(type(i) is int and 0 <= i < n for i in indices):
+    checked = tuple(itertools.islice(indices, MAX_TASK_EPISODES + 1))
+    if len(checked) > MAX_TASK_EPISODES:
+        raise ValueError(f"a task runs at most {MAX_TASK_EPISODES} episodes")
+    if not all(type(i) is int and 0 <= i < n for i in checked):
         raise ValueError(f"episode indices must be ints in [0, {n})")
+    return checked, None if pushes is None else _checked_pushes(pushes)
+
+
+def _checked_pushes(pushes: Iterable[Push]) -> tuple[Push, ...]:
+    """``pushes`` as a tuple of ``Push`` (exactly), sorted by start step with no repeats; the
+    env checks the rest of the schedule against its clock at reset (contract §9)."""
+    injected = tuple(itertools.islice(pushes, MAX_TASK_PUSHES + 1))
+    if len(injected) > MAX_TASK_PUSHES:
+        raise ValueError(f"a task injects at most {MAX_TASK_PUSHES} pushes")
+    if not all(type(p) is Push for p in injected):
+        raise ValueError("pushes must be topple.disturbances.Push objects")
+    for p in injected:  # a trusted hook skips the bounds, never the arithmetic (contract §9)
+        if not (math.isfinite(p.magnitude_n) and math.isfinite(p.lateral_ratio)):
+            raise ValueError("injected pushes must have a finite magnitude and lateral ratio")
+    check_push_schedule(injected)
+    return injected
 
 
 def run_episodes(
-    ref: PolicyRef, protocol: EvalProtocol, indices: Sequence[int]
+    ref: PolicyRef,
+    protocol: EvalProtocol,
+    indices: Iterable[int],
+    pushes: Iterable[Push] | None = None,
 ) -> list[EpisodeResult]:
     """A pool task (submit it with ``submit_episodes``): episodes ``indices`` of the public
-    ``protocol`` for ``ref``, in order, on one env. The arguments are checked again here, and
-    the controller is rebuilt (its sha256 re-checked) before the first episode."""
-    _check_task(ref, protocol, indices)
+    ``protocol`` for ``ref``, in order, on one env, each with ``pushes`` in place of its
+    scenario's when given. The arguments are checked again here, and the controller is rebuilt
+    (its sha256 re-checked) before the first episode."""
+    checked, injected = _check_task(ref, protocol, indices, pushes)
     factory = worker_factory(ref)
     env = BalanceEnv(protocol.preset, challenge=protocol.challenge, record=True)
     try:
         return [
-            run_episode(env, factory, protocol.seeds[i], i, salt=protocol.salt).result
-            for i in indices
+            run_episode(
+                env, factory, protocol.seeds[i], i, salt=protocol.salt, pushes=injected
+            ).result
+            for i in checked
         ]
     finally:
         env.close()

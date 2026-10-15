@@ -8,7 +8,9 @@ neither must a symlink committed in place of a directory (``out -> ~/project``),
 
 from __future__ import annotations
 
+import errno
 import os
+import shutil
 import stat
 import tempfile
 from collections.abc import Iterator
@@ -18,6 +20,17 @@ from pathlib import Path
 OUTPUT_MODE = 0o644
 """Mode of every output file, whatever the umask: trajectories and videos are artifacts that CI
 uploads and other people read."""
+DIRECTORY_MODE = 0o755
+"""Mode of an output directory ``new_directory`` creates (a policy directory is committed and
+shared like any other output)."""
+_NEW_FILE_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_BINARY", 0)
+)
 
 
 class SymlinkedOutputError(OSError):
@@ -84,3 +97,42 @@ def _set_mode(fd: int, path: Path) -> None:
         os.fchmod(fd, OUTPUT_MODE)
     else:
         os.chmod(path, OUTPUT_MODE)
+
+
+@contextmanager
+def new_directory(path: Path) -> Iterator[Path]:
+    """A new, private, empty directory next to ``path`` for the block to fill, renamed to
+    ``path`` (mode ``DIRECTORY_MODE``) when the block succeeds, and removed with everything in
+    it when the block fails: ``path`` appears complete or not at all.
+
+    ``FileExistsError`` if anything (a symlink included) is at ``path`` before the block, or
+    after it: an existing directory is never written into or replaced. A directory created at
+    ``path`` in the instant between that last check and the rename is replaced if it is empty
+    (POSIX ``rename``) and refused if it is not, so nothing anyone wrote there is lost.
+    """
+    if os.path.lexists(path):
+        raise FileExistsError(errno.EEXIST, "already exists", str(path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=".partial"))
+    try:
+        yield tmp
+        os.chmod(tmp, DIRECTORY_MODE)
+        if os.path.lexists(path):
+            raise FileExistsError(errno.EEXIST, "already exists", str(path))
+        os.rename(tmp, path)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+
+
+def write_new_file(path: Path, data: bytes) -> None:
+    """Create ``path`` (which must not exist, and is never followed if it is a symlink) holding
+    ``data``, mode ``OUTPUT_MODE``. For files inside a ``new_directory``."""
+    fd = os.open(path, _NEW_FILE_FLAGS, OUTPUT_MODE)
+    try:
+        _set_mode(fd, path)
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+    finally:
+        os.close(fd)

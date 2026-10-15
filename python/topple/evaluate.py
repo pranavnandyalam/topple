@@ -14,7 +14,7 @@ import importlib.metadata
 import itertools
 import platform
 import subprocess
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -36,6 +36,7 @@ from topple.contract import (
     describe_exception,
     validate_action,
 )
+from topple.disturbances import Push
 from topple.envs.balance import BalanceEnv
 from topple.ids import parse_protocol, resolve_protocol
 from topple.results import (
@@ -302,13 +303,19 @@ def run_episode(
     *,
     salt: int = 0,
     report_seed: bool = True,
+    pushes: Sequence[Push] | None = None,
 ) -> EpisodeRun:
     """One episode. Never raises for controller misbehaviour: errors land in the result.
 
     Any exception from the controller (its factory, ``reset``, ``act``, or the code of the object
     it returns) becomes a typed error that scores 0; only ``KeyboardInterrupt`` propagates.
+    ``pushes`` replaces the seed's scenario pushes through the trusted reset hook (contract §9;
+    benches such as ``topple shove``); ``None`` keeps them.
     """
-    obs_arr, info = env.reset(seed=seed)
+    if pushes is None:
+        obs_arr, info = env.reset(seed=seed)
+    else:
+        obs_arr, info = env.reset(seed=seed, options={"pushes": tuple(pushes)})
     controller, error = _start_controller(env, factory, seed, salt)
     if controller is not None:
         error = _control_loop(env, controller, obs_arr, info)
@@ -423,6 +430,23 @@ def distribution_version(name: str) -> str | None:
         return None
 
 
+def run_versions() -> Versions:
+    """What this machine runs episodes with: Topple, MuJoCo, numpy, the obs and action schemas,
+    and the installed ONNX Runtime, onnx and ``cpu_isa`` (recorded for every run, a Python
+    controller's included: per-episode ONNX results are bit-exact only per platform,
+    ``cpu_isa`` and onnxruntime version, contract §17)."""
+    return Versions(
+        topple=__version__,
+        mujoco=mujoco.__version__,
+        numpy=np.__version__,
+        obs_schema=OBS_SCHEMA_ID,
+        action_spec=BALANCE_V1_ACTION.id,
+        onnxruntime=distribution_version("onnxruntime"),
+        onnx=distribution_version("onnx"),
+        cpu_isa=cpu_isa(),
+    )
+
+
 def build_results(
     protocol: EvalProtocol,
     episodes: list[EpisodeResult],
@@ -440,16 +464,7 @@ def build_results(
         protocol=protocol.id,
         protocol_hash=protocol.protocol_hash(),
         seed_set=protocol.seed_set,
-        versions=Versions(
-            topple=__version__,
-            mujoco=mujoco.__version__,
-            numpy=np.__version__,
-            obs_schema=OBS_SCHEMA_ID,
-            action_spec=BALANCE_V1_ACTION.id,
-            onnxruntime=distribution_version("onnxruntime"),
-            onnx=distribution_version("onnx"),
-            cpu_isa=cpu_isa(),
-        ),
+        versions=run_versions(),
         platform=platform_tag(),
         robot_hash=robot_hash(protocol.challenge.robot_xml, protocol.challenge.params),
         controller=controller,
