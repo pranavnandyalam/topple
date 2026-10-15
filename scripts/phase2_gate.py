@@ -23,8 +23,10 @@ reads ``results.json`` (a regular file of at most 16 MiB, never blocking, exact 
   (``--ci-dir``), which must record a linux platform, ``cpu_isa`` and onnxruntime.
 - **G5** re-runs batch-1 parity against the fixture (``topple.export``'s parity code), **G6**
   loads the submission (``load_policy_dir``), **G7** also requires the ablation run (so G10
-  judges it), **G8** checks the results package's files (and that ``phase2.json`` and
-  ``phase2.md`` are regular files, not symlinks) with local git commands, **G10** reads only
+  judges it) and replays §2.5 with every attempt's local G1-G4 result recomputed from
+  ``phase2.json``'s fresh evaluations (only ubuntu failures and G5/G6 stay claims), **G8**
+  checks the results package's files (and that ``phase2.json`` and ``phase2.md`` are regular
+  files, not symlinks) with local git commands, **G10** reads only
   ``phase2.json`` and recomputes the selection protocol hash, ``ENV_ALGO_VERSION`` and the
   bundle hash from code. G9 is ``phase2_ci_check.py``.
 """
@@ -47,6 +49,7 @@ from typing import Final
 from phase2_common import (
     CHALLENGE_ID,
     FIXTURE_DIR,
+    LOCAL_SHIP_GATES,
     LQR_SUBMISSION,
     MAX_MEAN_SATURATION,
     MAX_PEAK_TREE_RSS_MIB,
@@ -64,7 +67,9 @@ from phase2_common import (
     RESULT_FILES,
     SHIP_GATES,
     SUCCESS_MARGIN,
+    UBUNTU_GATES,
     CommandError,
+    Fresh,
     FreshRow,
     G11Row,
     Phase2Report,
@@ -103,7 +108,7 @@ from topple.results import EvalResults, read_results
 from topple.stats import N_RESAMPLES, SEED, paired_bootstrap
 from topple.train.selection import NOT_SHIPPABLE
 
-CALIBRATION_GATES: Final = ("G2", "G2b", "G3", "G4")
+CALIBRATION_GATES: Final = UBUNTU_GATES
 LOCAL: Final = "local"
 UBUNTU: Final = "ubuntu"
 
@@ -287,6 +292,21 @@ def calibration_checks(cmp: Comparison, k: int, where: str) -> dict[str, Problem
     return out
 
 
+def eval_v1_checks(cmp: Comparison, k: int, where: str) -> dict[str, Problems]:
+    """G1 and G3's eval_v1 part for entry ``k`` of a framed eval_v1 comparison (PID entry 0):
+    protocol score (fsum/N, contract §12) above PID's, success at least PID's."""
+    pid, ppo = cmp.entries[0], cmp.entries[k]
+    n = len(cmp.seeds)
+    out: dict[str, Problems] = {"G1": [], "G3": []}
+    score_ppo, score_pid = math.fsum(ppo.scores) / n, math.fsum(pid.scores) / n
+    if not score_ppo > score_pid:
+        out["G1"].append(f"{where}: PPO score {score_ppo:.4f} is not above PID's {score_pid:.4f}")
+    s_ppo, s_pid = sum(ppo.success), sum(pid.success)
+    if s_ppo < s_pid:
+        out["G3"].append(f"{where}: PPO success {_rate(s_ppo, n)} is below PID's {_rate(s_pid, n)}")
+    return out
+
+
 def _ubuntu_provenance(cmp: Comparison, where: str) -> Problems:
     """The ubuntu evidence records what produced it (§4): a linux platform, ``cpu_isa`` and
     the onnxruntime version."""
@@ -352,11 +372,7 @@ def gate_g1(inp: GateInputs) -> Problems:
     cmp, k, problems = _eval_v1(inp)
     if problems or cmp is None:
         return problems
-    n = len(cmp.seeds)
-    ppo, pid = math.fsum(cmp.entries[k].scores) / n, math.fsum(cmp.entries[0].scores) / n
-    if not ppo > pid:
-        return [f"eval_v1: PPO score {ppo:.4f} is not above PID's {pid:.4f}"]
-    return []
+    return eval_v1_checks(cmp, k, "eval_v1")["G1"]
 
 
 def gate_g3(inp: GateInputs, calibration: Mapping[str, Problems]) -> Problems:
@@ -365,12 +381,7 @@ def gate_g3(inp: GateInputs, calibration: Mapping[str, Problems]) -> Problems:
     cmp, k, found = _eval_v1(inp)
     problems += found
     if not found and cmp is not None:
-        n = len(cmp.seeds)
-        s_ppo, s_pid = sum(cmp.entries[k].success), sum(cmp.entries[0].success)
-        if s_ppo < s_pid:
-            problems.append(
-                f"eval_v1: PPO success {_rate(s_ppo, n)} is below PID's {_rate(s_pid, n)}"
-            )
+        problems += eval_v1_checks(cmp, k, "eval_v1")["G3"]
     return problems
 
 
@@ -484,7 +495,7 @@ def gate_g7(inp: GateInputs) -> Problems:
     gate was exported ``--report-only`` and is marked ``below_pid_gate``; and the ablation run
     (§5.1), which G10 judges with the others (§2.3). The shipped run is a PPO run exported for
     shipping, its policy is the submission, and it and its attempts are §2.5's choice among the
-    candidates."""
+    candidates, each attempt's local G1-G4 result recomputed from the fresh evaluations."""
     problems = _errors(inp.report, inp.subject)
     if problems:
         return problems
@@ -506,8 +517,11 @@ def gate_g7(inp: GateInputs) -> Problems:
         ("eval_v1", fresh.eval_v1, eval_protocol()),
         ("calibration", fresh.calibration, calibration_protocol()),
     )
+    framed = True
     for name, cmp, protocol in frames:
-        problems += _frame(cmp, protocol, name, inp.baselines, f"fresh {name}")
+        found = _frame(cmp, protocol, name, inp.baselines, f"fresh {name}")
+        framed = framed and not found
+        problems += found
     rows: dict[str, FreshRow] = {}
     for fresh_row in fresh.rows:
         if fresh_row.run in rows:
@@ -540,6 +554,49 @@ def gate_g7(inp: GateInputs) -> Problems:
     if extra:
         problems.append(f"fresh-eval rows for runs that are not reported: {extra}")
     problems += _shipped(report, runs, rows, inp.subject)
+    if framed:
+        problems += _attempts_measured(report, rows)
+    return problems
+
+
+def fresh_local_failures(fresh: Fresh, row: FreshRow) -> tuple[tuple[str, ...], Problems]:
+    """The ``LOCAL_SHIP_GATES`` that ``row``'s policy fails on ``phase2.json``'s own framed
+    fresh evaluations (G2-G4 on the calibration, G1 and G3 on eval_v1), in gate order."""
+    where = f"fresh calibration, {row.run}"
+    k_cal, problems = _find(fresh.calibration, row.policy_sha256, None, where)
+    k_eval, found = _find(fresh.eval_v1, row.policy_sha256, None, f"fresh eval_v1, {row.run}")
+    problems += found
+    if problems:
+        return (), problems
+    checks = calibration_checks(fresh.calibration, k_cal, where)
+    for gate, more in eval_v1_checks(fresh.eval_v1, k_eval, f"fresh eval_v1, {row.run}").items():
+        checks[gate] = checks.get(gate, []) + more
+    return tuple(g for g in LOCAL_SHIP_GATES if checks[g]), []
+
+
+def _attempts_measured(report: Phase2Report, rows: Mapping[str, FreshRow]) -> Problems:
+    """Every §2.5 attempt's local G1-G4 result is what the fresh evaluations show: a
+    ``local`` attempt failed exactly those, an ``ubuntu`` one and the shipped one none (it
+    passed every ship gate locally). Only ubuntu failures and G5/G6 stay recorded claims."""
+    problems: Problems = []
+    for attempt in report.shipped.attempts:
+        row = rows.get(attempt.run)
+        if row is None:
+            continue  # the replay names a run without a fresh row
+        measured, found = fresh_local_failures(report.fresh, row)
+        if found:
+            problems += found
+            continue
+        claimed = (
+            tuple(g for g in LOCAL_SHIP_GATES if g in attempt.failed_gates)
+            if attempt.failed_on == LOCAL
+            else ()
+        )
+        if measured != claimed:
+            problems.append(
+                f"shipped.attempts {attempt.run!r}: recorded local failures {list(claimed)} "
+                f"({attempt.failed_on or 'none'}) are not its fresh evaluations' {list(measured)}"
+            )
     return problems
 
 

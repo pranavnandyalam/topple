@@ -29,6 +29,7 @@ import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from statistics import median
 from typing import Any, get_args
 
 import numpy as np
@@ -324,11 +325,11 @@ def phase2_doc(
     subject: gate.Subject,
     *,
     shipped_run: str = "ppo_s0",
-    attempts: Sequence[tuple[str, Sequence[str]]] = (("ppo_s0", ()),),
+    attempts: Sequence[tuple[str, Sequence[str], str | None]] = (("ppo_s0", (), None),),
 ) -> dict[str, Any]:
     """A good ``phase2.json``: 3 PPO runs (ppo_s0 ranked first), 3 SAC runs below the PID gate
     and the ablation; fresh comparisons of all six with PID and LQR. ``shipped_run``'s policy
-    is the submission's, shipped after ``attempts``."""
+    is the submission's, shipped after ``attempts`` (run, failed gates, where they failed)."""
 
     def policy_sha(run: str, subject: gate.Subject) -> str:
         return subject.policy_sha256 if run == shipped_run else fake_sha(f"policy {run}")
@@ -420,7 +421,9 @@ def phase2_doc(
         "shipped": {
             "run": shipped_run,
             "policy_sha256": subject.policy_sha256,
-            "attempts": [{"run": r, "failed_gates": list(g)} for r, g in attempts],
+            "attempts": [
+                {"run": r, "failed_gates": list(g), "failed_on": where} for r, g, where in attempts
+            ],
         },
         "g11": [
             {"run": r, "eligible": True, "g2": True, "g2b": True, "g3": True, "g4": True}
@@ -732,6 +735,29 @@ def test_g2b_success_margin_is_exact(lqr: int, ppo: int, passes: bool, good: Goo
         assert f"{ppo / 200:.3f} ({ppo}/200)" in failed["G2b"][0]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"), [("energy_j", 13.1), ("saturation_fraction", 0.10)], ids=["e_ref", "sat"]
+)
+def test_g4_bars_are_inclusive(field: str, value: float, good: GoodSet) -> None:
+    """G4 is "at most": a median energy of exactly E_ref (13.1 J) and a mean saturation of
+    exactly 0.10 (fsum of 200 x 0.1 / 200 is 0.1) pass."""
+    ppo = replace(arrays(PPO_CAL, 200, 3), **{field: (value,) * 200})
+    cal = good.cal(ppo=ppo)
+    assert median(cal.entries[2].energy_j) <= 13.1
+    assert math.fsum(cal.entries[2].saturation_fraction) / 200 <= 0.10
+    assert getattr(cal.entries[2], field) == (value,) * 200
+    assert failing(good.inputs(cmp_cal=cal, ci_cmp=cal)) == {}
+
+
+def test_g1_needs_ppo_strictly_above_pid(good: GoodSet) -> None:
+    """eval_v1: PPO playing exactly as PID does (same scores and successes) fails G1 alone."""
+    cmp = good.eval_v1()
+    entries = (*cmp.entries[:2], replace_arrays(cmp.entries[2], arrays(PID_EVAL, 20, 1)))
+    assert entries[2].scores == entries[0].scores
+    failed = failing(good.inputs(cmp_eval=comparison(EVAL, entries)))
+    assert set(failed) == {"G1"}, failed
+
+
 def test_g1_compares_ppo_with_pid_not_lqr(good: GoodSet) -> None:
     """eval_v1: PPO scores above PID but below LQR, which passes G1."""
     cmp = good.eval_v1(ppo=Perf(80.0, 55.0, 19, 3.0, 0.03))
@@ -918,7 +944,7 @@ def no_fresh_row(doc: dict[str, Any]) -> None:
 def shipped_not_first(doc: dict[str, Any]) -> None:
     """ppo_s1 ranks below ppo_s0 on the selection seeds, and ppo_s0 has no failed attempt."""
     runs_of(doc)["ppo_s1"]["selection_history"][-1]["score"] = 83.0
-    doc["shipped"]["attempts"] = [{"run": "ppo_s1", "failed_gates": []}]
+    doc["shipped"]["attempts"] = [{"run": "ppo_s1", "failed_gates": [], "failed_on": None}]
     doc["shipped"]["run"] = "ppo_s1"
 
 
@@ -966,16 +992,103 @@ def test_g7_names_a_bad_run_table(name: str, good: GoodSet) -> None:
     assert any(words in p for p in failed["G7"]), failed["G7"]
 
 
-def test_g7_accepts_a_recorded_fallback(good: GoodSet) -> None:
-    """ppo_s0 failed G2b; the next candidate, ppo_s1, shipped: §2.5's record."""
+def like_lqr(doc: dict[str, Any], run: str) -> None:
+    """``run`` plays exactly as LQR does in the fresh calibration: it fails G2b there alone
+    (its G11 row says so), as ``g2b_only`` makes the shipped policy fail it locally."""
+    cal = Comparison.model_validate_json(json.dumps(doc["fresh"]["calibration"]), strict=True)
+    lqr = cal.entries[1]
+    copied = ("scores", "success", "termination", "energy_j", "saturation_fraction")
+    entries = [
+        e.model_copy(update={f: getattr(lqr, f) for f in copied}) if e.id == run else e
+        for e in cal.entries
+    ]
+    doc["fresh"]["calibration"] = json.loads(to_json(comparison(CAL, entries)))
+    for row in doc["g11"]:
+        if row["run"] == run:
+            row["g2b"] = False
+
+
+def fallback(
+    good: GoodSet, failed_on: str, *, fails_locally: bool, failed: Sequence[str] = ("G2b",)
+) -> gate.GateInputs:
+    """ppo_s1 shipped after ppo_s0 failed ``failed`` on ``failed_on``; ppo_s0's fresh
+    calibration fails G2b (``fails_locally``) or passes every gate."""
     doc = phase2_doc(
-        good.subject, shipped_run="ppo_s1", attempts=[("ppo_s0", ["G2b"]), ("ppo_s1", [])]
+        good.subject,
+        shipped_run="ppo_s1",
+        attempts=[("ppo_s0", failed, failed_on), ("ppo_s1", (), None)],
     )
-    assert failing(good.inputs(report=report_of(doc))) == {}
-    unrecorded = phase2_doc(good.subject, shipped_run="ppo_s1", attempts=[("ppo_s1", [])])
-    failed = failing(good.inputs(report=report_of(unrecorded)))
-    assert set(failed) == {"G7"}
-    assert any("section 2.5" in p and "'ppo_s0'" in p for p in failed["G7"]), failed
+    if fails_locally:
+        like_lqr(doc, "ppo_s0")
+    return good.inputs(report=report_of(doc))
+
+
+@pytest.mark.parametrize(
+    ("failed_on", "fails_locally", "failed"),
+    [
+        ("local", True, ("G2b",)),  # phase2.json's own fresh calibration shows it
+        ("ubuntu", False, ("G2b",)),  # passed locally; the ubuntu half is CI's claim
+        ("local", True, ("G2b", "G5")),  # G5 and G6 cannot be recomputed from phase2.json
+        ("local", False, ("G6",)),
+    ],
+)
+def test_g7_accepts_a_recorded_fallback(
+    failed_on: str, fails_locally: bool, failed: Sequence[str], good: GoodSet
+) -> None:
+    """ppo_s0 failed G2b; the next candidate, ppo_s1, shipped: §2.5's record."""
+    assert failing(fallback(good, failed_on, fails_locally=fails_locally, failed=failed)) == {}
+    unrecorded = phase2_doc(good.subject, shipped_run="ppo_s1", attempts=[("ppo_s1", (), None)])
+    failed_gates = failing(good.inputs(report=report_of(unrecorded)))
+    assert set(failed_gates) == {"G7"}
+    assert any("section 2.5" in p and "'ppo_s0'" in p for p in failed_gates["G7"]), failed_gates
+
+
+@pytest.mark.parametrize(
+    ("failed_on", "fails_locally", "failed"),
+    [
+        ("local", False, ("G2b",)),  # a local failure the fresh evaluations do not show
+        ("ubuntu", True, ("G2b",)),  # it failed locally, so it never reached ubuntu
+        ("local", True, ("G2b", "G4")),  # one gate too many
+        ("local", True, ("G5",)),  # and one too few
+    ],
+)
+def test_g7_recomputes_every_local_failure_from_the_fresh_evaluations(
+    failed_on: str, fails_locally: bool, failed: Sequence[str], good: GoodSet
+) -> None:
+    """A recorded attempt is replayed on phase2.json's own fresh evaluations: its local G1-G4
+    failures must be exactly what they show, in either direction."""
+    found = failing(fallback(good, failed_on, fails_locally=fails_locally, failed=failed))
+    assert set(found) == {"G7"}, found
+    assert any("'ppo_s0'" in p and "fresh" in p for p in found["G7"]), found["G7"]
+
+
+def test_g7_refuses_a_shipped_run_its_fresh_evaluations_fail(good: GoodSet) -> None:
+    """The shipped candidate passed every ship gate locally: its fresh calibration must too."""
+    found = failing(with_doc(good, lambda doc: like_lqr(doc, "ppo_s0")))
+    assert set(found) == {"G7"}, found
+    assert any("'ppo_s0'" in p and "G2b" in p for p in found["G7"]), found["G7"]
+
+
+@pytest.mark.parametrize(
+    ("failed_gates", "failed_on", "words"),
+    [
+        (["G2b"], None, "failed_on"),
+        ([], "local", "failed_on"),
+        (["G5"], "ubuntu", "ubuntu"),
+        (["G1"], "ubuntu", "ubuntu"),
+    ],
+)
+def test_a_ship_attempt_says_where_it_failed(
+    failed_gates: list[str], failed_on: str | None, words: str, good: GoodSet
+) -> None:
+    """``failed_on`` is null exactly when nothing failed; ubuntu measures only G2-G4."""
+    doc = good.doc()
+    doc["shipped"]["attempts"][0].update(failed_gates=failed_gates, failed_on=failed_on)
+    with pytest.raises(ValueError, match=words):
+        report_of(doc)
+    del doc["shipped"]["attempts"][0]["failed_on"]
+    with pytest.raises(ValueError, match="failed_on"):
+        report_of(doc)
 
 
 # --- G8 -------------------------------------------------------------------------------------------
@@ -1134,26 +1247,12 @@ def test_g11_table_must_match_the_recomputation(good: GoodSet) -> None:
 
 
 def test_g11_g2b_is_reported_not_gating(good: GoodSet) -> None:
+    """The two runs that were not shipped fail G2b in the fresh calibration and still count
+    (the shipped one cannot: G7 requires it to pass every ship gate there)."""
+
     def lqr_level(doc: dict[str, Any]) -> None:
-        for row in doc["g11"]:
-            row["g2b"] = False
-        cal = Comparison.model_validate_json(json.dumps(doc["fresh"]["calibration"]), strict=True)
-        lqr = cal.entries[1]
-        entries = [
-            e.model_copy(
-                update={
-                    "scores": lqr.scores,
-                    "success": lqr.success,
-                    "termination": lqr.termination,
-                    "energy_j": lqr.energy_j,
-                    "saturation_fraction": lqr.saturation_fraction,
-                }
-            )
-            if e.id in PPO_RUNS
-            else e
-            for e in cal.entries
-        ]
-        doc["fresh"]["calibration"] = json.loads(to_json(comparison(CAL, entries)))
+        like_lqr(doc, "ppo_s1")
+        like_lqr(doc, "ppo_s2")
 
     assert failing(with_doc(good, lqr_level)) == {}
 

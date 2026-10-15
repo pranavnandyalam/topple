@@ -61,6 +61,11 @@ next candidate is tried."""
 PASS_GATES: Final = ("G1", "G2", "G2b", "G3", "G4", "G5", "G6", "G7", "G8", "G10", "G11")
 """§4: ``phase2_gate.py`` exits 0 iff every one of these passes (G9 is ``phase2_ci_check.py``)."""
 ShipGate = Literal["G1", "G2", "G2b", "G3", "G4", "G5", "G6"]
+LOCAL_SHIP_GATES: Final = ("G1", "G2", "G2b", "G3", "G4")
+"""The ship gates G7 recomputes for every §2.5 attempt from ``phase2.json``'s own fresh
+evaluations (G5 and G6 need the candidate's fixture and results, which it does not hold)."""
+UBUNTU_GATES: Final = ("G2", "G2b", "G3", "G4")
+"""§4: the gates evaluated on the ubuntu compare too (G3 on its 0..199 part)."""
 G10_FIELDS: Final = (
     "flags",
     "num_timesteps",
@@ -383,10 +388,22 @@ class Fresh(_Strict):
 
 
 class ShipAttempt(_Strict):
-    """One §2.5 candidate tried for shipping, and the ship gates it failed (none: shipped)."""
+    """One §2.5 candidate tried for shipping, the ship gates it failed (none: shipped) and
+    where they were measured: ``local`` (its own fresh evaluations, which ``phase2.json``
+    holds, so G7 recomputes their G1-G4 part) or ``ubuntu`` (CI's compare after push, G2-G4
+    only, for a candidate that passed every ship gate locally); ``null`` when it failed none."""
 
     run: RunName
     failed_gates: tuple[ShipGate, ...]
+    failed_on: Literal["local", "ubuntu"] | None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> ShipAttempt:
+        if (self.failed_on is None) != (not self.failed_gates):
+            raise SummaryError("failed_on is null exactly when no gate failed")
+        if self.failed_on == "ubuntu" and not set(self.failed_gates) <= set(UBUNTU_GATES):
+            raise SummaryError("only G2, G2b, G3 and G4 are measured on ubuntu")
+        return self
 
 
 class Shipped(_Strict):
