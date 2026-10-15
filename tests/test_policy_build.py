@@ -452,11 +452,6 @@ def test_constants_that_overflow_float32_are_refused(norm: ObsNorm) -> None:
 
 # §7: onnx and protobuf are imported at module level by topple.policy, so they must be base
 # dependencies; today they are installed by hand because the lock cannot be regenerated.
-@pytest.mark.xfail(
-    strict=True,
-    reason="task #6: move onnx/protobuf to [project] dependencies and re-lock (§7); blocked "
-    "while download.pytorch.org is unreachable. Remove this marker when that lands.",
-)
 def test_onnx_and_protobuf_are_base_dependencies() -> None:
     pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
     names = {

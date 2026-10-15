@@ -1,11 +1,9 @@
 name: ci
 
-# docs/design/phase-2.md §7 also runs on pushes to phase-* branches. That waits for the B12 merge
-# blocker (onnx and protobuf in the base dependencies, uv.lock regenerated): until then the
-# default jobs cannot import topple.policy, so a branch push would only produce red runs.
+# docs/design/phase-2.md §7: pull requests, and pushes to main and phase-* branches.
 on:
   push:
-    branches: [main]
+    branches: [main, 'phase-*']
   pull_request:
 
 permissions:

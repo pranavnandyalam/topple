@@ -52,10 +52,10 @@ def pytest_runs(job: str) -> list[str]:
     return [r for r in runs(job) if " pytest " in f" {r} "]
 
 
-def test_triggers_are_pull_requests_and_pushes_to_main() -> None:
+def test_triggers_are_pull_requests_and_pushes_to_main_and_phase_branches() -> None:
     triggers = workflow()[True]  # YAML 1.1 reads the key `on` as true
     assert set(triggers) == {"push", "pull_request"}
-    assert triggers["push"] == {"branches": ["main"]}  # phase-* joins once B12 lands
+    assert triggers["push"] == {"branches": ["main", "phase-*"]}
 
 
 def test_the_three_jobs() -> None:
