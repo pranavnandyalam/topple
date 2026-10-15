@@ -80,19 +80,17 @@ RANKED_PLATFORM = "linux-x86_64"
 EpisodeKey = tuple[float, bool, float]
 EPISODE_SEEDS = (1000, 1001, 1002)
 EPISODES: dict[str, dict[str, dict[int, EpisodeKey]]] = {
-    # STALE until re-pinned on Apple Silicon: these darwin-arm64 values were measured under E_ref
-    # 13.0 J, before the linux-x86_64 recalibration to 13.1 J (2026-10-15), so a local run on a Mac
-    # fails here and prints the values to pin (HANDOFF.md lists this re-pin).
+    # The development platform (Apple Silicon), re-pinned under E_ref 13.1 J on 2026-10-15.
     "darwin-arm64": {
         "pid": {
-            1000: (92.05698981231265, True, 10.0),
+            1000: (92.07486036832013, True, 10.0),
             1001: (77.65148730115902, True, 10.0),
-            1002: (46.296017498043454, False, 5.97),
+            1002: (46.327503731785804, False, 5.97),
         },
         "lqr": {
-            1000: (91.5273532508896, True, 10.0),
-            1001: (84.07772455809453, True, 10.0),
-            1002: (83.74288560556353, True, 10.0),
+            1000: (91.54282414455297, True, 10.0),
+            1001: (84.11681322780457, True, 10.0),
+            1002: (83.76543245729982, True, 10.0),
         },
     },
     # The CI platform (GitHub Actions ubuntu-24.04), the source of truth for ranked scores.
