@@ -25,6 +25,7 @@ from typer.testing import CliRunner
 import topple.export as export_module
 from policy_support import run as onnx_run
 from run_support import GIT_COMMIT, Run, make_run
+from topple._npz import read_npz_bytes
 from topple.challenge import load_challenge
 from topple.cli import app
 from topple.export import (
@@ -32,14 +33,19 @@ from topple.export import (
     CONSTANT_NAMES,
     MAX_NPZ_BYTES,
     ExportError,
+    ExportWarning,
     constant_mismatches,
+    coverage_counts,
     export_policy,
     parity_bin,
     read_run_json,
+    snapshot_files,
+    write_snapshot,
 )
 from topple.policy.build import ObsNorm, build_policy_onnx
 from topple.policy.manifest import read_manifest
 from topple.policy.runtime import load_policy_dir
+from topple.train.config import validate_train_config
 
 runner = CliRunner()
 
@@ -280,9 +286,36 @@ def test_replace_swaps_a_symlink_never_its_target(ppo: Run, tmp_path: Path) -> N
     assert (target / "keep.txt").read_text() == "keep"
 
 
-def test_out_must_not_be_under_runs(ppo: Run, tmp_path: Path) -> None:
-    refused(ppo, tmp_path / "runs" / "shipped", "under runs/")
-    refused(ppo, ppo.path / "shipped", "inside the run")
+def test_out_must_not_be_under_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``runs/`` is the checkout's gitignored run folder: the one under the working directory,
+    and the one a run lives in."""
+    run = make_run(tmp_path / "runs", name="ppo_s0")
+    monkeypatch.chdir(tmp_path)
+    refused(run, Path("runs/shipped"), "under runs/")
+    with pytest.raises(ExportError, match="under runs/"):
+        export_policy(run.path, Path("runs"), replace=True)
+    refused(run, tmp_path / "runs" / "shipped", "under runs/")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)  # the run's own runs/ still counts
+    refused(run, tmp_path / "runs" / "shipped", "under runs/")
+    refused(run, run.path / "shipped", "under runs/")  # inside the run, and under its runs/
+    other = make_run(tmp_path / "scratch")  # a run outside any runs/: only the run itself
+    refused(other, other.path / "shipped", "inside the run")
+    export_policy(other.path, tmp_path / "x" / "runs" / "p")  # neither the cwd's nor the run's
+
+
+def test_a_checkout_under_a_directory_named_runs_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clone at ``.../runs/topple`` ships ``runs/ppo_s0`` to ``submissions/ppo_balance``: only
+    the checkout's own ``runs/`` is refused, not every path with a component called runs."""
+    checkout = tmp_path / "runs" / "topple"
+    make_run(checkout / "runs", name="ppo_s0")
+    monkeypatch.chdir(checkout)
+    manifest = export_policy(Path("runs/ppo_s0"), Path("submissions/ppo_balance"))
+    assert (checkout / "submissions" / "ppo_balance" / "policy.onnx").exists()
+    assert manifest.claims.selected_step == 1024
 
 
 def test_report_only_writes_report_policy_and_is_idempotent(ppo: Run, tmp_path: Path) -> None:
@@ -304,6 +337,34 @@ def test_vacuous_coverage_is_recorded_with_report_only_not_failed(tmp_path: Path
     assert parity is not None
     assert parity.vacuous is True
     assert parity.n_saturated == 0
+
+
+@pytest.mark.parametrize(
+    ("onpolicy", "selection", "match"),
+    [
+        (201, 200, "n_onpolicy_seeds 201 is more than the 200 selection seeds"),
+        (0, 200, "no on-policy rows"),
+    ],
+)
+def test_onpolicy_seeds_are_bound_to_the_selection_seeds(
+    tmp_path: Path, onpolicy: int, selection: int, match: str
+) -> None:
+    """(a) has 5 rows per selection seed with T >= 1: a snapshot that dropped every on-policy row
+    or claims more episodes than the run's selection seeds is a coverage miss."""
+    run = make_run(tmp_path, onpolicy_seeds=onpolicy, selection_seeds=selection)
+    refused(run, tmp_path / "p", match)
+    manifest = export_policy(run.path, run.path / "report_policy", report_only=True)
+    assert manifest.claims.export_parity is not None
+    assert manifest.claims.export_parity.vacuous is True
+    assert manifest.claims.export_parity.n_onpolicy_seeds == onpolicy
+
+
+def test_fewer_onpolicy_seeds_than_selection_seeds_are_fine(tmp_path: Path) -> None:
+    """Episodes with T = 0 send no rows: 199 of 200 is covered."""
+    run = make_run(tmp_path, onpolicy_seeds=199, selection_seeds=200)
+    parity = export_policy(run.path, tmp_path / "p").claims.export_parity
+    assert parity is not None
+    assert (parity.n_onpolicy_seeds, parity.vacuous) == (199, False)
 
 
 def test_onpolicy_rows_must_be_five_per_seed(ppo: Run, tmp_path: Path) -> None:
@@ -590,11 +651,43 @@ def test_a_parity_miss_fails_even_for_a_report(ppo: Run, tmp_path: Path) -> None
         export_policy(ppo.path, ppo.path / "report_policy", report_only=True)
 
 
+def test_a_nan_onnx_output_on_a_middle_row_fails_parity(
+    ppo: Run, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NaN is never <= anything: a NaN action on row 1,500 must become the worst difference,
+    not be skipped by a ``diff > worst`` comparison."""
+    real = export_module.make_session
+
+    class NanOnRow1500:
+        def __init__(self, validated: Any) -> None:
+            self.session = real(validated)
+            self.calls = 0
+
+        def run(self, names: Any, feeds: Any) -> Any:
+            out = self.session.run(names, feeds)
+            self.calls += 1
+            if self.calls == 1501:
+                out[0][0, 1] = np.nan
+            return out
+
+    monkeypatch.setattr(export_module, "make_session", NanOnRow1500)
+    with pytest.raises(ExportError, match=r"max \|a_onnx - a_ref\| is nan"):
+        export_policy(ppo.path, ppo.path / "report_policy", report_only=True)
+
+
 def test_nan_parity_rows_are_refused(ppo: Run, tmp_path: Path) -> None:
     action_ref = ppo.action_ref.copy()
     action_ref[3, 0] = np.nan
     ppo.rewrite_npz("parity_ref.npz", action_ref=action_ref)
     refused(ppo, tmp_path / "p", "finite")
+
+
+def test_coverage_counts_at_the_thresholds() -> None:
+    """Unsaturated: max_i |a_ref_i| < 0.99; saturated: >= 0.999 (§3.3 step 4)."""
+    amax = [0.0, 0.98999999, 0.99, 0.995, 0.99899999, 0.999, 1.0]
+    action_ref = np.array([[a, -a / 2] for a in amax])
+    assert coverage_counts(action_ref) == (2, 2)
+    assert coverage_counts(-action_ref[:, ::-1]) == (2, 2)  # either sign, either action
 
 
 @pytest.mark.parametrize("where", [1000, 2000, 2063])
@@ -667,6 +760,94 @@ def test_the_fixture_files(ppo: Run, tmp_path: Path) -> None:
         "n_saturated",
         "policy_sha256",
     ]
+
+
+def test_a_fixture_target_that_is_a_directory_is_refused_before_anything_is_written(
+    ppo: Run, tmp_path: Path
+) -> None:
+    out = tmp_path / "p"
+    fixtures = tmp_path / "data"
+    export_policy(ppo.path, out, test_fixture="t", fixture_dir=fixtures)
+    before = {name: os.stat(out / name).st_ino for name in os.listdir(out)}
+    npz_before = (fixtures / "t_parity.npz").stat().st_ino
+    (fixtures / "t_parity.bin").unlink()
+    (fixtures / "t_parity.bin").mkdir()
+    with pytest.raises(ExportError, match=r"t_parity\.bin is a directory") as info:
+        export_policy(ppo.path, out, test_fixture="t", fixture_dir=fixtures, replace=True)
+    assert ".tmp" not in str(info.value)
+    assert {name: os.stat(out / name).st_ino for name in os.listdir(out)} == before
+    assert (fixtures / "t_parity.npz").stat().st_ino == npz_before
+    assert sorted(os.listdir(fixtures)) == ["t_parity.bin", "t_parity.json", "t_parity.npz"]
+
+
+def test_a_fixture_that_cannot_be_written_leaves_out_and_the_fixtures_alone(
+    ppo: Run, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fixture files are written (to temp names) before ``--out`` is swapped: a failure
+    there replaces nothing, and the error names the fixture, not its temp file."""
+    out = tmp_path / "p"
+    fixtures = tmp_path / "data"
+    export_policy(ppo.path, out, test_fixture="t", fixture_dir=fixtures)
+    before = {name: os.stat(out / name).st_ino for name in os.listdir(out)}
+    fixture_inodes = {name: os.stat(fixtures / name).st_ino for name in os.listdir(fixtures)}
+    real = Path.write_bytes
+
+    def full_disk(self: Path, data: Any) -> int:
+        if ".t_parity.json." in self.name:
+            raise OSError(28, "No space left on device", str(self))
+        return real(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", full_disk)
+    with pytest.raises(ExportError, match=r"cannot write .*t_parity\.json: No space") as info:
+        export_policy(ppo.path, out, test_fixture="t", fixture_dir=fixtures, replace=True)
+    assert ".tmp" not in str(info.value)
+    assert {name: os.stat(out / name).st_ino for name in os.listdir(out)} == before
+    assert {name: os.stat(fixtures / name).st_ino for name in os.listdir(fixtures)} == (
+        fixture_inodes
+    )
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []
+
+
+def test_a_fixture_rename_that_fails_after_the_swap_says_what_was_written(
+    ppo: Run, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The renames after the swap only fail on a race (the targets are checked first): the
+    error then says --out was written, and no temp file is left."""
+    out = tmp_path / "p"
+    fixtures = tmp_path / "data"
+    real = os.replace
+
+    def racing(src: Any, dst: Any) -> None:
+        if str(dst).endswith("t_parity.json"):
+            raise IsADirectoryError(21, "Is a directory", str(dst))
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", racing)
+    with pytest.raises(ExportError, match=r"wrote .*p, but cannot finish the fixture files"):
+        export_policy(ppo.path, out, test_fixture="t", fixture_dir=fixtures)
+    assert (out / "policy.onnx").exists()
+    assert [p.name for p in fixtures.iterdir() if p.name.startswith(".")] == []
+
+
+def test_a_failed_cleanup_after_the_swap_is_a_warning(
+    ppo: Run, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the new policy is renamed in, the export has happened: an old directory that
+    cannot be removed is reported as a warning (the CLI prints it), not as a failed export."""
+    out = tmp_path / "p"
+    export_policy(ppo.path, out)
+    old = os.stat(out / "policy.onnx").st_ino
+
+    def stuck(path: Path) -> None:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(export_module, "_remove", stuck)
+    with pytest.warns(ExportWarning, match=r"cannot remove the old one .*Permission denied"):
+        export_policy(ppo.path, out, replace=True)
+    assert os.stat(out / "policy.onnx").st_ino != old
+    result = runner.invoke(app, ["export", str(ppo.path), "--out", str(out), "--replace"])
+    assert result.exit_code == 0, result.output
+    assert "warning: replaced" in result.output
 
 
 def test_the_bin_layout_pads_to_4_bytes() -> None:
@@ -760,3 +941,93 @@ def test_a_mean_beyond_float32_is_a_clean_error(ppo: Run, tmp_path: Path) -> Non
 def test_integers_are_read_as_floats_in_normalize_json(ppo: Run, tmp_path: Path) -> None:
     ppo.rewrite_json("ckpt/step_1024/normalize.json", lambda d: d.update(count=2048))
     export_policy(ppo.path, tmp_path / "p")
+
+
+def test_at_most_16_versions_become_claims(ppo: Run, tmp_path: Path) -> None:
+    versions = {f"k{i:02d}": f"{i}.0" for i in range(17)}
+    ppo.rewrite_json("train_meta.json", lambda d: d.update(versions=versions))
+    claims = export_policy(ppo.path, tmp_path / "p").claims
+    assert claims.versions == {f"k{i:02d}": f"{i}.0" for i in range(16)}
+
+
+def test_a_config_error_in_train_meta_is_one_bounded_clean_line(ppo: Run, tmp_path: Path) -> None:
+    evil = "x\n::error::pwned\x1b[2J" + "A" * 20_000
+    ppo.rewrite_json("train_meta.json", lambda d: d["config"].update(algo=evil))
+    with pytest.raises(ExportError) as info:
+        export_policy(ppo.path, tmp_path / "p")
+    message = str(info.value)
+    assert message.startswith("train_meta.json: config: ")
+    assert len(message) <= 2000
+    assert message.isprintable()
+
+
+def test_the_npz_reader_takes_export_dtypes_only() -> None:
+    buf = io.BytesIO()
+    np.savez(buf, n=np.zeros(3, np.int64))
+    with pytest.raises(ValueError, match="n: dtype <i8 is not an export input dtype"):
+        read_npz_bytes(buf.getvalue(), {"n": ("<i8", (3,))}, max_bytes=MAX_NPZ_BYTES)
+    good = io.BytesIO()
+    np.savez(good, n=np.zeros(3, np.float64))
+    assert read_npz_bytes(good.getvalue(), {"n": ("<f8", (3,))}, max_bytes=1 << 20)["n"].shape == (
+        3,
+    )
+
+
+# --- the snapshot writer ------------------------------------------------------------------------
+
+
+def test_the_snapshot_writer_round_trips_through_export(ppo: Run, tmp_path: Path) -> None:
+    """``run_support`` writes every run with ``snapshot_files``; its files are exactly what export
+    reads, and writing the same snapshot twice gives the same bytes (training is deterministic)."""
+    cfg = validate_train_config(ppo.config)
+    onpolicy = ppo.obs[: int((ppo.sets == 0).sum())]
+    args = (cfg, ppo.step, ppo.weights.layers, ppo.norm)
+    kwargs: dict[str, Any] = {
+        "count": 2048.0001,
+        "onpolicy": onpolicy,
+        "action_ref": ppo.action_ref,
+        "onnx_sha256": ppo.sha256,
+    }
+    files = snapshot_files(*args, **kwargs)
+    assert sorted(files) == ["actor.npz", "meta.json", "normalize.json", "parity_ref.npz"]
+    assert files == snapshot_files(*args, **kwargs)
+    for name, data in files.items():
+        assert (ppo.step_dir / name).read_bytes() == data, name
+    meta = json.loads(files["meta.json"])
+    assert (meta["n_onpolicy"], meta["n_onpolicy_seeds"], meta["net_arch"]) == (1000, 200, [8, 8])
+    with pytest.raises(FileExistsError):
+        write_snapshot(ppo.path / "ckpt", ppo.step, files)
+    with pytest.raises(ValueError, match="action_ref"):
+        snapshot_files(*args, **{**kwargs, "action_ref": ppo.action_ref[:-1]})
+    with pytest.raises(ValueError, match="onnx_sha256"):
+        snapshot_files(*args, **{**kwargs, "onnx_sha256": "x"})
+    with pytest.raises(ValueError, match="groups of 5"):
+        snapshot_files(*args, **{**kwargs, "onpolicy": onpolicy[:-1]})
+    wide = (
+        (np.zeros((9, 10), np.float32), np.zeros(9, np.float32)),
+        *ppo.weights.layers[1:],
+    )
+    with pytest.raises(ValueError, match="W0"):
+        snapshot_files(cfg, ppo.step, wide, ppo.norm, **kwargs)
+
+
+def test_write_snapshot_is_all_or_nothing(tmp_path: Path) -> None:
+    ckpt = tmp_path / "ckpt"
+    (ckpt / ".step_7.tmp").mkdir(parents=True)  # a stale one from a crash
+    (ckpt / ".step_7.tmp" / "junk").write_text("x")
+
+    def broken(directory: Path) -> None:
+        (directory / "model.zip").write_bytes(b"half")
+        raise OSError(28, "No space left on device")
+
+    with pytest.raises(OSError, match="No space"):
+        write_snapshot(ckpt, 7, {"meta.json": b"{}"}, more=broken)
+    assert os.listdir(ckpt) == []
+
+    def sb3(directory: Path) -> None:
+        (directory / "model.zip").write_bytes(b"zip")
+
+    path = write_snapshot(ckpt, 7, {"meta.json": b"{}"}, more=sb3)
+    assert path == ckpt / "step_7"
+    assert sorted(os.listdir(path)) == ["meta.json", "model.zip"]
+    assert os.listdir(ckpt) == ["step_7"]

@@ -37,6 +37,7 @@ import numpy.typing as npt
 from topple.evaluate import FALL_REASONS, EvalProtocol
 from topple.policy.manifest import policy_task
 from topple.pool import ONPOLICY_ROWS, EpisodeRows, PolicyRef, policy_ref, submit_episodes_with_rows
+from topple.results import summarize
 
 if TYPE_CHECKING:
     from topple.policy.build import ObsNorm
@@ -65,7 +66,16 @@ ABORT_FLAGS: Final = ("rss_abort", "cpu_abort", "wall_clock_abort")
 NONDETERMINISTIC: Final = "nondeterministic"
 NOT_SHIPPABLE: Final = frozenset({*ABORT_FLAGS, NONDETERMINISTIC})
 """A run with any of these flags is never shipped or reported as a result (§1)."""
-FLAGS: Final = ("std_collapse", "late_regression", "high_energy", "no_eligible", *NOT_SHIPPABLE)
+FLAGS: Final = (
+    "std_collapse",
+    "late_regression",
+    "high_energy",
+    "no_eligible",
+    *ABORT_FLAGS,
+    NONDETERMINISTIC,
+)
+"""Every flag, in the order ``train_meta.flags`` lists them (a tuple: never a set's order, which
+follows the string hash seed and so changes from process to process)."""
 FLOAT_SLACK: Final = 1e-9
 """Success rates are k/n: a drop of 0.85 - 0.75 is 0.0999999... in floating point."""
 
@@ -112,11 +122,13 @@ class SelectionResult:
 
 
 def summarize_episodes(episodes: Sequence[EpisodeResult], *, step: int) -> SelectionResult:
-    """The ``SelectionResult`` of ``episodes`` (one per selection seed, in seed order). An
+    """The ``SelectionResult`` of ``episodes`` (one per selection seed, in seed order): score and
+    success rate are the leaderboard's own aggregate (``results.summarize``, contract §12). An
     episode without metrics (``missing``) counts 0 energy, 0 saturation and no fall."""
     n = len(episodes)
     if n == 0:
         raise ValueError("a selection eval has at least one episode")
+    aggregate = summarize(episodes, n)
     energy = [_metric(e, "energy_j") for e in episodes]
     saturation = [_metric(e, "saturation_fraction") for e in episodes]
     fell = sum(
@@ -124,8 +136,8 @@ def summarize_episodes(episodes: Sequence[EpisodeResult], *, step: int) -> Selec
     )
     return SelectionResult(
         step=step,
-        success_rate=sum(bool(e.success) for e in episodes) / n,
-        score=math.fsum(float(e.score) for e in episodes) / n,
+        success_rate=aggregate.success_rate,
+        score=aggregate.score,
         median_energy_j=float(median(energy)),
         mean_saturation=math.fsum(saturation) / n,
         scores=tuple(float(e.score) for e in episodes),
@@ -380,11 +392,30 @@ class EvalTrigger:
     """§2.4's trigger, fed SB3's ``num_timesteps``: due when ``num_timesteps // every_steps``
     exceeds its last value. PPO calls it at each rollout start (``total_timesteps=None``); SAC
     at each step, where it is never due at or past ``total_timesteps`` (the final eval in
-    ``_on_training_end`` covers that)."""
+    ``_on_training_end`` covers that). ``last_label`` is the label of the last eval it allowed
+    (or the resume point): ``final_due`` keeps the final eval from repeating it."""
 
     every_steps: int
     total_timesteps: int | None = None
-    _bucket: int = 0
+    _bucket: int = field(default=0, repr=False)
+    last_label: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.every_steps) is not int or self.every_steps < 1:
+            raise ValueError(f"every_steps must be an int >= 1, got {self.every_steps!r}")
+
+    @classmethod
+    def resumed(
+        cls, every_steps: int, num_timesteps: int, total_timesteps: int | None = None
+    ) -> EvalTrigger:
+        """The trigger of a run resumed from its snapshot at ``num_timesteps`` (SB3 keeps the
+        count): due at the next label of the schedule, never at the resume point, whose eval
+        and snapshot exist already."""
+        if type(num_timesteps) is not int or num_timesteps < 0:
+            raise ValueError(f"num_timesteps must be an int >= 0, got {num_timesteps!r}")
+        trigger = cls(every_steps, total_timesteps, last_label=num_timesteps)
+        trigger._bucket = num_timesteps // every_steps
+        return trigger
 
     def due(self, num_timesteps: int) -> bool:
         bucket = num_timesteps // self.every_steps
@@ -393,7 +424,15 @@ class EvalTrigger:
         if self.total_timesteps is not None and num_timesteps >= self.total_timesteps:
             return False
         self._bucket = bucket
+        self.last_label = num_timesteps
         return True
+
+    def final_due(self, num_timesteps: int) -> bool:
+        """Whether ``_on_training_end`` evaluates (and snapshots) at ``num_timesteps``: always,
+        unless that label was evaluated already. That happens only when a hard limit stopped
+        training in the same callback call that ran a periodic eval (SAC's ``_on_step``), or
+        right at a resume point; the eval there is then the final one (§1, §2.4)."""
+        return num_timesteps != self.last_label
 
 
 def final_timesteps(cfg: PpoTrainConfig | SacTrainConfig) -> int:

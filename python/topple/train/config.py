@@ -39,9 +39,8 @@ from pydantic import (
 
 from topple._inputs import open_regular
 from topple.ids import parse_protocol, resolve_protocol, validate_challenge_id
-from topple.results import MAX_EPISODES
 from topple.train.wrappers import TRAIN_SEED_LO
-from topple.yamlsafe import MAX_YAML_BYTES, ConfigError, safe_load_capped
+from topple.yamlsafe import MAX_YAML_BYTES, ConfigError, clean_text, safe_load_capped
 
 if TYPE_CHECKING:
     from topple.envs.balance import RewardConfig
@@ -51,10 +50,19 @@ MAX_WIDTH: Final = 256
 MAX_N_ENVS: Final = 16  # shipped configs use <= 8 (§1); 16 is for Phase 13's bigger machines
 MAX_TRAIN_SEED: Final = 2**32  # SB3 seeds numpy's legacy global RNG, which takes < 2**32
 MAX_TOTAL_TIMESTEPS: Final = 10**10
-MAX_SELECTION_EVALS: Final = 100
+MAX_TRAIN_META_BYTES: Final = 64 * 1024
+"""``train_meta.json``'s size budget: ``topple export`` and ``topple train`` read it with this cap
+(§3.3 step 2), so the bounds below keep a run's file under it."""
+MAX_SELECTION_EVALS: Final = 40
 """Most periodic selection evals a run may ask for (``total_timesteps // every_steps``); the
-shipped configs ask for 19 or 20 (§2.4). Bounds the eval schedule and ``selection_scores.npz``."""
+shipped configs ask for 19 or 20 (§2.4), waypoint 12 (16 at 8M). With ``MAX_SELECTION_SEEDS``
+it bounds ``selection_history`` and ``gate_baseline`` so that ``train_meta.json`` stays under
+``MAX_TRAIN_META_BYTES`` (tested at the bounds), and bounds ``selection_scores.npz``."""
+MAX_SELECTION_SEEDS: Final = 250
+"""Most selection seeds (every config uses 200; smoke 2): ``gate_baseline`` keeps one score per
+seed for each baseline in ``train_meta.json``."""
 MAX_MESSAGES: Final = 8
+MAX_LOC_CHARS: Final = 96
 _PRESET_CHARS: Final = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
 
 
@@ -296,7 +304,8 @@ class SacParams(_Frozen):
 
 
 class SeedRange(_Frozen):
-    """Seeds ``first..last`` (inclusive), public and below the training seeds (§0)."""
+    """Selection seeds ``first..last`` (inclusive, at most ``MAX_SELECTION_SEEDS``), public and
+    below the training seeds (§0)."""
 
     first: Annotated[int, Field(ge=0, lt=TRAIN_SEED_LO)]
     last: Annotated[int, Field(ge=0, lt=TRAIN_SEED_LO)]
@@ -305,8 +314,11 @@ class SeedRange(_Frozen):
     def _ordered(self) -> SeedRange:
         if self.last < self.first:
             raise ValueError("seeds.last must not be below seeds.first")
-        if self.last - self.first >= MAX_EPISODES:
-            raise ValueError(f"a protocol has at most {MAX_EPISODES} seeds")
+        if self.last - self.first >= MAX_SELECTION_SEEDS:
+            raise ValueError(
+                f"selection takes at most {MAX_SELECTION_SEEDS} seeds (train_meta.json keeps a "
+                "score per seed and stays under 64 KiB)"
+            )
         return self
 
     @property
@@ -486,12 +498,14 @@ def _read(path: Path) -> bytes:
 
 
 def _describe(exc: ValidationError) -> str:
-    """At most ``MAX_MESSAGES`` field errors as ``<loc>: <message>`` (never the input)."""
+    """At most ``MAX_MESSAGES`` field errors as ``<loc>: <message>``. Pydantic's messages and
+    the locations can quote the input (``Input tag 'x' found ...``, an extra key's name), so
+    each is escaped and cut (``clean_text``): one bounded, printable line."""
     parts = []
     for error in exc.errors(include_url=False, include_context=False, include_input=False)[
         :MAX_MESSAGES
     ]:
-        loc = ".".join(str(p) for p in error["loc"]) or "(root)"
-        parts.append(f"{loc}: {error['msg']}")
+        loc = clean_text(".".join(str(p) for p in error["loc"]), MAX_LOC_CHARS) or "(root)"
+        parts.append(f"{loc}: {clean_text(error['msg'])}")
     more = exc.error_count() - MAX_MESSAGES
     return "; ".join(parts) + (f" (and {more} more)" if more > 0 else "")

@@ -11,6 +11,9 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -33,7 +36,7 @@ from topple.pool import (
     run_episodes_with_rows,
     submit_episodes_with_rows,
 )
-from topple.results import EpisodeResult, ErrorInfo
+from topple.results import EpisodeResult, ErrorInfo, summarize
 from topple.train.config import (
     HealthConfig,
     SelectionConfig,
@@ -41,6 +44,7 @@ from topple.train.config import (
     validate_train_config,
 )
 from topple.train.selection import (
+    ABORT_FLAGS,
     FLAGS,
     N_RANDOM_ROWS,
     NOT_SHIPPABLE,
@@ -141,7 +145,12 @@ def episode(
         seed=2000 + index,
         success=success,
         score=score,
-        metrics={"termination": termination, "energy_j": energy, "saturation_fraction": saturation},
+        metrics={
+            "termination": termination,
+            "energy_j": energy,
+            "saturation_fraction": saturation,
+            "time_upright_s": 10.0,
+        },
     )
 
 
@@ -169,6 +178,9 @@ def test_summarize_follows_the_aggregate_rules() -> None:
     assert r.mean_saturation == pytest.approx(0.075)
     assert r.scores == (90.0, 40.0, 60.0, 0.0)
     assert r.extras == {"fell": 0.5}
+    # the leaderboard's own aggregate (results.summarize), so rank keys match it exactly
+    aggregate = summarize(episodes, len(episodes))
+    assert (r.score, r.success_rate) == (aggregate.score, aggregate.success_rate)
     with pytest.raises(ValueError, match="at least one episode"):
         summarize_episodes([], step=0)
 
@@ -393,6 +405,36 @@ def test_run_flags() -> None:
     assert set(FLAGS) >= NOT_SHIPPABLE >= {"rss_abort", "cpu_abort", "wall_clock_abort"}
 
 
+EXPECTED_FLAGS = (
+    "std_collapse",
+    "late_regression",
+    "high_energy",
+    "no_eligible",
+    "rss_abort",
+    "cpu_abort",
+    "wall_clock_abort",
+    "nondeterministic",
+)
+
+
+def test_flags_have_one_order_in_every_process() -> None:
+    """``train_meta.flags`` is written in ``FLAGS`` order: it must not depend on the string hash
+    seed (a frozenset unpacked into the tuple did)."""
+    assert FLAGS == EXPECTED_FLAGS
+    assert ABORT_FLAGS == ("rss_abort", "cpu_abort", "wall_clock_abort")
+    code = "from topple.train.selection import FLAGS; print(','.join(FLAGS))"
+    for hash_seed in ("1", "2", "3"):
+        out = subprocess.run(
+            [sys.executable, "-c", code],
+            env={**os.environ, "PYTHONHASHSEED": hash_seed},
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        ).stdout
+        assert tuple(out.strip().split(",")) == EXPECTED_FLAGS
+
+
 # --- the eval schedule --------------------------------------------------------------------------
 
 
@@ -449,12 +491,12 @@ def test_ppo_labels_for_5m_are_the_measured_ones() -> None:
 @pytest.mark.parametrize("algo", ["ppo", "sac"])
 @pytest.mark.parametrize("n_envs", [1, 3, 8])
 @pytest.mark.parametrize("unit", [7, 64, 512])
-@pytest.mark.parametrize("every", [250, 1000, 4096])
+@pytest.mark.parametrize("every", [500, 1000, 4096])
 def test_eval_labels_match_the_step_by_step_trigger(
     algo: str, n_envs: int, unit: int, every: int
 ) -> None:
     base = load_train_config(CONFIGS / f"smoke_{algo}.yaml").model_dump(mode="json")
-    base.update(n_envs=n_envs, total_timesteps=20_000 + unit)
+    base.update(n_envs=n_envs, total_timesteps=16_000 + unit)
     base["selection"]["every_steps"] = every
     if algo == "ppo":
         base["ppo"].update(n_steps=unit, batch_size=2)
@@ -464,6 +506,55 @@ def test_eval_labels_match_the_step_by_step_trigger(
     labels = eval_labels(cfg)
     assert labels == simulate(cfg)
     assert len(set(labels)) == len(labels)
+
+
+def test_the_final_eval_is_skipped_where_an_abort_stopped_at_a_periodic_label() -> None:
+    """SAC: a hard limit seen in the ``_on_step`` that just ran the periodic eval at 1,024 stops
+    training at 1,024; ``_on_training_end`` must not evaluate (and snapshot) that label again."""
+    trigger = EvalTrigger(1024, 2048)
+    assert trigger.final_due(0)  # nothing evaluated yet
+    assert not trigger.due(1022)
+    assert trigger.final_due(1022)
+    assert trigger.due(1024)
+    assert trigger.last_label == 1024
+    assert not trigger.final_due(1024)  # the abort path: the periodic eval was the final one
+    assert trigger.final_due(1026)  # a later stop still gets its own final eval
+    assert not trigger.due(2048)
+    assert trigger.final_due(2048)
+
+
+@pytest.mark.parametrize("name", ["ppo_balance", "sac_balance", "ablate_nopenalty"])
+@pytest.mark.parametrize("k", [0, 2])
+def test_a_resumed_trigger_continues_the_schedule(name: str, k: int) -> None:
+    """A run resumed from the snapshot at the k-th label (SB3 keeps ``num_timesteps``) evaluates
+    exactly the labels after it, never the resume point itself."""
+    cfg = load_train_config(CONFIGS / f"{name}.yaml")
+    labels = eval_labels(cfg)
+    start = labels[k]
+    sac = cfg.algo == "sac"
+    trigger = EvalTrigger.resumed(
+        cfg.selection.every_steps, start, cfg.total_timesteps if sac else None
+    )
+    assert not trigger.final_due(start)
+    seen: list[int] = []
+    num = start
+    unit = cfg.n_envs if sac else cfg.ppo.n_steps * cfg.n_envs
+    while num < cfg.total_timesteps:
+        if not sac and trigger.due(num):
+            seen.append(num)
+        num += unit
+        if sac and trigger.due(num):
+            seen.append(num)
+    assert trigger.final_due(num)
+    assert (*seen, num) == labels[k + 1 :]
+    assert EvalTrigger(cfg.selection.every_steps).due(start)  # a fresh trigger would re-fire
+
+
+def test_a_resumed_trigger_is_checked() -> None:
+    with pytest.raises(ValueError, match="num_timesteps"):
+        EvalTrigger.resumed(1024, -1)
+    with pytest.raises(ValueError, match="every_steps"):
+        EvalTrigger(0)
 
 
 # --- on-policy rows (a) -------------------------------------------------------------------------

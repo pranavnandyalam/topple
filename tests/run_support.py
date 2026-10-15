@@ -1,11 +1,12 @@
 """Synthetic training run directories for the export and ``topple train`` tests
 (docs/design/phase-2.md §2.3, §2.4, §3.3).
 
-A run is written with plain ``np.savez`` and ``json`` from the deterministic tiny weights of
-``policy_support``, laid out as the snapshot writes it: ``best.json``, ``train_meta.json`` and
-``ckpt/step_<N>/{meta.json, normalize.json, actor.npz, parity_ref.npz}``. The reference actions
-are ``topple.policy.build.reference_actions`` (what the graph computes, in float64), standing in
-for SB3's ``predict``; the ONNX sha256 is of ``topple.export.build_onnx``'s bytes, the bytes a
+A run is written from the deterministic tiny weights of ``policy_support``: ``best.json`` and
+``train_meta.json`` with ``json``, and ``ckpt/step_<N>/{meta.json, normalize.json, actor.npz,
+parity_ref.npz}`` with the snapshot writer training uses (``topple.export.snapshot_files`` and
+``write_snapshot``), so export's reader is tested against that writer. The reference actions are
+``topple.policy.build.reference_actions`` (what the graph computes, in float64), standing in for
+SB3's ``predict``; the ONNX sha256 is of ``topple.export.build_onnx``'s bytes, the bytes a
 selection eval scores.
 """
 
@@ -23,7 +24,7 @@ import numpy.typing as npt
 
 from policy_support import balance_spec, det64, tiny_norm, tiny_weights
 from topple.challenge import load_challenge
-from topple.export import RULE_OF, build_onnx
+from topple.export import RULE_OF, build_onnx, snapshot_files, write_snapshot
 from topple.policy.build import MlpWeights, ObsNorm, reference_actions
 from topple.train.config import config_sha256, load_train_config, validate_train_config
 from topple.train.selection import parity_obs
@@ -93,15 +94,20 @@ def make_run(
     eligible: bool = True,
     flags: tuple[str, ...] = (),
     onpolicy_seeds: int = 200,
+    selection_seeds: int | None = None,
     head_scale: float = 3.0,
     name: str = "run",
 ) -> Run:
-    """Write a run directory ``root/name`` with one snapshot at ``step``."""
+    """Write a run directory ``root/name`` with one snapshot at ``step``: ``onpolicy_seeds``
+    episodes sent on-policy rows, out of ``selection_seeds`` (default: as many) selection
+    seeds."""
     activation = "tanh" if algo == "ppo" else "relu"
     weights = tiny_weights(activation, head_scale=head_scale)
     norm = tiny_norm()  # epsilon 1e-8, clip 10: the shipped configs' normalize block
     cfg_doc = load_train_config(CONFIGS / f"smoke_{algo}.yaml").model_dump(mode="json")
     cfg_doc["policy"]["net_arch"]["pi"] = [8, 8]
+    n_seeds = onpolicy_seeds if selection_seeds is None else selection_seeds
+    cfg_doc["selection"]["seeds"] = {"first": 2000, "last": 1999 + n_seeds}
     cfg = validate_train_config(cfg_doc)
     challenge = load_challenge("balance-v1")
     data = build_onnx(weights.layers, norm, activation=activation, challenge=challenge)  # type: ignore[arg-type]
@@ -114,45 +120,17 @@ def make_run(
     )
 
     run_dir = root / name
-    step_dir = run_dir / "ckpt" / f"step_{step}"
-    step_dir.mkdir(parents=True)
-    with (step_dir / "actor.npz").open("wb") as fh:
-        np.savez(
-            fh,
-            **{
-                key: arr
-                for k, (w, b) in enumerate(weights.layers)
-                for key, arr in ((f"W{k}", w), (f"b{k}", b))
-            },
-        )
-    with (step_dir / "parity_ref.npz").open("wb") as fh:
-        np.savez(fh, obs=obs, action_ref=action_ref, set=sets, onnx_sha256=np.str_(sha))
-    (step_dir / "normalize.json").write_text(
-        json.dumps(
-            {
-                "mean": norm.mean.tolist(),
-                "var": norm.var.tolist(),
-                "count": 2048.0001,
-                "epsilon": norm.epsilon,
-                "clip_obs": norm.clip,
-            }
-        )
+    files = snapshot_files(
+        cfg,
+        step,
+        weights.layers,
+        norm,
+        count=2048.0001,
+        onpolicy=onpolicy,
+        action_ref=action_ref,
+        onnx_sha256=sha,
     )
-    (step_dir / "meta.json").write_text(
-        json.dumps(
-            {
-                "step": step,
-                "algo": algo,
-                "action_rule": RULE_OF[activation],
-                "net_arch": [8, 8],
-                "activation": activation,
-                "config_sha256": config_sha256(cfg),
-                "onnx_sha256": sha,
-                "n_onpolicy": 5 * onpolicy_seeds,
-                "n_onpolicy_seeds": onpolicy_seeds,
-            }
-        )
-    )
+    write_snapshot(run_dir / "ckpt", step, files)
     row = {
         "step": step,
         "success_rate": 0.7,

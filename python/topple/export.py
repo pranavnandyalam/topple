@@ -13,8 +13,9 @@ members, dtypes and shapes, every header checked before any data is read. ``mode
 1. **Resolve.** The step is ``--step`` or ``best.json``'s integer ``step``; ``ckpt/step_<N>`` must
    be a real directory under the run. Without ``--report-only`` the step's ``selection_history``
    row must be eligible, the run may carry no abort flag and no ``nondeterministic``, and the
-   output must not lie under ``runs/`` (or inside the run); with it the output is the run's
-   ``report_policy/``, replaced if present.
+   output must not lie under ``runs/`` (the working directory's ``runs/``, or the ``runs/`` the run
+   itself lives in) or inside the run; with it the output is the run's ``report_policy/``,
+   replaced if present.
 2. **Read** (above), and bind the files to each other: ``train_meta.config`` validates as a
    ``TrainConfig`` whose ``config_sha256`` is the one ``train_meta.json`` and ``meta.json``
    record; ``meta.json`` agrees with it (algo, activation, actor widths) and with the step;
@@ -28,20 +29,29 @@ members, dtypes and shapes, every header checked before any data is read. ``mode
 4. **Parity.** Every ``parity_ref`` row at batch 1 through ``make_session``: ``max |a_onnx -
    a_ref| <= 1e-5`` always. The rows must be the §2.4 sets in order (on-policy rows, then exactly
    ``random_rows`` and ``edge_rows`` of ``normalize.json``). Coverage: at least 300 rows with
-   ``max_i |a_ref_i| < 0.99``, at least 32 with ``>= 0.999``, and ``n_onpolicy == 5 *
-   n_onpolicy_seeds``; with ``--report-only`` a miss marks the parity ``vacuous`` instead.
+   ``max_i |a_ref_i| < 0.99``, at least 32 with ``>= 0.999``, ``n_onpolicy == 5 *
+   n_onpolicy_seeds`` and ``1 <= n_onpolicy_seeds <=`` the run's number of selection seeds; with
+   ``--report-only`` a miss marks the parity ``vacuous`` instead.
 5. **Write.** ``policy.onnx`` and ``policy.json`` (claims from ``meta.json`` and
    ``train_meta.json`` through a whitelist), checked by loading them exactly as a submission is
    loaded, into a new directory; ``--replace`` (or ``--report-only``) swaps it in for an
    existing policy directory. ``--test-fixture NAME`` also writes ``tests/data/NAME_parity.npz``
-   (a copy), ``.bin`` (layout v1) and ``.json`` for the C and JS parity readers.
+   (a copy), ``.bin`` (layout v1) and ``.json`` for the C and JS parity readers: written to temp
+   names before ``--out`` is swapped and renamed over their targets after it, so a failure to
+   write them changes nothing. Removing the old policy directory after the swap is cleanup: a
+   failure there is an ``ExportWarning``, not a failed export.
 
-Every refusal is one ``ExportError`` line of fixed words and safe names.
+Training writes the snapshot files with ``snapshot_files`` and ``write_snapshot`` below (no
+torch), so the format has one writer and one reader, tested together.
+
+Every refusal is one ``ExportError`` line of fixed words, safe names and escaped, bounded text.
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
+import io
 import itertools
 import json
 import math
@@ -52,7 +62,9 @@ import shutil
 import stat
 import struct
 import tempfile
-from collections.abc import Mapping
+import warnings
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, NoReturn
@@ -102,6 +114,7 @@ from topple.policy.validate import (
     smoke_test,
     validate_policy_bytes,
 )
+from topple.pool import ONPOLICY_ROWS
 from topple.rng import MAX_SEED
 from topple.train.config import MAX_WIDTH, PpoTrainConfig, SacTrainConfig, config_sha256
 from topple.train.config import validate_train_config as _validate_config
@@ -113,6 +126,8 @@ from topple.train.selection import (
     SET_RANDOM,
     edge_row_count,
     edge_rows,
+    onpolicy_seed_count,
+    parity_obs,
     random_rows,
 )
 from topple.yamlsafe import ConfigError
@@ -132,7 +147,7 @@ MIN_UNSATURATED: Final = 300
 MIN_SATURATED: Final = 32
 UNSATURATED_BELOW: Final = 0.99
 SATURATED_FROM: Final = 0.999
-ONPOLICY_PER_SEED: Final = 5
+MAX_ONPOLICY_SEEDS: Final = 10_000
 PARITY_REFERENCE: Final = "sb3.predict"
 REPORT_DIR: Final = "report_policy"
 RUNS_DIR: Final = "runs"
@@ -161,7 +176,11 @@ _BOM: Final = b"\xef\xbb\xbf"
 
 class ExportError(Exception):
     """A run directory that cannot be exported, or an output that cannot be written: one line
-    of fixed words and safe names (``topple export`` exits 2 with it)."""
+    of fixed words, safe names and escaped, bounded text (``topple export`` exits 2 with it)."""
+
+
+class ExportWarning(UserWarning):
+    """The export happened, but cleanup after it did not (``topple export`` prints it)."""
 
 
 def _fail(message: str) -> NoReturn:
@@ -283,8 +302,8 @@ class SnapshotMeta(_Strict):
     activation: Literal["tanh", "relu"]
     config_sha256: Hex64
     onnx_sha256: Hex64
-    n_onpolicy: Annotated[int, Field(ge=0, le=ONPOLICY_PER_SEED * 10_000)]
-    n_onpolicy_seeds: Annotated[int, Field(ge=0, le=10_000)]
+    n_onpolicy: Annotated[int, Field(ge=0, le=ONPOLICY_ROWS * MAX_ONPOLICY_SEEDS)]
+    n_onpolicy_seeds: Annotated[int, Field(ge=0, le=MAX_ONPOLICY_SEEDS)]
 
 
 class NormalizeFile(_Strict):
@@ -381,6 +400,172 @@ def constant_mismatches(
     return problems
 
 
+# --- the snapshot files, written by training ---------------------------------------------------
+
+Schema = dict[str, tuple[str, tuple[int, ...]]]
+
+
+def _actor_schema(h1: int, h2: int, d: int, a: int) -> Schema:
+    """``actor.npz``: float32 ``[out, in]`` weights and biases, keys ``W0, b0, W1, b1, W2, b2``."""
+    return {
+        "W0": ("<f4", (h1, d)),
+        "b0": ("<f4", (h1,)),
+        "W1": ("<f4", (h2, h1)),
+        "b1": ("<f4", (h2,)),
+        "W2": ("<f4", (a, h2)),
+        "b2": ("<f4", (a,)),
+    }
+
+
+def _parity_schema(n: int, d: int, a: int) -> Schema:
+    """``parity_ref.npz``: ``obs`` f32 [N, D], ``action_ref`` f64 [N, A], ``set`` u1 [N],
+    ``onnx_sha256`` a U64 scalar."""
+    return {
+        "obs": ("<f4", (n, d)),
+        "action_ref": ("<f8", (n, a)),
+        "set": ("|u1", (n,)),
+        "onnx_sha256": ("<U64", ()),
+    }
+
+
+def _check_arrays(name: str, arrays: Mapping[str, npt.NDArray[Any]], schema: Schema) -> None:
+    if set(arrays) != set(schema):
+        raise ValueError(f"{name}: holds {sorted(arrays)}, not {sorted(schema)}")
+    for key, (dtype, shape) in schema.items():
+        arr = arrays[key]
+        if arr.dtype.str != dtype or arr.shape != shape:
+            raise ValueError(
+                f"{name}: {key} must be {dtype} {shape}, not {arr.dtype.str} {arr.shape}"
+            )
+
+
+def _npz_bytes(arrays: Mapping[str, npt.NDArray[Any]]) -> bytes:
+    """``np.savez``: numpy's canonical layout (the one ``topple._zip`` reads), members dated
+    1980-01-01, so the same arrays give the same bytes on every run."""
+    buf = io.BytesIO()
+    np.savez(buf, **dict(arrays))  # type: ignore[arg-type]  # numpy's stub types **kwds poorly
+    return buf.getvalue()
+
+
+def _json_bytes(doc: object) -> bytes:
+    """Floats as ``repr`` (float64 round-trips exactly), never NaN or infinity."""
+    return (json.dumps(doc, indent=2, allow_nan=False) + "\n").encode("ascii")
+
+
+def snapshot_files(
+    cfg: PpoTrainConfig | SacTrainConfig,
+    step: int,
+    layers: tuple[tuple[F32, F32], ...],
+    norm: ObsNorm,
+    *,
+    count: float,
+    onpolicy: F32,
+    action_ref: F64,
+    onnx_sha256: str,
+) -> dict[str, bytes]:
+    """The bytes of ``ckpt/step_<step>/``'s ``actor.npz``, ``normalize.json``,
+    ``parity_ref.npz`` and ``meta.json`` (§2.4), exactly in the layout export reads: the actor's
+    float32 layers, ``VecNormalize``'s ``obs_rms`` (``norm`` with its ``count``), the parity rows
+    (``onpolicy`` (a), then ``random_rows`` and ``edge_rows`` of ``norm``, ``parity_obs``) with
+    ``action_ref`` computed on them by the caller (SB3's ``predict``), and the metadata binding
+    them to ``cfg`` and to ``onnx_sha256`` (of the ``build_onnx`` bytes the selection eval
+    scored). Torch-free: training passes numpy arrays. ``ValueError`` for an array of the wrong
+    dtype or shape (checked against the same schemas export reads with)."""
+    from topple.challenge import load_challenge
+
+    task = policy_task(load_challenge(cfg.env.challenge))
+    d, a = task.obs_dim, task.action_dim
+    h1, h2 = cfg.policy.net_arch.pi
+    if len(layers) != len(ACTOR_KEYS) // 2:
+        raise ValueError(f"actor.npz: {len(ACTOR_KEYS) // 2} layers, not {len(layers)}")
+    actor = {
+        f"{kind}{k}": np.asarray(arr)
+        for k, (w, b) in enumerate(layers)
+        for kind, arr in (("W", w), ("b", b))
+    }
+    _check_arrays("actor.npz", actor, _actor_schema(h1, h2, d, a))
+    if not (isinstance(onnx_sha256, str) and HEX64.fullmatch(onnx_sha256)):
+        raise ValueError("onnx_sha256 must be 64 lowercase hex digits")
+    n_seeds = onpolicy_seed_count(onpolicy)
+    obs, sets = parity_obs(onpolicy, norm)
+    parity: dict[str, npt.NDArray[Any]] = {
+        "obs": obs,
+        "action_ref": np.asarray(action_ref),
+        "set": sets,
+        "onnx_sha256": np.asarray(np.str_(onnx_sha256)),
+    }
+    _check_arrays("parity_ref.npz", parity, _parity_schema(obs.shape[0], d, a))
+    normalize = NormalizeFile(
+        mean=[float(x) for x in np.asarray(norm.mean, dtype=np.float64)],
+        var=[float(x) for x in np.asarray(norm.var, dtype=np.float64)],
+        count=float(count),
+        epsilon=float(norm.epsilon),
+        clip_obs=float(norm.clip),
+    )
+    if len(normalize.mean) != d:
+        raise ValueError(f"normalize.json: mean and var must have {d} entries ({task.challenge})")
+    if (normalize.epsilon, normalize.clip_obs) != (cfg.normalize.epsilon, cfg.normalize.clip_obs):
+        raise ValueError("normalize.json: epsilon or clip_obs differ from the run's config")
+    meta = SnapshotMeta(
+        step=step,
+        algo=cfg.algo,
+        action_rule=RULE_OF[cfg.policy.activation],
+        net_arch=[h1, h2],
+        activation=cfg.policy.activation,
+        config_sha256=config_sha256(cfg),
+        onnx_sha256=onnx_sha256,
+        n_onpolicy=int(onpolicy.shape[0]),
+        n_onpolicy_seeds=n_seeds,
+    )
+    return {
+        "actor.npz": _npz_bytes(actor),
+        "normalize.json": _json_bytes(normalize.model_dump(mode="json")),
+        "parity_ref.npz": _npz_bytes(parity),
+        "meta.json": _json_bytes(meta.model_dump(mode="json")),
+    }
+
+
+def write_snapshot(
+    ckpt_dir: Path,
+    step: int,
+    files: Mapping[str, bytes],
+    *,
+    more: Callable[[Path], None] | None = None,
+) -> Path:
+    """Write the immutable ``ckpt_dir/step_<step>/`` (§2.4) and return it: ``files``
+    (``snapshot_files``' and any other, such as PPO's ``critic.npz``), then ``more(directory)``
+    (SB3's ``model.zip`` and ``vecnormalize.pkl``, resume only) into ``.step_<step>.tmp/`` (a
+    stale one from a crash is removed first), renamed into place. ``FileExistsError`` if
+    ``step_<step>`` exists; a failure leaves no snapshot and no temp directory."""
+    if type(step) is not int or step < 0:
+        raise ValueError(f"step must be an int >= 0, got {step!r}")
+    if not all(name and Path(name).name == name and not name.startswith(".") for name in files):
+        raise ValueError("snapshot files are plain names")
+    final = ckpt_dir / f"step_{step}"
+    if os.path.lexists(final):
+        raise FileExistsError(
+            errno.EEXIST, "the snapshot exists (snapshots are immutable)", str(final)
+        )
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    tmp = ckpt_dir / f".step_{step}.tmp"
+    if os.path.lexists(tmp):
+        _remove(tmp)
+    os.mkdir(tmp)
+    try:
+        for name, data in files.items():
+            write_new_file(tmp / name, data)
+        if more is not None:
+            more(tmp)
+        os.chmod(tmp, DIRECTORY_MODE)
+        if os.path.lexists(final):
+            raise FileExistsError(errno.EEXIST, "the snapshot exists", str(final))
+        os.rename(tmp, final)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    return final
+
+
 # --- inputs -------------------------------------------------------------------------------------
 
 
@@ -466,12 +651,15 @@ def _history_row(train_meta: dict[str, Any], step: int) -> dict[str, Any]:
 
 
 def _check_output(out_dir: Path, run_dir: Path, *, report_only: bool) -> None:
-    """Without ``--report-only``: not under a ``runs/`` directory nor inside the run. With it:
-    exactly the run's ``report_policy/``."""
+    """Without ``--report-only``: not under ``runs/`` (the working directory's, the checkout's
+    gitignored run folder, or the one the run lives in) nor inside the run; a directory called
+    ``runs`` elsewhere, such as an ancestor of the checkout, does not count. With it: exactly
+    the run's ``report_policy/``."""
     try:
         check_output_directory(out_dir)
         run_root = run_dir.resolve(strict=True)
         out_parent = out_dir.parent.resolve()
+        runs_dirs = [(Path.cwd() / RUNS_DIR).resolve()]
     except SymlinkedOutputError as exc:
         _fail(str(exc))
     except OSError as exc:
@@ -480,8 +668,10 @@ def _check_output(out_dir: Path, run_dir: Path, *, report_only: bool) -> None:
         if out_parent != run_root or out_dir.name != REPORT_DIR:
             _fail(f"--report-only writes the run's {REPORT_DIR}/ only (--out RUN_DIR/{REPORT_DIR})")
         return
+    if run_root.parent.name == RUNS_DIR:
+        runs_dirs.append(run_root.parent)
     resolved = out_parent / out_dir.name
-    if RUNS_DIR in resolved.parts:
+    if any(resolved.is_relative_to(runs) for runs in runs_dirs):
         _fail(f"--out must not be under {RUNS_DIR}/ (runs are gitignored scratch)")
     if resolved.is_relative_to(run_root):
         _fail("--out must not be inside the run directory")
@@ -554,28 +744,10 @@ def _read_snapshot(run: _Run) -> _Snapshot:
         clip=raw_norm.clip_obs,
     )
     h1, h2 = meta.net_arch
-    actor = _npz(
-        run.step_dir / "actor.npz",
-        {
-            "W0": ("<f4", (h1, d)),
-            "b0": ("<f4", (h1,)),
-            "W1": ("<f4", (h2, h1)),
-            "b1": ("<f4", (h2,)),
-            "W2": ("<f4", (a, h2)),
-            "b2": ("<f4", (a,)),
-        },
-    )[0]
+    actor = _npz(run.step_dir / "actor.npz", _actor_schema(h1, h2, d, a))[0]
     layers = tuple((actor[f"W{k}"], actor[f"b{k}"]) for k in range(3))
     n = meta.n_onpolicy + N_RANDOM_ROWS + edge_row_count(d)
-    parity, parity_bytes = _npz(
-        run.step_dir / "parity_ref.npz",
-        {
-            "obs": ("<f4", (n, d)),
-            "action_ref": ("<f8", (n, a)),
-            "set": ("|u1", (n,)),
-            "onnx_sha256": ("<U64", ()),
-        },
-    )
+    parity, parity_bytes = _npz(run.step_dir / "parity_ref.npz", _parity_schema(n, d, a))
     parity_sha = str(parity["onnx_sha256"][()])
     if not HEX64.fullmatch(parity_sha):
         _fail("parity_ref.npz: onnx_sha256 is not a sha256")
@@ -640,7 +812,8 @@ def _bind(snap: _Snapshot, history_sha: str) -> tuple[bytes, ValidatedPolicy]:
 
 @dataclass(frozen=True)
 class ParityReport:
-    """Step 4's numbers (``claims.export_parity``)."""
+    """Step 4's numbers (``claims.export_parity``) and the run's number of selection seeds,
+    which bounds ``n_onpolicy_seeds``."""
 
     n: int
     n_onpolicy: int
@@ -648,7 +821,7 @@ class ParityReport:
     n_unsaturated: int
     n_saturated: int
     max_abs_diff: float
-    covered: bool
+    n_selection_seeds: int
 
     def claim(self, *, vacuous: bool) -> ExportParity:
         return ExportParity(
@@ -694,32 +867,49 @@ def _parity(snap: _Snapshot, validated: ValidatedPolicy) -> ParityReport:
         if not (isinstance(out, np.ndarray) and out.dtype == np.float32 and out.shape == (1, a)):
             _fail("policy.onnx: parity row output is not float32 (1, action_dim)")
         diff = float(np.max(np.abs(out[0].astype(np.float64) - snap.action_ref[i])))
-        if not diff <= worst:  # NaN is never <=: it becomes the worst and fails below
+        if math.isnan(diff) or diff > worst:  # a NaN sticks (nothing is > NaN) and fails below
             worst = diff
     if not worst <= PARITY_TOLERANCE:
         _fail(f"parity: max |a_onnx - a_ref| is {worst:.3g}, above {PARITY_TOLERANCE:g}")
-    amax = np.abs(snap.action_ref).max(axis=1)
-    n_on, seeds = snap.meta.n_onpolicy, snap.meta.n_onpolicy_seeds
-    unsaturated = int((amax < UNSATURATED_BELOW).sum())
-    saturated = int((amax >= SATURATED_FROM).sum())
-    covered = (
-        unsaturated >= MIN_UNSATURATED
-        and saturated >= MIN_SATURATED
-        and n_on == ONPOLICY_PER_SEED * seeds
+    unsaturated, saturated = coverage_counts(snap.action_ref)
+    return ParityReport(
+        n,
+        snap.meta.n_onpolicy,
+        snap.meta.n_onpolicy_seeds,
+        unsaturated,
+        saturated,
+        worst,
+        len(snap.cfg.selection.seeds.seeds),
     )
-    return ParityReport(n, n_on, seeds, unsaturated, saturated, worst, covered)
+
+
+def coverage_counts(action_ref: F64) -> tuple[int, int]:
+    """``(n_unsaturated, n_saturated)``: the rows with ``max_i |a_ref_i| < 0.99`` and those with
+    ``max_i |a_ref_i| >= 0.999`` (§3.3 step 4)."""
+    amax = np.abs(action_ref).max(axis=1)
+    return int((amax < UNSATURATED_BELOW).sum()), int((amax >= SATURATED_FROM).sum())
 
 
 def _coverage_misses(report: ParityReport) -> list[str]:
+    """Step 4's coverage rules that ``report`` misses. The on-policy rows (a) are bound to the
+    run: 5 per selection episode of T >= 1, so at least one episode and at most the run's
+    selection seeds (a snapshot writer that dropped or duplicated them would pass otherwise)."""
     misses = []
     if report.n_unsaturated < MIN_UNSATURATED:
         misses.append(f"{report.n_unsaturated} unsaturated rows (< {MIN_UNSATURATED})")
     if report.n_saturated < MIN_SATURATED:
         misses.append(f"{report.n_saturated} saturated rows (< {MIN_SATURATED})")
-    if report.n_onpolicy != ONPOLICY_PER_SEED * report.n_onpolicy_seeds:
+    if report.n_onpolicy != ONPOLICY_ROWS * report.n_onpolicy_seeds:
         misses.append(
-            f"n_onpolicy {report.n_onpolicy} is not {ONPOLICY_PER_SEED} x n_onpolicy_seeds "
+            f"n_onpolicy {report.n_onpolicy} is not {ONPOLICY_ROWS} x n_onpolicy_seeds "
             f"{report.n_onpolicy_seeds}"
+        )
+    if report.n_onpolicy_seeds < 1:
+        misses.append("no on-policy rows (n_onpolicy_seeds 0)")
+    if report.n_onpolicy_seeds > report.n_selection_seeds:
+        misses.append(
+            f"n_onpolicy_seeds {report.n_onpolicy_seeds} is more than the "
+            f"{report.n_selection_seeds} selection seeds"
         )
     return misses
 
@@ -830,7 +1020,9 @@ def write_policy_dir(out: Path, files: Mapping[str, bytes], *, replace: bool) ->
     """Write ``files`` as the directory ``out``, complete or not at all. Without ``replace``
     ``out`` must not exist (``_atomic.new_directory``). With it the new directory is written as
     a temp sibling, the old one (``_replaceable``) renamed aside, the new one renamed in and the
-    old one removed; a failure puts the old one back."""
+    old one removed; a failure up to the swap puts the old one back. Once the new one is in,
+    failing to remove the old one is an ``ExportWarning`` (the hidden ``.<name>.<hex>.old`` is
+    left), not an error."""
     if not replace:
         try:
             with new_directory(out) as tmp:
@@ -862,7 +1054,16 @@ def write_policy_dir(out: Path, files: Mapping[str, bytes], *, replace: bool) ->
         shutil.rmtree(tmp, ignore_errors=True)
         raise
     if aside is not None:
-        _remove(aside)
+        try:
+            _remove(aside)
+        except OSError as exc:
+            warnings.warn(
+                ExportWarning(
+                    f"replaced {out}, but cannot remove the old one at {aside.name}: "
+                    f"{exc.strerror or type(exc).__name__}"
+                ),
+                stacklevel=2,
+            )
 
 
 def parity_bin(obs: F32, action_ref: F64, sets: npt.NDArray[np.uint8]) -> bytes:
@@ -885,9 +1086,18 @@ def _fixture_paths(fixture_dir: Path, name: str) -> dict[str, Path]:
     return {ext: fixture_dir / f"{name}_parity.{ext}" for ext in ("npz", "bin", "json")}
 
 
-def _write_fixtures(
-    paths: Mapping[str, Path], snap: _Snapshot, report: ParityReport, sha: str
-) -> None:
+def _check_fixture_targets(paths: Mapping[str, Path], *, replace: bool) -> None:
+    """Before anything is built or written: an existing fixture needs ``--replace``, and a
+    target a file cannot be renamed over (a directory) is refused."""
+    existing = [p.name for p in paths.values() if os.path.lexists(p)]
+    if existing and not replace:
+        _fail(f"fixture files {existing} exist (pass --replace to replace them)")
+    for path in paths.values():
+        if os.path.isdir(path) and not os.path.islink(path):
+            _fail(f"{path} is a directory: --test-fixture replaces files only")
+
+
+def _fixture_contents(snap: _Snapshot, report: ParityReport, sha: str) -> dict[str, bytes]:
     sidecar = {
         "onnx_sha256": snap.parity_sha256,
         "n": report.n,
@@ -898,14 +1108,48 @@ def _write_fixtures(
         "n_saturated": report.n_saturated,
         "policy_sha256": sha,
     }
-    contents = {
+    return {
         "npz": snap.parity_bytes,
         "bin": parity_bin(snap.obs, snap.action_ref, snap.sets),
         "json": (json.dumps(sidecar, indent=2) + "\n").encode("ascii"),
     }
-    for ext, path in paths.items():
-        with replacement(path, suffix=".tmp") as tmp:
-            tmp.write_bytes(contents[ext])
+
+
+def _write_outputs(
+    out_dir: Path,
+    files: Mapping[str, bytes],
+    *,
+    replace: bool,
+    fixtures: Mapping[str, Path],
+    contents: Mapping[str, bytes],
+) -> None:
+    """The policy directory and the fixture files: each fixture is written to a temp file beside
+    its target first (``replacement``), then the policy directory is written and swapped in,
+    then the temp files are renamed over their targets (checked up front, so the renames cannot
+    meet a directory). A failure before the swap leaves ``--out`` and every fixture as they
+    were; errors name the target, never a temp file."""
+    swapped = False
+    try:
+        with ExitStack() as staged:
+            for ext, path in fixtures.items():
+                try:
+                    tmp = staged.enter_context(replacement(path, suffix=".tmp"))
+                    tmp.write_bytes(contents[ext])
+                except OSError as exc:
+                    _fail(f"cannot write {path}: {exc.strerror or type(exc).__name__}")
+            try:
+                write_policy_dir(out_dir, files, replace=replace)
+            except OSError as exc:
+                _fail(f"cannot write {out_dir}: {exc.strerror or type(exc).__name__}")
+            swapped = True
+    except OSError as exc:  # a rename of a staged fixture, after the swap
+        if not swapped:
+            raise
+        names = ", ".join(path.name for path in fixtures.values())
+        _fail(
+            f"wrote {out_dir}, but cannot finish the fixture files {names}: "
+            f"{exc.strerror or type(exc).__name__}"
+        )
 
 
 # --- the command --------------------------------------------------------------------------------
@@ -935,9 +1179,7 @@ def export_policy(
         except OSError as exc:
             _fail(str(exc) if isinstance(exc, SymlinkedOutputError) else f"{fixture_dir}: {exc}")
         fixtures = _fixture_paths(fixture_dir, test_fixture)
-        existing = [p.name for p in fixtures.values() if os.path.lexists(p)]
-        if existing and not replace:
-            _fail(f"fixture files {existing} exist (pass --replace to replace them)")
+        _check_fixture_targets(fixtures, replace=replace)
     run = _resolve(run_dir, out_dir, step, report_only=report_only, replace=replace)
     if not run.replace and os.path.lexists(out_dir):
         _fail(f"{out_dir} already exists (pass --replace to replace it)")
@@ -953,10 +1195,6 @@ def export_policy(
         load_policy_files(files, challenge=snap.challenge)  # exactly what loading it runs
     except LoadError as exc:
         _fail(f"the exported policy does not load: {exc}")
-    try:
-        write_policy_dir(out_dir, files, replace=run.replace)
-        if fixtures:
-            _write_fixtures(fixtures, snap, report, manifest.onnx.sha256)
-    except OSError as exc:
-        _fail(f"cannot write {exc.filename or out_dir}: {exc.strerror or type(exc).__name__}")
+    contents = _fixture_contents(snap, report, manifest.onnx.sha256) if fixtures else {}
+    _write_outputs(out_dir, files, replace=run.replace, fixtures=fixtures, contents=contents)
     return manifest

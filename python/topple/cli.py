@@ -846,7 +846,7 @@ def train(
 ) -> None:
     """Train a policy (PPO or SAC) with periodic selection evals and pickle-free snapshots.
     Needs the train extra (torch, stable-baselines3). Exits 4 when a hard limit stopped it."""
-    from topple.train.config import read_train_config
+    from topple.train.config import config_sha256, read_train_config
     from topple.yamlsafe import ConfigError
 
     _check_output(out)
@@ -854,7 +854,7 @@ def train(
         loaded = read_train_config(config, seed=seed)
     except ConfigError as exc:
         _fail(f"{config.name}: {exc}")
-    attempt = _retry_target(out, retry=retry)
+    attempt = _retry_target(out, retry=retry, config_sha256=config_sha256(loaded.config))
     learn = _learn_module()
     if attempt is not None:
         try:
@@ -867,10 +867,12 @@ def train(
         raise typer.Exit(code=EXIT_HARD_LIMIT)
 
 
-def _retry_target(out: Path, *, retry: bool) -> Path | None:
+def _retry_target(out: Path, *, retry: bool, config_sha256: str) -> Path | None:
     """Where ``--retry`` moves the existing ``out`` (``None``: nothing to move). Exit 2 if
     ``out`` exists and is not an empty directory, unless ``--retry`` and its
-    ``train_meta.json`` carries ``wall_clock_abort`` and fewer than 2 attempts are kept."""
+    ``train_meta.json`` carries ``wall_clock_abort`` and the ``config_sha256`` of this run's
+    effective config (the same config and seed: a retry re-runs the attempt and must reproduce
+    it, §1), and fewer than 2 attempts are kept."""
     from topple.export import ExportError, read_run_json
 
     if not os.path.lexists(out) or _empty_directory(out):
@@ -884,11 +886,18 @@ def _retry_target(out: Path, *, retry: bool) -> Path | None:
         meta = read_run_json(out / "train_meta.json")
     except ExportError as exc:
         _fail(f"--retry: {exc}")
-    flags = meta.get("flags") if isinstance(meta, dict) else None
+    if not isinstance(meta, dict):
+        meta = {}
+    flags = meta.get("flags")
     if not isinstance(flags, list) or "wall_clock_abort" not in flags:
         _fail(
             f"--retry re-runs only a run whose train_meta.json carries wall_clock_abort; {out} "
             "does not (rss_abort and cpu_abort are bugs to fix, not to re-run)"
+        )
+    if meta.get("config_sha256") != config_sha256:
+        _fail(
+            f"--retry re-runs the attempt in {out} with its own config and seed: its "
+            "train_meta.json config_sha256 is not this run's (check the config file and --seed)"
         )
     if out.name in ("", ".", ".."):
         _fail(f"--retry needs a named --out, not {out}")
@@ -969,22 +978,34 @@ def export_cmd(
     """Export a training checkpoint as a topple.policy/1 directory, without torch or pickle:
     rebuild the ONNX from the checkpoint's arrays, bind it to the bytes training scored, check
     parity row by row, and write policy.onnx + policy.json."""
-    from topple.export import FIXTURE_DIR, ExportError, export_policy
+    import warnings
+
+    from topple.export import FIXTURE_DIR, ExportError, ExportWarning, export_policy
 
     _check_output(out)
     if test_fixture is not None:
         _check_output(FIXTURE_DIR)
-    try:
-        manifest = export_policy(
-            run_dir,
-            out,
-            step=step,
-            report_only=report_only,
-            replace=replace_out,
-            test_fixture=test_fixture,
-        )
-    except ExportError as exc:
-        _fail(str(exc))
+    error: str | None = None
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", ExportWarning)
+        try:
+            manifest = export_policy(
+                run_dir,
+                out,
+                step=step,
+                report_only=report_only,
+                replace=replace_out,
+                test_fixture=test_fixture,
+            )
+        except ExportError as exc:
+            error = str(exc)
+    for w in caught:  # the export happened, cleanup after it did not; others pass through
+        if issubclass(w.category, ExportWarning):
+            typer.echo(f"warning: {_printable(str(w.message))}", err=True)
+        else:
+            warnings.showwarning(w.message, w.category, w.filename, w.lineno)
+    if error is not None:
+        _fail(error)
     parity = manifest.claims.export_parity
     if parity is None:  # export always records it
         _fail("internal error: the export recorded no parity")

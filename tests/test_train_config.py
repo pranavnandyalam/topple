@@ -22,6 +22,8 @@ import yaml
 from topple.train.config import (
     MAX_CONFIG_BYTES,
     MAX_SELECTION_EVALS,
+    MAX_SELECTION_SEEDS,
+    MAX_TRAIN_META_BYTES,
     MAX_TRAIN_SEED,
     LrSchedule,
     PpoTrainConfig,
@@ -260,6 +262,56 @@ def test_the_other_challenges_protocol_is_refused() -> None:
 def test_too_many_selection_evals_are_refused() -> None:
     every = 5_000_000 // (MAX_SELECTION_EVALS + 1)
     refused(edited("ppo_balance", lambda d: d["selection"].update(every_steps=every)), "evals")
+    every = 5_000_000 // MAX_SELECTION_EVALS  # exactly the most
+    parse_train_config(
+        as_yaml(edited("ppo_balance", lambda d: d["selection"].update(every_steps=every)))
+    )
+
+
+def test_too_many_selection_seeds_are_refused() -> None:
+    def seeds(n: int) -> dict[str, Any]:
+        return edited(
+            "ppo_balance", lambda d: d["selection"].update(seeds={"first": 2000, "last": 1999 + n})
+        )
+
+    refused(seeds(MAX_SELECTION_SEEDS + 1), "selection.seeds", f"at most {MAX_SELECTION_SEEDS}")
+    assert len(parse_train_config(as_yaml(seeds(MAX_SELECTION_SEEDS))).selection.seeds.seeds) == (
+        MAX_SELECTION_SEEDS
+    )
+
+
+def test_train_meta_fits_its_64_kib_readers_at_the_config_bounds() -> None:
+    """``topple export`` and ``topple train`` read ``train_meta.json`` with a 64 KiB cap: at the
+    most selection seeds and evals a config allows, with the widest numbers and the waypoint
+    gate's two baselines, ``gate_baseline``, ``selection_history`` and the config written with
+    ``indent=2`` leave ``MAX_TRAIN_META_BYTES - 56 KiB`` for the remaining identity and resource
+    fields."""
+    from topple.export import MAX_JSON_BYTES
+    from topple.train.selection import GateBaseline, HistoryRow, SelectionResult
+
+    wide = -1.2345678901234568e-300  # 24 characters: the longest repr a float64 has
+    extras = {"mean_gates": wide, "docked": wide, "fell": wide, "median_t_finish_s": wide}
+
+    def result(step: int) -> SelectionResult:
+        return SelectionResult(
+            step=step,
+            success_rate=wide,
+            score=wide,
+            median_energy_j=wide,
+            mean_saturation=wide,
+            scores=[wide] * MAX_SELECTION_SEEDS,
+            extras=extras,
+        )
+
+    baseline = GateBaseline("waypoint", reference=result(0), anchor=result(0))
+    history = [
+        HistoryRow(result(10**10 - k), True, "a" * 64, wide, wide, wide, wide, wide).to_json()
+        for k in range(MAX_SELECTION_EVALS + 1, 0, -1)
+    ]
+    config = load_train_config(CONFIGS / "ppo_balance.yaml").model_dump(mode="json")
+    doc = {"config": config, "gate_baseline": baseline.to_json(), "selection_history": history}
+    assert MAX_TRAIN_META_BYTES == MAX_JSON_BYTES == 64 * 1024  # the readers' cap
+    assert len(json.dumps(doc, indent=2)) <= 56 * 1024
 
 
 @pytest.mark.parametrize(
@@ -354,12 +406,38 @@ def test_anchors_and_aliases_are_refused(text: bytes) -> None:
         (b"base:\n  <<: {n: 1}\n  n: 2\n", "merge keys"),
         (b"? [a, b]\n: 1\n", "plain scalars"),
         (b"? {a: 1}\n: 1\n", "plain scalars"),
+        # PyYAML merges any key tagged !!merge, whatever its text: the second a would be dropped
+        (b"a: 1\n!!merge x: {b: 2, a: 9}\n", "tag"),
+        (b"!!merge x: {seed: 7}\n", "tag"),
+        (b"!<tag:yaml.org,2002:merge> x: {seed: 7}\n", "tag"),
+        (b"!!str a: 1\n", "tag"),
+        (b"! a: 1\n", "tag"),
     ],
 )
 def test_repeated_merge_and_complex_keys_are_refused(text: bytes, match: str) -> None:
     """PyYAML would keep the last of two equal keys without a word."""
     with pytest.raises(ConfigError, match=match):
         safe_load_capped(text)
+
+
+@pytest.mark.parametrize(
+    "hidden", [b"!!merge hidden: {seed: 12345, n_envs: 16}\n", b"!!merge h: {}\n"]
+)
+def test_a_tagged_merge_key_in_a_config_file_is_refused(hidden: bytes) -> None:
+    text = (CONFIGS / "smoke_ppo.yaml").read_bytes() + hidden
+    with pytest.raises(ConfigError, match="tag"):
+        parse_train_config(text)
+    without_seed = b"".join(
+        line
+        for line in (CONFIGS / "smoke_ppo.yaml").read_bytes().splitlines(keepends=True)
+        if not line.startswith(b"seed:")
+    )
+    with pytest.raises(ConfigError, match="tag"):
+        parse_train_config(without_seed + b"!!merge x: {seed: 7}\n")
+
+
+def test_tagged_values_are_still_read() -> None:
+    assert safe_load_capped(b"a: !!str 1\nb: !!int '2'\n") == {"a": "1", "b": 2}
 
 
 def test_equal_keys_in_different_mappings_are_fine() -> None:
@@ -391,6 +469,18 @@ def test_block_nesting_is_bounded_too() -> None:
     assert safe_load_capped(text, max_depth=64) is not None
 
 
+@pytest.mark.parametrize("flow", [True, False])
+def test_exactly_32_levels_are_read_and_33_refused(flow: bool) -> None:
+    def nested(levels: int) -> bytes:
+        if flow:
+            return b"[" * levels + b"]" * levels
+        return "".join(f"{'  ' * i}k{i}:\n" for i in range(levels)).encode()  # one mapping each
+
+    assert safe_load_capped(nested(32)) is not None
+    with pytest.raises(ConfigError, match="nests more than 32"):
+        safe_load_capped(nested(33))
+
+
 def test_more_than_64_kib_is_refused() -> None:
     text = b"#" * MAX_CONFIG_BYTES + b"\n"
     with pytest.raises(ConfigError, match="more than"):
@@ -413,6 +503,40 @@ def test_a_syntax_error_names_its_line_without_quoting_the_text() -> None:
         safe_load_capped(b"a: 1\nb: [1, 2\nc: secret\n")
     assert "line" in str(info.value)
     assert "secret" not in str(info.value)
+
+
+def clean(message: str, limit: int = 2000) -> None:
+    """One bounded line: no control character a terminal or a CI log would act on."""
+    assert len(message) <= limit, len(message)
+    assert message.isprintable(), message[:200]
+
+
+def test_a_huge_tag_is_not_quoted_whole() -> None:
+    with pytest.raises(ConfigError) as info:
+        safe_load_capped(b"a: !" + b"x" * 60_000 + b" 1\n")
+    clean(str(info.value), 300)
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        lambda d: d.update(algo="x\n::error::pwned\x1b[2J" + "A" * 20_000),
+        lambda d: d.update({"bad\nkey\x1b[2J" + "k" * 20_000: 1}),
+        lambda d: d["env"].update(challenge="balance\n::error::x\x1b" + "c" * 20_000),
+        lambda d: d["selection"].update(protocol="p\n::error::x\x1b" + "p" * 20_000),
+        lambda d: d["env"].update(preset="\x1b" + "q" * 20_000),
+    ],
+)
+def test_errors_never_quote_raw_or_unbounded_input(edit: Callable[[dict[str, Any]], None]) -> None:
+    """Pydantic's messages quote the input (\"Input tag 'x...' found\"), keys name the field: in
+    a ``ConfigError`` (and the ``ExportError`` that wraps it) they are escaped and bounded."""
+    data = edited("ppo_balance", edit)
+    with pytest.raises(ConfigError) as info:
+        validate_train_config(data)
+    message = str(info.value)
+    clean(message)
+    assert "\n" not in message
+    assert "\x1b" not in message
 
 
 # --- files --------------------------------------------------------------------------------------

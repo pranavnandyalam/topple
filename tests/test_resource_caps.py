@@ -31,7 +31,7 @@ from topple.cli import app
 from topple.compare import compare
 from topple.evaluate import EvalProtocol
 from topple.pool import POOL_MAX_WORKERS, eval_pool, pool_size
-from topple.train.config import PpoTrainConfig
+from topple.train.config import PpoTrainConfig, config_sha256, load_train_config
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -136,14 +136,16 @@ def learn(monkeypatch: pytest.MonkeyPatch) -> FakeLearn:
     return fake
 
 
-def aborted_run(path: Path, flags: list[str]) -> Path:
+SMOKE = str(CONFIGS / "smoke_ppo.yaml")
+SMOKE_SHA = config_sha256(load_train_config(Path(SMOKE)))  # the effective config, seed 0
+
+
+def aborted_run(path: Path, flags: list[str], config_sha: str = SMOKE_SHA) -> Path:
     path.mkdir(parents=True)
-    (path / "train_meta.json").write_text(json.dumps({"flags": flags}))
+    meta = {"flags": flags, "config_sha256": config_sha}
+    (path / "train_meta.json").write_text(json.dumps(meta))
     (path / "ckpt").mkdir()
     return path
-
-
-SMOKE = str(CONFIGS / "smoke_ppo.yaml")
 
 
 def test_train_runs_the_effective_config(learn: FakeLearn, tmp_path: Path) -> None:
@@ -203,6 +205,39 @@ def test_retry_moves_nothing_else(learn: FakeLearn, tmp_path: Path, flags: list[
     assert learn.calls == []
     assert (out / "ckpt").is_dir()
     assert not (tmp_path / "run.attempt1").exists()
+
+
+@pytest.mark.parametrize(
+    ("args", "config_sha"),
+    [
+        (["--seed", "5"], SMOKE_SHA),  # the attempt ran seed 0
+        ([], "0" * 64),  # the attempt ran another config
+        ([], None),  # the attempt recorded none
+    ],
+)
+def test_retry_reruns_only_the_attempts_own_config_and_seed(
+    learn: FakeLearn, tmp_path: Path, args: list[str], config_sha: Any
+) -> None:
+    """§1: a retry starts afresh with the same seed and must reproduce the attempt's
+    ``onnx_sha256``; another effective config would be an unrelated run."""
+    out = aborted_run(tmp_path / "ppo_s0", ["wall_clock_abort"], config_sha)
+    result = runner.invoke(app, ["train", SMOKE, "--out", str(out), "--retry", *args])
+    assert result.exit_code == 2
+    assert "config_sha256" in result.output
+    assert learn.calls == []
+    assert (out / "ckpt").is_dir()
+    assert not (tmp_path / "ppo_s0.attempt1").exists()
+
+
+def test_retry_with_the_same_seed_given_explicitly(learn: FakeLearn, tmp_path: Path) -> None:
+    out = aborted_run(
+        tmp_path / "ppo_s2",
+        ["wall_clock_abort"],
+        config_sha256(load_train_config(Path(SMOKE), seed=2)),
+    )
+    result = runner.invoke(app, ["train", SMOKE, "--out", str(out), "--retry", "--seed", "2"])
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "ppo_s2.attempt1" / "ckpt").is_dir()
 
 
 @pytest.mark.parametrize("meta", [None, b"{", b'{"flags": "wall_clock_abort"}', b"[]"])
