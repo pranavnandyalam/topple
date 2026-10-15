@@ -4,7 +4,8 @@ This file moves work between Claude Code sessions (local Mac ⇄ cloud at claude
 **Whoever stops working must update it, commit it and push before stopping.** Nothing else
 carries over: local memory, scratch files and workflow scripts stay on the machine that made them.
 
-Last updated: 2026-10-15 by the cloud session (in progress; see "Where things stand").
+Last updated: 2026-10-15 by the cloud session, handing back to the local Mac session. Branch
+`phase-2-learn` is pushed and clean at the commit that adds this text.
 
 ## Where things stand
 
@@ -12,32 +13,46 @@ Last updated: 2026-10-15 by the cloud session (in progress; see "Where things st
 |---|---|
 | Phase 0 (setup) | Merged to `main` (fcc2b13) |
 | Phase 1 (sim core, balance-v1) | Merged to `main` as **f997394** (PR #3). Passed two review gates (the second all-Opus); every confirmed finding fixed; CI green (1,806 tests, 98.9% coverage) |
-| Phase 2 (learn) | **Building 2a.** Spec v5.3 in `docs/design/phase-2.md`; decision log `docs/design/phase-2-decisions.md` (Linux recalibration rows R1–R6). Slice 1a (ONNX graph builder, 9-check validator, canonical form, hardened session) **done and reviewed** (`08a47b7`, `c0469d6`; decision log B1–B12). Slice 1b (manifest, policy submissions, ONNXPolicy, pools, loader/results) in progress |
+| Phase 2 (learn) | **2a torch-free half built and reviewed; torch half not started.** Spec v5.3 (`docs/design/phase-2.md`) matches the code; decision log rows R1–R7 (recalibration), A1–A8 (answers), B1–B36 (slices). Done, each with builder → reviewers → skeptics → fixer → re-review: **1a** ONNX builder/validator/canonical form (`08a47b7`, `c0469d6`); **1b** manifest, policy dirs, ONNXPolicy, pools, loader/results (`0da4ce6`, `9e2153f`); **1c** policy pack, compare + stats, shove bench, side-by-side video, hygiene tests (`dbe4203`, `eaf4d54`); **2 (torch-free)** yamlsafe, train config + 5 YAMLs, wrappers, selection, `_npz`, `topple export`, `topple train` shell (`5d13f3e`, `6249245`, `c735213`); **3a** gate scripts (`scripts/phase2_*`), C reference parity (`tests/c/`), CI jobs, coverage scopes (`ceff1d3`, fix `4fe6e7f`). Fast suite ≈3,400 tests green on linux (`-m "not slow and not train"`) |
+| Slice 3a re-review | **Not completed**: the session stopped before the re-review of fix `4fe6e7f` reported. Re-run one re-review agent on `ceff1d3..4fe6e7f` (ruff, mypy, fast suite, check each fix) and sync §4/§6/§7 of the spec with the 3a code (builder/fixer listed spec changes; not yet recorded as B rows) |
+| CI trigger | `ci.yml` still runs only on `main` pushes and PRs: the `push: phase-*` trigger (spec §7) is held back until B12 lands, so branch pushes don't produce red runs |
 | Merge blocker B12 | `onnx>=1.23.2,<1.24` and `protobuf>=7.36,<8` must move to base dependencies and `uv.lock` be regenerated (spec §7) before any PR: until then the default CI jobs cannot import `topple.policy`. Needs `download.pytorch.org` reachable (the Mac can do it: `uv lock`, then remove the strict xfail `test_onnx_and_protobuf_are_base_dependencies`) |
 | Linux recalibration | **Done** (2026-10-15, Pranav chose it): E_ref 13.0 → **13.1 J** on linux-x86_64, now the calibration platform. Bands hold (LQR 87.5%, PID 65.0%). New bundle `89a62007…`, protocol hashes and linux golden scores re-pinned. Reviewed (2 reviewers + 2 skeptics), findings fixed |
 | Darwin golden pins | **Stale** in `tests/test_golden.py` (`EPISODES["darwin-arm64"]`, measured under E_ref 13.0). The Mac session must re-pin them: run `uv run pytest tests/test_golden.py` on the Mac and copy the measured values (decision log R2). CI only checks linux pins |
-| Network (cloud) | The cloud environment's policy blocks `download.pytorch.org` and `download-r2.pytorch.org`, so torch cannot be installed and `uv lock` cannot run (it resolves the train extra). Asked Pranav to allow both hosts. Until then: no training, no PPO probe, no pyproject dependency changes; `onnx==1.23.2` and `protobuf==7.36.2` are installed into `.venv` by hand (`uv pip install`) for the torch-free slices |
+| Network (cloud) | The cloud environment blocks `download.pytorch.org` and `download-r2.pytorch.org`, so torch could not be installed and `uv lock` could not run there. On the Mac: `uv lock` works; then `uv sync` (it removes nothing needed: onnx/protobuf become base deps) |
 | Direction update | `PLAN.md` section 0 (2026-10-11): workbench for people's own robot projects, Studio (desktop + browser), Arena with FRC drive practice, revised build order |
 | Deferred risks | `docs/design/deferred-risks.md`: things later phases must fix (e.g. a hidden mass below the floor makes any robot a passive pendulum) |
 | Phase 3 design inputs | Branch `phase-3-design`: draft `docs/design/phase-3.md` + `phase-3-critiques.json` (55 issues, 7 BLOCKER, 21 HIGH), not yet revised. Never merge that branch wholesale; cherry-pick only the phase-3 docs |
 
 Work branch: **`phase-2-learn`** (based on `main`). Its PR should be opened when Phase 2 is built.
 
-## Next steps, in order
+## Next steps, in order (for the local Mac session)
 
-1. ~~Ask Pranav the open questions~~ (answered 2026-10-15; see below).
-2. ~~Linux re-measure of calibration~~ (done: E_ref 13.1, see the table). **Mac session: re-pin the
-   darwin-arm64 golden scores** in `tests/test_golden.py` (the STALE comment there points here).
-3. **PPO confirmation probe** (Q4: yes): one ~7-minute run of the §0 recipe on the recalibrated env,
-   before any slice-3 training. Blocked in the cloud until torch installs (Network row above).
-4. **Build Phase 2a** from `docs/design/phase-2.md`, in small slices, each with its own review:
-   1. ONNX validator + canonicalization, data-only `topple.policy/1` submissions, hardened
-      `ONNXPolicy` runtime (no training needed);
-   2. training pipeline (PPO config, wrappers, action-excess penalty, selection on seeds 2000..2199,
-      CPU budgets) + torch-free `topple export` + parity tests;
-   3. train 3 seeds, export, run done-when gates G1–G10, side-by-side PID vs PPO video.
-5. Phase 2a review gate (below), fix, merge. Then Phase 2b (waypoint-v1, `topple.traj/2`).
-6. Then follow the revised build order in `PLAN.md` section 0.
+1. **B12 (merge blocker):** in `pyproject.toml` move `onnx>=1.23.2,<1.24` and `protobuf>=7.36,<8`
+   to `[project] dependencies`, bound `onnxruntime>=1.31,<1.32`, add `psutil>=6` to the `train`
+   extra and `matplotlib` to `dev` (spec §7); `uv lock`; `uv sync --extra train`; remove the strict
+   xfail `test_onnx_and_protobuf_are_base_dependencies`; add the `push: phase-*` trigger to
+   `ci.yml`. Run ruff, mypy, `uv run pytest -n 4 -m "not train"` and the slow suite.
+2. **Re-pin darwin-arm64 golden scores** in `tests/test_golden.py` (STALE comment; decision log R2):
+   run it on the Mac and copy the measured values.
+3. **Finish slice 3a's review** (row above) and record its spec changes as B37+.
+4. **PPO confirmation probe** (Q4: yes): ~7 min of the §0 recipe on the recalibrated env.
+5. **Torch half of slice 2:** `topple/train/{learn,snapshot,callbacks,resources}.py` per spec §1–§2.5
+   and decision row **B36** (what they must call: `snapshot_files`/`write_snapshot`, `EvalTrigger`
+   with `final_due`/`resumed`, `evaluate_policy_bytes(..., step=)`, `measure_gate_baseline`,
+   `run_flags`); train-marked tests (`test_train_smoke` twice-run determinism,
+   `test_snapshot_reference`, `test_resources`, `test_pack_torch_legacy`); the torch-generated
+   third-party fixtures (`scripts/make_thirdparty_fixtures.py`, B26).
+6. **Slice 3b:** train PPO seeds 0–2, SAC 0–2 and the ablation (one run at a time), then
+   `scripts/phase2_results.py` (results package, §5) and `scripts/phase2_done.sh`; push, get CI
+   green, fetch the ubuntu evidence (G9), shipped `submissions/ppo_balance`, hero video.
+7. Phase 2a review gate (fresh-clone done-when verifier + reviewers + skeptics), fix, open the PR,
+   merge. Then Phase 2b (waypoint-v1, `topple.traj/2`), then PLAN.md section 0's build order.
+
+Process notes from this session: each slice ran as one builder → 2–3 reviewers (max effort) → 2
+skeptics → fixer → re-review, then a docs agent synced the spec from the builder/fixer reports
+(verifying against code). That cost a lot of usage (/usage: ~87% from workflows); consider 2
+reviewers per slice and skipping the separate spec-sync agent for small slices.
 
 ## Answers from Pranav (2026-10-15)
 
