@@ -7,7 +7,8 @@ PR #3); its changes are rows S1–S22 of the log's "Sync with merged Phase 1". v
 findings of the sync's adversarial verification (rows V1–V18 of the log's "Sync verification").
 v5.3 records slices 1a, 1b and 1c's resolved deviations (rows B1–B12 of the log's "Slice 1a build",
 B13–B16 of "Slice 1b build", B17–B26 of "Slice 1c build"), slice 2's torch-free half (rows B27–B36
-of "Slice 2 torch-free build") and the linux-x86_64 recalibration
+of "Slice 2 torch-free build"), slice 3a's gate scripts, C reference and CI jobs as built and
+their review fixes (rows B37–B45 of "Slice 3a build") and the linux-x86_64 recalibration
 (E_ref 13.0 → 13.1; rows R1–R6 of the log's "Linux recalibration") and Pranav's answers to the
 open questions (rows A1–A8 of "Owner answers"), which keep the waypoint scene identical to
 balance-v1's (§8.2).
@@ -496,7 +497,9 @@ exported artifacts (§4–§5).
   `test_phase2_gate`), evaluated on the candidate's own fresh Mac evals (same lock and platform as
   `.venv-eval`, so the numbers are identical). The ubuntu half of G2–G4 (§4) is checked after
   push; if it fails there, the next candidate is tried and the attempt is reported. Every attempt
-  is reported. No candidate passing → 2a fails.
+  is reported with where its failures were measured (`failed_on`: `"local"`, `"ubuntu"` (G2–G4
+  only) or `null` when nothing failed); G7 recomputes the local ones (§4). No candidate passing →
+  2a fails.
 
 ## 3. Export and the `topple.policy/1` format
 
@@ -991,52 +994,85 @@ uv run python scripts/phase2_gate.py out/cmp_cal.json out/cmp_eval_v1.json out/p
     --submission submissions/ppo_balance --results-dir docs/results/phase2
 ```
 
+- **The script.** Line 2 is a file-wide `# shellcheck disable=SC2086` (the block splits `$S`
+  into three submissions on purpose; the directive must follow the shebang directly), and a
+  preamble `top=$(git rev-parse --show-toplevel)`, `cd "$top"` lets it run from anywhere in the
+  checkout. Every line is a simple command, so errexit stops on any failure: no `&&` or `||`
+  (bash ignores a failure left of them, so the re-export and its `cmp` are two lines), and
+  command output is taken only by an assignment (`x=$(cmd)` fails when `cmd` does; `test -z
+  "$(cmd)"` passes when `cmd` fails and prints nothing). `test_phase2_gate` checks the script's
+  lines against this block.
 - **CI trigger.** `ci.yml` runs on `pull_request` and on `push` to `main` and `phase-*`, so a
   branch without a PR is still checked.
-- **`phase2_ci_check.py`** queries `gh run list --branch <current> --workflow ci.yml --json
-  databaseId,status,conclusion,headSha` and fails with distinct messages: no run for HEAD, in
-  progress, cancelled (concurrency cancel-in-progress), failure. It passes only on a completed
-  `success` run with `headSha == HEAD`.
-- **Ubuntu evidence.** In CI's `python-slow` job (where `slow` tests run, §7), after
-  `test_shipped_policy`, `topple compare
-  submissions/pid_example.py submissions/lqr_example.py submissions/ppo_balance -p
-  balance-v1/standard --seeds 0..199 --workers 4 --json out/cmp_cal_ci.json` (about 1–2 min on
-  the private repo's 2-vCPU runner, where the pool clamps `--workers 4` to 2, §1; 15 s locally)
-  runs, and both it and `test_shipped_policy`'s `results.json` are uploaded as artifacts.
-  Because a commit's own CI run exists only after push, the binding is to
-  the **policy**, not the commit: `phase2_results.py --fetch-ci` downloads (`gh run download`)
-  the newest successful `ci.yml` run whose `results.json` has `controller.policy_sha256 ==`
-  the shipped `onnx.sha256` and whose compare `protocol_hash` equals the current one, and copies
-  both files to `docs/results/phase2/ci_ubuntu/{results.json,cmp_cal.json}` in a follow-up
-  commit that changes no policy bytes (so the binding holds); `phase2.md` cites the committed
-  files, never an expiring artifact URL.
+- **`phase2_ci_check.py`** (`--head` a full sha; `--branch` overrides the current branch)
+  queries `gh run list --branch <branch> --workflow ci.yml --limit 100 --json
+  databaseId,status,conclusion,headSha` and judges the newest run for HEAD (largest
+  `databaseId`). It fails (exit 1) with distinct messages: no run for HEAD, in progress,
+  cancelled (concurrency cancel-in-progress), failure. After a completed `success` run with
+  `headSha == HEAD` it calls `gh run view <id> --json jobs` and passes only if `python`,
+  `python-slow` and `python-train` each completed with `success` (otherwise the failure message
+  names the job). It exits 2 when `gh` is missing, fails, runs past its timeout, prints more than
+  1 MiB or prints unexpected JSON.
+- **Ubuntu evidence.** In CI's `python-slow` job (where `slow` tests run, §7), on a `push` run
+  once a policy is shipped (each step's `if:` is `github.event_name == 'push' &&
+  hashFiles('submissions/ppo_balance/policy.onnx') != ''`: a pull request runs its own code, so
+  its numbers are never evidence), after `test_shipped_policy` (its `results.json` goes under
+  `TOPPLE_ARTIFACT_DIR=out/ci`), `topple compare submissions/pid_example.py
+  submissions/lqr_example.py submissions/ppo_balance -p balance-v1/standard --seeds 0..199
+  --workers 4 --json out/cmp_cal_ci.json` (about 1–2 min on the private repo's 2-vCPU runner,
+  where the pool clamps `--workers 4` to 2, §1; 15 s locally) runs. A check step (`test -f
+  out/ci/results.json`, `test -f out/cmp_cal_ci.json`, one per line: `upload-artifact`'s
+  `if-no-files-found` fires only when no path matches at all) precedes the upload of both as the
+  `ubuntu-evidence` artifact. Because a commit's own CI run exists only after push, the binding is
+  to the **policy** and the **code**, not the commit: `phase2_results.py --fetch-ci` considers only
+  `push` runs of `ci.yml` on the current branch whose `headSha` is an ancestor of HEAD (`git
+  merge-base --is-ancestor`) and between which and HEAD no `EVIDENCE_PATHS` changed (`python`,
+  `submissions`, `pyproject.toml`, `uv.lock`, `.github/workflows/ci.yml`,
+  `tests/test_shipped_policy.py`), downloads (`gh run download`) the newest successful one whose
+  `results.json` has `controller.policy_sha256 ==` the shipped `onnx.sha256` and whose compare
+  `protocol_hash` equals the current one, and copies both files to
+  `docs/results/phase2/ci_ubuntu/{results.json,cmp_cal.json}`, with `ci_ubuntu/source.json`
+  (`topple.ci_source/1`: `run_id`, `head_sha`, `event: "push"`, `branch`; ≤ 4096 bytes), in a
+  follow-up commit that changes no evidence path (so the binding holds; G8 rechecks it with
+  local git, so the done-when needs the history, not a shallow clone); `phase2.md` cites the
+  committed files, never an expiring artifact URL.
 
-`phase2_gate.py` exits 0 iff every gate in `PASS_GATES = ("G1", "G2", "G2b", "G3", "G4", "G5",
-"G6", "G7", "G8", "G10", "G11")` passes (G9 is `phase2_ci_check.py`), naming each failure; the
-constants live in `scripts/phase2_common.py` with `SHIP_GATES` (§2.5). Every input file is read
-as contract §15 reads `results.json`: `open_regular` (≤ 16 MiB, never blocking), strict JSON
-types, `format` required (`read_results` for results, the §5.3 model for compare JSON). Mean
-saturation is the unweighted mean of per-episode `saturation_fraction`. Paired rows are read from
-the compare JSON and recomputed with `topple.stats.paired_bootstrap` from the per-seed arrays; the
-two MUST be equal. **G2, G2b, G3 (0..199 part) and G4 are evaluated on both** the Mac compare
-(`out/cmp_cal.json`) and the ubuntu one (`ci_ubuntu/cmp_cal.json`, `cpu_isa` and `onnxruntime`
-recorded); both MUST pass (measured: three parity-equivalent runtimes changed all 200 episode
-scores, one by 22.8 points, and moved the PPO − LQR lower bound over 3.07–3.17).
+`phase2_gate.py` (`--ci-dir`, `--submission`, `--results-dir`; `--fixture`, default
+`tests/data/<submission name>_parity.npz`) exits 0 iff every gate in `PASS_GATES = ("G1", "G2",
+"G2b", "G3", "G4", "G5", "G6", "G7", "G8", "G10", "G11")` passes (G9 is `phase2_ci_check.py`),
+naming each failure, and exits 2 when it cannot hash the PID and LQR baselines; the constants
+live in `scripts/phase2_common.py` with `SHIP_GATES` (§2.5). Every input file is read as contract
+§15 reads `results.json`: `open_regular` (≤ 16 MiB, never blocking), strict JSON types, `format`
+required (`read_results` for results, the §5.3 model for compare JSON); `phase2.json` is also
+refused for NaN or Infinity anywhere (the free-form summary, `pilot` and `render` objects
+included) and for an integer with |n| ≥ 2^53, and the parity fixture is read with an 8 MiB cap
+(`MAX_NPZ_BYTES`). In each compare entry 0 MUST be `submissions/pid_example.py` and entry 1
+`submissions/lqr_example.py` (by submission sha256), and the shipped policy is the one entry
+whose `policy_sha256` is the submission's `onnx.sha256` and whose `sha256` is its submission
+sha256. Mean saturation is the unweighted mean of per-episode `saturation_fraction` (fsum/N).
+A paired row a gate uses MUST be `topple.stats.paired_bootstrap`'s (`n_resamples` 10,000, seed
+0) and equal its recomputation from the per-seed arrays within `PAIRED_ABS_TOL = 1e-12` (B19: a
+platform's SIMD summation order moves the last bits); the gate decides on the recomputed bound.
+G2b's success margin is decided on exact fractions (k/n). **G2, G2b, G3 (0..199 part) and G4 are
+evaluated on both** the Mac compare (`out/cmp_cal.json`) and the ubuntu one
+(`ci_ubuntu/cmp_cal.json`, which MUST record a `linux-*` platform, `cpu_isa` and `onnxruntime`);
+both MUST pass (measured: three parity-equivalent runtimes changed all 200 episode scores, one by
+22.8 points, and moved the PPO − LQR lower bound over 3.07–3.17).
 
 | Gate | Check |
 |---|---|
-| G1 | eval_v1 protocol score: PPO > PID |
+| G1 | eval_v1 protocol score (fsum/N): PPO > PID, strictly |
 | G2 | 0..199: `paired[ppo, pid]` lower bound > 0 (Mac and ubuntu) |
 | G2b | 0..199: `paired[ppo, lqr]` lower bound > 0 and success(PPO) ≥ success(LQR) − 0.03 (Mac and ubuntu) |
 | G3 | success(PPO) ≥ success(PID) on 0..199 (Mac and ubuntu) and on eval_v1 |
-| G4 | 0..199: PPO median energy ≤ E_ref and mean saturation ≤ 0.10 (Mac and ubuntu) |
+| G4 | 0..199: PPO median energy ≤ E_ref (the code's `ScoreConfig` value) and mean saturation ≤ 0.10, both inclusive (Mac and ubuntu) |
 | G5 | batch-1 parity of `submissions/ppo_balance` against `tests/data/ppo_balance_parity.npz` (≤ 1e-5, ≥ 300 unsaturated and ≥ 32 saturated rows, fixture `onnx_sha256` == `onnx.sha256`) |
-| G6 | `results.json` `controller.policy_sha256` == `onnx.sha256` and `controller.sha256` == `submission_sha256(submissions/ppo_balance)`; `versions.onnxruntime` set; `load_policy_dir` accepts it |
-| G7 | `phase2.json` has 3 PPO + 3 SAC runs, each with a fresh-eval row (ineligible ones via `--report-only`, marked "below PID gate") |
-| G8 | every required `docs/results/phase2/` file (§5.2, incl. `ci_ubuntu/*`) exists within the §5.2 caps, is tracked (`git ls-files --error-unmatch`) and unmodified (`git diff --quiet -- docs/results`); `ci_ubuntu/results.json` `policy_sha256` == `onnx.sha256` |
-| G9 | `phase2_ci_check.py`: CI on HEAD succeeded (all three jobs `python`, `python-slow`, `python-train`; coverage ≥ 80% in each scope, §7; `test_shipped_policy` and the ubuntu compare) |
-| G10 | every reported run: no abort flag and no `nondeterministic`, `num_timesteps ≥ total_timesteps`, `peak_tree_rss_mib < 6144`, `selection_protocol_hash` and `env_algo_version` equal the recomputed current values; shipped run `git_dirty: false` (§2.3) |
-| G11 | ≥ 2 of 3 PPO runs have `best.eligible` and their exported policies pass G2, G3 and G4 on 0..199 in fresh evals; per-run table in `phase2.json` with a G2b column (reported, not gating) |
+| G6 | `results.json` `controller.policy_sha256` == `onnx.sha256` and `controller.sha256` == `submission_sha256(submissions/ppo_balance)`; `versions.onnxruntime` set; its `protocol_hash` is eval_v1's and `complete: true`; `load_policy_dir` accepts the submission and the loaded policy's sha256 is the hashed one |
+| G7 | `phase2.json` has 3 PPO + 3 SAC runs and exactly 1 ablation run (so G10 judges it). Each PPO and SAC run has `best.rule` `pid` and one fresh-eval row: its policy is its best's `onnx_sha256` and an entry (index ≥ 2) of both fresh compares, which have the current protocol hashes, are complete and have PID as entry 0 and LQR as entry 1; ineligible ones via `--report-only`, marked "below PID gate"; no fresh rows for runs that are not reported. The shipped run is a PPO run not exported report-only whose `policy_sha256` is the submission's; it and `shipped.attempts` equal a §2.5 replay over the recorded failures, and every attempt's local G1–G4 result, recomputed from the fresh compares, is what it records (`failed_on: "local"`: exactly those gates; `"ubuntu"` and the shipped attempt: none). Only ubuntu failures and G5/G6 stay recorded claims |
+| G8 | every required `docs/results/phase2/` file (`RESULT_FILES`: `hero.mp4`, `hero.gif`, `median_pid_ppo.mp4`, `median_lqr_ppo.mp4`, `gallery_1..3.gif`, `learning_curves.png`, `shove.png`, `ci_ubuntu/{results.json,cmp_cal.json,source.json}`) is a regular file (symlinks are not followed) within its §5.2 cap (MB = 10^6), the package within 20 MB in at most 256 entries; the required files, `phase2.json` and `phase2.md` are tracked (`git ls-files`) and regular files (a symlink counts as missing); nothing under `docs/results` is untracked (not ignored) or modified (`git diff --name-only HEAD`, so staged changes count); `ci_ubuntu/results.json` `policy_sha256` == `onnx.sha256`; `ci_ubuntu/source.json`'s run commit is an ancestor of HEAD with no `EVIDENCE_PATHS` changed since |
+| G9 | `phase2_ci_check.py`: CI on HEAD succeeded (all three jobs `python`, `python-slow`, `python-train`; coverage ≥ 80% in each scope, §7, the train scope from when `topple/train/learn.py` exists; `test_shipped_policy` and the ubuntu compare) |
+| G10 | every reported run's summary has exactly the §5.1 fields (a missing or extra key fails): no abort flag and no `nondeterministic`, `num_timesteps ≥ total_timesteps`, `peak_tree_rss_mib < 6144`, `selection_protocol_hash`, `env_algo_version` and `bundle_hash` equal the recomputed current values; shipped run `git_dirty: false` (§2.3) |
+| G11 | ≥ 2 of 3 PPO runs have `best.eligible` and their exported policies pass G2, G3 and G4 on 0..199 in fresh evals; the per-run `g11` table in `phase2.json` lists exactly the 3 PPO runs and equals the recomputation on `fresh.calibration` (`eligible`, `g2`, `g2b`, `g3`, `g4`), its G2b column reported, not gating |
 
 Every input G10 reads comes from the committed per-run summary in `phase2.json` (§5.1), never
 from `runs/`.
@@ -1057,7 +1093,8 @@ from `runs/`.
   `bundle_hash`, `git_commit`, `git_dirty`, `versions`, `mp_start_method`, `torch_threads`,
   `wall_clock_s`, `train_s`, `selection_s`, `cpu_s`, `load_avg_start`, `load_avg_end`,
   `peak_tree_rss_mib`, `peak_procs`, `selection_history`, `best` (with its `onnx_sha256`),
-  `flags`, `e_ref_j`, `attempts`, `init_source` (fine-tune only); `shipped` (with every attempt);
+  `flags`, `e_ref_j`, `attempts`, `init_source` (fine-tune only); `shipped` (with every attempt:
+  its run, the ship gates it failed and `failed_on`, §2.5);
   the G11 table; and `pilot` constants (energy-cost variant 64.9 / 0.505; log_std −0.5/−1
   results), each with `source: "<workflow run id>"`, rendered as "pilot measurement";
 - renders `phase2.md` and `docs/results/phase2/*` from it.
@@ -1218,17 +1255,18 @@ train"`; torch-free):
 | `test_loader_policy` | Detection; ambiguous kind; extra/pickle-family/hidden/subdir entries named; missing `challenge` → TypeError; hard-linked `policy.json`; `POLICY.JSON` and a non-UTF-8 name refused on every OS; a directory of 10,000 entries refused after at most 4; `Submission.sha256` == `submission_sha256(dir)` from the same single read. Red-team (Linux, macOS): symlinked `policy.onnx`, symlink to `/dev/zero`, symlinked dir, lstat/open swap to a regular file and to a FIFO (rejected, never blocks; 5 s test timeout); oversize rejected before read. |
 | `test_export_inputs` | Ignores `best.json.dir`; rejects step ≥ 2^53, symlinked or escaping step dirs, npz with 9 members / bad names / oversize / object dtype / a header declaring 2^42 elements (clean error, no allocation) / bytes prepended to the archive (contract §14 layout), NaN in `normalize.json`, bad fixture name, sha mismatch, a constant-binding mismatch, a run with an abort or `nondeterministic` flag (without `--report-only`); existing `--out` without `--replace` → exit 2; a relative `--out` under a symlinked `out` → exit 2 before any write (also `compare --json`, `policy pack`, `video`, `train`); `--report-only` twice succeeds (idempotent); vacuous coverage recorded, not failed; `.bin` v1 layout (magic, version, N, D, A, set) and `.json` sidecar fields. Also the §3.3 step 1–5 rules as built: symlink loops (step dir, `ckpt`, `./runs`) give one `ExportError`, never a traceback; the `runs/` rule (a checkout under `.../runs/topple` exports); `--replace` limits; every binding; `1 ≤ n_onpolicy_seeds ≤` selection seeds; a NaN ONNX output on a middle row fails; fixture staging and the `ExportWarning`; `snapshot_files` / `write_snapshot` round-trip through export. |
 | `test_shipped_policy` (slow; parametrized over `ppo_balance` and, once it exists, `ppo_waypoint`) | The submission loads; fixture sha equals `onnx.sha256`; parity ≤ 1e-5 with ≥ 300 unsaturated and ≥ 32 saturated rows; balance: eval_v1 PPO > PID; writes `results.json` as a CI artifact. |
-| `test_c_reference` | Generates a C header from `submissions/ppo_balance/policy.onnx` initializers by §3.2 position (`float.hex` literals; `tests/c/genc.py`), compiles `tests/c/mlp.c` (about 40 lines) with the system `cc -O2`, with and without `-ffp-contract=off`, and checks every `.bin` row within 1e-5 (measured ≤ 6.6e-7). Skips locally without `cc`; CI sets `TOPPLE_REQUIRE_CC=1`. |
+| `test_c_reference` | Generates a C header from a first-party `policy.onnx`'s initializers by §3.2 position (`float.hex` literals and the policy's sha256; `tests/c/genc.py`), compiles `tests/c/mlp.c` (about 40 lines) with the system `cc -O2 -Wall -Wextra` (no warning allowed), with and without `-ffp-contract=off`, and checks every `.bin` row within 1e-5 (measured ≤ 6.6e-7). It runs on tiny PPO and SAC exports from a synthetic run, so it runs before `ppo_balance` exists; the `ppo_balance` case skips until that is committed (even with `TOPPLE_REQUIRE_CC=1`). Negative controls: another policy's rows are off by more than 1e-3; a `.bin` with a bad magic, version or dims, or a truncated one, is refused with exit 2; `genc` refuses a graph that is not a §3.2 sequence and bytes that are not ONNX. Skips locally without `cc`; CI sets `TOPPLE_REQUIRE_CC=1`, which makes a missing `cc` fail. |
 | `test_harness_finite_obs` | A fake env emitting NaN makes `evaluate` raise `RuntimeError` before `act()` is called, also under `python -O`. |
 | `test_driver_golden` (2b) | Per platform tag, as `tests/test_golden.py` pins balance-v1's baselines (contract §13; physics reproduces only per platform, e.g. LQR seed 1001 scored 84.08 on darwin-arm64 and 85.40 on linux-x86_64 under E_ref 13.0): `EPISODES[platform_tag()]` holds `submissions/waypoint_pid_example.py`'s scores on `waypoint-v1/clean` seeds 0..4 (to 1e-9) and docked/fell on `standard` 0..19, for `darwin-arm64` and `linux-x86_64`; a platform without pins skips locally and fails in CI, and CI must run on `linux-x86_64` (the same `pins_for` / `check_ci_platform` rule); a re-pin updates both platforms in one change. The platform-independent `WaypointScore` dump is pinned once. |
 | `test_traj_v2` (2b) | The §8.1a cases. |
-| `test_import_hygiene` | A fresh interpreter with an import hook imports `topple.cli`, `topple.pool`, `topple.controllers.onnx_policy`, `topple.compare`, `topple.bench`, `topple.stats`, every `topple.policy.*` module it finds, `topple.export`, `topple._npz`, `topple.yamlsafe`, `topple.train` and its torch-free `config`, `wrappers`, `selection`: no attempt to import `torch`, `stable_baselines3`, `tensorboard` or `psutil` (a guarded `try: import` counts, installed or not; positive control) and none in `sys.modules`. |
+| `test_import_hygiene` | A fresh interpreter with an import hook imports `topple.cli`, `topple.pool`, `topple.controllers.onnx_policy`, `topple.compare`, `topple.bench`, `topple.stats`, every `topple.policy.*` module it finds, `topple.export`, `topple._npz`, `topple.yamlsafe`, `topple.train` and its torch-free `config`, `wrappers`, `selection`, and (with `PYTHONPATH=scripts`) the scripts `phase2_common`, `phase2_gate`, `phase2_ci_check`: no attempt to import `torch`, `stable_baselines3`, `tensorboard` or `psutil` (a guarded `try: import` counts, installed or not; positive control) and none in `sys.modules`. |
 | `test_no_unsafe_loads` | AST scan of `python/topple`, `scripts/`, `tests/`. Outside `topple/train/`'s torch half (its `__init__`, `config`, `wrappers` and `selection` are scanned): no `pickle, cloudpickle, dill, joblib, shelve, marshal, torch, stable_baselines3` imports (`__import__` / `importlib.import_module` of a literal included), except a fixed (file → names) allow-list in the test, each entry still used by its file (a stale one fails): the `train`-marked test files (`test_train_smoke`, `test_snapshot_reference`, `test_pack_torch_legacy`, `test_resources`, `test_surgery`) → `torch`, `stable_baselines3`; the merged `tests/test_contract.py` → `pickle` (its `TaskSpec` pickle round trip, contract §8); `tests/test_onnx_policy.py`, `tests/test_pool.py` → `pickle` (pickling refused, `PolicyRef` pickled); `topple/train/wrappers.py`, `tests/test_train_wrappers.py` → `stable_baselines3` (`make_train_env`'s lazy `Monitor` import, its `train`-marked case); `tests/test_train_config.py`, `tests/test_selection.py` → `pickle` (`lr_fn` and `EpisodeRows` round trips); `scripts/make_thirdparty_fixtures.py` → `torch` (§3.3, run once with the train extra); `tests/test_policy_validate.py`, `tests/test_policy_canonical.py` → `numpy_helper` and `tests/test_policy_pack.py` → `numpy_helper`, `external_data_helper` (they monkeypatch the readers to raise). Torch-free tree: onnx entry point only `onnx.ModelProto.FromString`; banned any `onnx.load*` and any reference to `numpy_helper`, `external_data_helper`, `load_external_data_for_model`, `register_custom_ops_library`, `onnx.shape_inference.infer_shapes_path`, `onnx.hub`, `onnx.utils.extract_model`, and `check_model` or `onnx.reference.ReferenceEvaluator` given a path (a string, f-string, `/` join, `Path(…)`/`str(…)` call, or a name containing "path" or "file"). `InferenceSession(` and `add_session_config_entry` (the three §3.5 literal keys) only in `runtime.make_session`. `PPO.load`, `SAC.load`, `VecNormalize.load` (qualified or not), `load_from_zip_file` only in `learn.resume_from` (`test_snapshot_reference` reloads through it). Everywhere: no `yaml.load/full_load/unsafe_load` (and their `_all` forms), `allow_pickle=True`, `torch.load` without `weights_only=True`. Every rule has a positive control. Name-based, reading import aliases as what they import; `getattr` evasion out of scope. |
 | `test_repo_hygiene` | No pickle-family (`.zip` included: SB3's `model.zip`), native-code (`.so/.dylib/.pyd/.dll`), external-data (`.onnx.data`, `.onnx_data`, `.data`) or hidden files under `submissions/`, tracked or untracked and not ignored; `.gitignore` covers `runs/`, `*.pkl`, `.venv-eval/`, `.DS_Store`; `git check-ignore docs/results/phase2/hero.mp4` and `.../waypoint.mp4` return non-zero. |
 | `test_stats`, `test_compare`, `test_bench` | `paired_bootstrap` known answer pinning (mean, lo, hi) for a committed 200-element vector; n = 1; all-equal; compare round-trip, all ordered pairs on 2 `ideal` seeds; shove both directions and interpolation. |
 | `test_video_sbs` | Timeline (hold-last-frame, labels, trims), GIF ladder, frame rule; one `render`-marked 64 px smoke. |
 | `test_resource_caps` | Pools clamp to 4; shipped configs `n_envs` ≤ 8; `limits` complete; `topple train` on a non-empty `--out` exits 2; `--retry` renames only a `wall_clock_abort` attempt of the same effective config (`config_sha256`), at most twice; an abort flag exits 4; a missing train extra exits 2 with one line and moves nothing. |
-| `test_phase2_gate` | `phase2_gate.py`, `phase2b_gate.py` and `phase2_ci_check.py` on synthetic JSON: pass a good set; name each failing gate, incl. a G2b-only failure (and the §2.5 fallback picking the next candidate on it), an ubuntu-only G4 failure, each missing G10 field, a stale `selection_protocol_hash` on a SAC row, `git_dirty` on the shipped run, an untracked MP4; the CI check's four distinct messages. Uses the `SHIP_GATES` / `PASS_GATES` constants. |
+| `test_phase2_gate` | `phase2_gate.py`, `phase2b_gate.py` and `phase2_ci_check.py` on synthetic JSON: pass a good set; name each failing gate, incl. a G2b-only failure (and the §2.5 fallback picking the next candidate on it), an ubuntu-only G4 failure, each missing G10 field, a stale `selection_protocol_hash` on a SAC row, `git_dirty` on the shipped run, an untracked MP4; the exact bars (G2b's margin at 169/200 and 85/200, G4 at exactly E_ref and 0.10, G1 at PPO equal to PID); a recorded §2.5 attempt that the fresh compares contradict, in either direction, and `failed_on`'s rules; the ubuntu evidence's `source.json` (strict reading; not an ancestor of HEAD, an evidence path changed since, a commit git does not have, from a real git checkout); the CI check's four distinct messages and its job check. Also `run_command`'s timeout and output caps, strict `phase2.json` reading (`format`, exact types, a FIFO, NaN and integers ≥ 2^53), the symlinked-report G8 case, and `phase2_done.sh`: its lines equal §4's block, no `&&`/`||` and `$(` only as an assignment's value, the shellcheck directive (and a shellcheck run when installed), and runs with stand-in `uv` and `git` where a failing or different re-export, or a failing `git rev-parse` or `git status`, stops it before G9. Uses the `SHIP_GATES` / `PASS_GATES` constants. |
+| `test_ci_config` | `ci.yml` and the coverage scopes: the triggers; the three jobs, their runner and the train job's 20 min; `TOPPLE_REQUIRE_CC=1` on `python`; the slow job's order (slow tests, ubuntu compare, evidence check, upload) and their push-only `if:`; the train job's commands (interim step without the train scope before `learn.py`, scoped step after, advisory legacy-exporter step); every action pinned by sha with a version comment; `permissions: contents: read` with no job-level permissions, `persist-credentials: false` on every checkout, concurrency cancel-in-progress; disjoint coverage scopes with equal `exclude_also` and `branch` settings. |
 
 **Train CI job** (`-m train`, `uv sync --locked --extra train`):
 
@@ -1259,18 +1297,35 @@ train"`; torch-free):
   "topple.train.snapshot", "topple.train.surgery", "topple.train.resources"]`,
   `disallow_subclassing_any = false` (the default job has no SB3, so `class
   SelectionCallback(BaseCallback)` subclasses `Any`). The train job runs the same mypy config with
-  the extra installed.
+  the extra installed. The override is added with the torch modules: until they exist the train
+  job's mypy passes without it.
 - **Coverage.** pyproject's `[tool.coverage.run]` (merged: `source = ["topple"]`, with
   `[tool.coverage.report] fail_under = 80`; the `python` job measures it) gains `omit` for
   `topple/train/{learn,snapshot,callbacks,surgery,resources}.py`; `.coveragerc-train` sets
-  `include` to exactly those five files, and the train job runs `--cov=topple.train
-  --cov-config=.coveragerc-train`, `fail_under = 80`, so the two 80% scopes are disjoint.
+  `[report] include` to exactly those five files (a `[run] include` is ignored once `--cov` sets
+  a source), `branch = True`, `show_missing`, `skip_covered` and a copy of pyproject's
+  `exclude_also` (`--cov-config` replaces pyproject's settings; a test keeps them equal), and the
+  train job runs `--cov=topple.train --cov-config=.coveragerc-train`, `fail_under = 80`, so the
+  two 80% scopes are disjoint. Until `topple/train/learn.py` exists none of the five files does
+  and coverage reports "No data to report" as 0%, so the train job runs the same tests without
+  the scope until then (B37).
 - **ci.yml.** Triggers: `pull_request`, and `push` to `main` and `phase-*` (merged: `main` only).
   Merged jobs keep their roles: `python` (`-m "not slow and not train"`, coverage) also sets
   `TOPPLE_REQUIRE_CC=1`; `python-slow` (`-m "slow and not train"`) runs `test_shipped_policy`, then
-  §4's ubuntu `topple compare`, and uploads that `results.json` and `out/cmp_cal_ci.json`. New job
-  `python-train` (ubuntu-24.04, 20 min): `uv sync --locked --extra train`, ruff, mypy, `pytest -m
-  train -n 2 --cov...` (`test_pack_torch_legacy` advisory), torch from the pytorch-cpu index.
+  §4's ubuntu `topple compare`, checks both evidence files exist and uploads that `results.json`
+  (`TOPPLE_ARTIFACT_DIR: out/ci`) and `out/cmp_cal_ci.json`; those three steps run only on a
+  `push` once `submissions/ppo_balance/policy.onnx` exists (§4). New job `python-train`
+  (ubuntu-24.04, 20 min): `uv sync --locked --extra train`, ruff and mypy with `--extra train`,
+  `pytest -m train -n 2 --ignore=tests/test_pack_torch_legacy.py --cov...` (without the `--cov`
+  flags while `topple/train/learn.py` is absent), then `test_pack_torch_legacy` alone in a
+  `continue-on-error` step (`if: hashFiles(...)` of the test file), torch from the pytorch-cpu
+  index. Security posture (the workflow runs pull-request code): every action pinned by commit
+  sha, top-level `permissions: contents: read` and none per job, `persist-credentials: false` on
+  every checkout, and `concurrency` with `cancel-in-progress` (whose cancelled runs
+  `phase2_ci_check.py` names).
+- **Tooling for `scripts/`.** `[tool.mypy] files` adds `scripts`, `[tool.pytest.ini_options]
+  pythonpath = ["scripts"]` (the tests import `phase2_common`, `phase2_gate`,
+  `phase2_ci_check`), and ruff's `src` adds `scripts`.
 - **Repository.** `.gitignore` (merged: `runs/`, `.DS_Store`, `*.mp4`, `/out/`) adds `*.pkl`,
   `.venv-eval/` and the negation `!docs/results/**/*.mp4` (the `*.mp4` rule would otherwise drop
   every results video). `cli.py` imports `topple.train.learn` only inside `train`.
