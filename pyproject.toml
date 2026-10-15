@@ -108,5 +108,13 @@ strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["mujoco.*", "imageio.*", "gymnasium.*", "onnxruntime.*", "stable_baselines3.*", "cma.*"]
+module = [
+    "mujoco.*",
+    "imageio.*",
+    "gymnasium.*",
+    "onnxruntime.*",
+    "stable_baselines3.*",
+    "cma.*",
+    "google.protobuf.*",
+]
 ignore_missing_imports = true
