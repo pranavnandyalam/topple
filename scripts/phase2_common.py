@@ -13,7 +13,8 @@
   policy, and one row per run binding it to its entry); the shipped run with every attempt; the
   G11 table; the pilot constants; and the values only the report renders. It is read like every
   gate input, as contract §15 reads ``results.json``: a regular file of at most 16 MiB
-  (``open_regular``, never blocking), exact JSON types, ``format`` required.
+  (``open_regular``, never blocking), exact JSON types, ``format`` required, no NaN or Infinity
+  (also in the free-form objects, whose integers must be exact in a double: |n| < 2**53).
 - **The results package's files** (``RESULT_FILES``) and their §5.2 size caps (G8).
 - **``run_command``**: a subprocess with a timeout and a cap on what it may print (git, gh).
 
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import subprocess
 import threading
@@ -34,6 +36,7 @@ from pathlib import Path
 from typing import IO, Annotated, Final, Literal
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -81,6 +84,7 @@ MIN_G11_RUNS: Final = 2
 """G11: at least this many of the 3 PPO runs pass the PID gate, G2, G3 and G4."""
 N_PPO_RUNS: Final = 3
 N_SAC_RUNS: Final = 3
+N_ABLATION_RUNS: Final = 1
 PAIRED_ABS_TOL: Final = 1e-12
 """A stored paired row must equal its recomputation within this (decision log B19: the bootstrap
 sums in a platform's SIMD order, so a row computed on ubuntu can differ from a Mac recomputation
@@ -174,7 +178,39 @@ Fraction01 = Annotated[float, Field(ge=0.0, le=1.0)]
 LoadAvg = tuple[NonNegFloat, NonNegFloat, NonNegFloat]
 """``os.getloadavg()``: the 1, 5 and 15 minute load averages."""
 Role = Literal["ppo", "sac", "ablation"]
-FreeObject = Annotated[dict[str, JsonValue], Field(max_length=MAX_FREE_KEYS)]
+
+
+class SummaryError(ValueError):
+    """A rule of this module's models broken; its text is fixed words and numbers, never an
+    input string, so ``describe_error`` may show it."""
+
+
+def check_json_numbers(value: JsonValue) -> None:
+    """Contract §15 for a free-form JSON value: no NaN or Infinity (pydantic's parser accepts
+    them, and ``1e999`` reads as Infinity), and every integer exact in a JSON double
+    (|n| < 2**53, as seeds are). ``SummaryError`` otherwise. Iterative: the parser bounds the
+    nesting, this walk never recurses."""
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise SummaryError("a number is not finite (NaN or Infinity)")
+        elif isinstance(item, int) and not isinstance(item, bool) and abs(item) >= MAX_SEED:
+            raise SummaryError("an integer is not exact in a JSON double (|n| >= 2**53)")
+
+
+def _json_numbers(value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    check_json_numbers(value)
+    return value
+
+
+FreeObject = Annotated[
+    dict[str, JsonValue], Field(max_length=MAX_FREE_KEYS), AfterValidator(_json_numbers)
+]
 
 
 class _Strict(BaseModel):
@@ -241,12 +277,12 @@ def _best_in_history(best: Best, history: Sequence[HistoryRowModel]) -> None:
     """``best`` names one history row, with that row's eligibility and ONNX sha256."""
     rows = [row for row in history if row.step == best.step]
     if len(rows) != 1:
-        raise ValueError(f"best.step {best.step} must be exactly one selection_history step")
+        raise SummaryError(f"best.step {best.step} must be exactly one selection_history step")
     if (rows[0].eligible, rows[0].onnx_sha256) != (best.eligible, best.onnx_sha256):
-        raise ValueError("best.eligible and best.onnx_sha256 must be its history row's")
+        raise SummaryError("best.eligible and best.onnx_sha256 must be its history row's")
     steps = [row.step for row in history]
     if len(set(steps)) != len(steps):
-        raise ValueError("selection_history steps must be unique")
+        raise SummaryError("selection_history steps must be unique")
 
 
 class RunSummary(_Strict):
@@ -289,7 +325,7 @@ class RunSummary(_Strict):
     def _consistent(self) -> RunSummary:
         _best_in_history(self.best, self.selection_history)
         if len(set(self.flags)) != len(self.flags):
-            raise ValueError("flags must be unique")
+            raise SummaryError("flags must be unique")
         return self
 
 
@@ -417,7 +453,10 @@ def read_phase2(path: Path) -> Phase2Report:
 
 def _validate_summary[M: BaseModel](model: type[M], summary: Mapping[str, JsonValue]) -> M:
     """``summary`` (already parsed from JSON) validated in JSON mode, so arrays are tuples and
-    scalars keep their exact JSON types."""
+    scalars keep their exact JSON types. ``ValueError`` (``ValidationError`` included) if it is
+    invalid, also when it never went through the parser (a non-finite number is a
+    ``SummaryError`` here, not a failure to re-encode it)."""
+    check_json_numbers(dict(summary))  # a Mapping, not necessarily a JSON object
     return model.model_validate_json(json.dumps(summary, allow_nan=False), strict=True)
 
 
@@ -439,13 +478,17 @@ def run_label(entry: RunEntry, index: int) -> str:
 
 def describe_error(exc: BaseException) -> str:
     """A one-line, printable description of ``exc`` that never echoes input values: for a
-    pydantic error, the location and type of its first errors (``missing field 'x'``)."""
+    pydantic error, the location and type of its first errors (``missing field 'x'``), and the
+    reason when one of this module's rules (``SummaryError``: fixed text) raised it."""
     if isinstance(exc, ValidationError):
         parts = []
         for err in exc.errors()[:4]:
             loc = ".".join(printable(str(p), 64) for p in err["loc"]) or "(root)"
+            reason = err.get("ctx", {}).get("error")
             if err["type"] == "missing":
                 parts.append(f"missing field {loc!r}")
+            elif isinstance(reason, SummaryError):
+                parts.append(f"{loc}: {printable(str(reason))}")
             else:
                 parts.append(f"{loc}: {err['type']}")
         more = exc.error_count() - len(parts)

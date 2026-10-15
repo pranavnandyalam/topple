@@ -83,6 +83,14 @@ jobs:
           uv run topple compare submissions/pid_example.py submissions/lqr_example.py
           submissions/ppo_balance -p balance-v1/standard --seeds 0..199 --workers 4
           --json out/cmp_cal_ci.json
+      # upload-artifact's if-no-files-found fires only when no path matches at all, so a run
+      # missing test_shipped_policy's results.json would otherwise upload the compare alone and
+      # pass. One command per line: bash -e stops on the first file that is missing.
+      - name: Check the ubuntu evidence
+        if: hashFiles('submissions/ppo_balance/policy.onnx') != ''
+        run: |
+          test -f out/ci/results.json
+          test -f out/cmp_cal_ci.json
       - name: Upload the ubuntu evidence
         if: hashFiles('submissions/ppo_balance/policy.onnx') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

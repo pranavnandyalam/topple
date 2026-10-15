@@ -7,7 +7,9 @@ PPO with chosen per-seed results, a ``results.json``, a ``phase2.json``, and a t
 policy (from ``tests/run_support.py``) standing in for ``submissions/ppo_balance`` and its parity
 fixture. A good set passes every gate; each mutation names exactly the gates it breaks. The CI
 check (``scripts/phase2_ci_check.py``) runs against a fake ``gh`` on ``PATH`` and never calls
-GitHub. ``scripts/phase2_done.sh`` is checked against §4's block.
+GitHub. ``scripts/phase2_done.sh`` is checked against §4's block (its ``export && cmp`` line as
+two commands, so errexit sees a failing re-export), with shellcheck when it is installed, and
+run with stand-in ``uv`` and ``git`` on ``PATH``.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import functools
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -439,6 +442,7 @@ def good_tree() -> gate.ResultsTree:
         not_tracked=(),
         untracked=(),
         modified=(),
+        not_regular=(),
     )
 
 
@@ -706,6 +710,74 @@ def test_each_failing_gate_is_named(name: str, good: GoodSet) -> None:
     assert any(words in problem for problems in failed.values() for problem in problems), failed
 
 
+@pytest.mark.parametrize(
+    ("lqr", "ppo", "passes"), [(175, 169, True), (175, 168, False), (91, 85, True)]
+)
+def test_g2b_success_margin_is_exact(lqr: int, ppo: int, passes: bool, good: GoodSet) -> None:
+    """success(PPO) >= success(LQR) - 0.03 at the boundary: 175/200 - 0.03 is exactly
+    169/200 (passes) and 168/200 fails G2b alone; 91/200 - 0.03 is exactly 85/200, which
+    floats get wrong (85/200 < 91/200 - 0.03 in binary), so the gate decides on fractions.
+    PPO's scores stay far above LQR's and PID survives less than PPO."""
+    cal = good.cal(
+        pid=Perf(70.0, 45.0, 80, 6.5, 0.074),
+        lqr=Perf(81.0, 55.0, lqr, 3.3, 0.046),
+        ppo=Perf(97.0, 92.0, ppo, 3.0, 0.03),
+    )
+    assert [sum(e.success) for e in cal.entries] == [80, lqr, ppo]
+    failed = failing(good.inputs(cmp_cal=cal))
+    if passes:
+        assert failed == {}
+    else:
+        assert set(failed) == {"G2b"}, failed
+        assert f"{ppo / 200:.3f} ({ppo}/200)" in failed["G2b"][0]
+
+
+def test_g1_compares_ppo_with_pid_not_lqr(good: GoodSet) -> None:
+    """eval_v1: PPO scores above PID but below LQR, which passes G1."""
+    cmp = good.eval_v1(ppo=Perf(80.0, 55.0, 19, 3.0, 0.03))
+    n = len(cmp.seeds)
+    pid, lqr, ppo = (sum(e.scores) / n for e in cmp.entries)
+    assert pid < ppo < lqr
+    assert failing(good.inputs(cmp_eval=cmp)) == {}
+
+
+def test_g5_needs_32_saturated_rows(good: GoodSet) -> None:
+    """A fixture keeping every unsaturated row but only 31 saturated ones fails G5 alone."""
+    with np.load(io.BytesIO(good.shipped["fixture"])) as npz:
+        members = {k: npz[k] for k in npz.files}
+    saturated = np.abs(members["action_ref"]).max(axis=1) >= 0.999
+    keep = ~saturated
+    keep[np.flatnonzero(saturated)[:31]] = True
+    for key in ("obs", "action_ref", "set"):
+        members[key] = members[key][keep]
+    buf = io.BytesIO()
+    np.savez(buf, **members)
+    failed = failing(good.inputs(fixture=buf.getvalue()))
+    assert set(failed) == {"G5"}
+    assert failed["G5"] == ("31 saturated rows (< 32)",)
+
+
+def test_g6_needs_a_complete_run(good: GoodSet) -> None:
+    results = good.results().model_copy(update={"complete": False})
+    failed = failing(good.inputs(results=results))
+    assert set(failed) == {"G6"}
+    assert "incomplete" in failed["G6"][0]
+
+
+def test_the_policy_entry_must_be_the_submission(good: GoodSet) -> None:
+    """An entry with the shipped ONNX but another submission sha256 (another policy.json, say)
+    is not the submission: every gate reading that compare fails."""
+    other = gate.Subject(sha256="7" * 64, policy_sha256=good.subject.policy_sha256)
+    cal = three_way(CAL, other, pid=PID_CAL, lqr=LQR_CAL, ppo=PPO_CAL)
+    failed = failing(good.inputs(cmp_cal=cal))
+    assert set(failed) == {"G2", "G2b", "G3", "G4"}
+    assert "submission_sha256" in failed["G2"][0]
+    ev = three_way(EVAL, other, pid=PID_EVAL, lqr=LQR_EVAL, ppo=PPO_EVAL)
+    failed = failing(good.inputs(cmp_eval=ev))
+    assert set(failed) == {"G1", "G3"}
+    assert "submission_sha256" in failed["G1"][0]
+
+
 def test_a_missing_input_fails_every_gate_that_reads_it(good: GoodSet) -> None:
     missing = gate.InputError("out/cmp_cal.json: No such file or directory")
     failed = failing(good.inputs(cmp_cal=missing))
@@ -864,6 +936,15 @@ def shipped_is_another_policy(doc: dict[str, Any]) -> None:
     doc["shipped"]["policy_sha256"] = "5" * 64
 
 
+def best_not_by_the_pid_rule(doc: dict[str, Any]) -> None:
+    runs_of(doc)["ppo_s1"]["best"]["rule"] = "none"
+
+
+def no_ablation(doc: dict[str, Any]) -> None:
+    """Without the ablation, G10 could not judge it (§2.3: PPO, SAC and ablation)."""
+    doc["runs"] = [r for r in doc["runs"] if r["role"] != "ablation"]
+
+
 G7_EDITS = {
     "two_sac_runs": (drop_sac, "SAC"),
     "below_pid_gate_unmarked": (unmarked, "below_pid_gate"),
@@ -872,6 +953,8 @@ G7_EDITS = {
     "row_names_another_entry": (wrong_entry, "entry"),
     "ineligible_exported_without_report_only": (ineligible_not_report_only, "report-only"),
     "shipped_is_another_policy": (shipped_is_another_policy, "submission"),
+    "best_not_by_the_pid_rule": (best_not_by_the_pid_rule, "best.rule"),
+    "no_ablation": (no_ablation, "0 ablation runs, not 1"),
 }
 
 
@@ -904,6 +987,7 @@ G8_TREES = {
     "not_tracked": {"not_tracked": ("phase2/hero.mp4",)},
     "untracked_mp4": {"untracked": ("phase2/extra.mp4",)},
     "modified": {"modified": ("phase2.md",)},
+    "symlinked_report": {"not_regular": ("docs/results/phase2.json",)},
 }
 
 
@@ -963,6 +1047,10 @@ G10_EDITS = {
     "short_run": (set_field("sac_s1", num_timesteps=999_999), "num_timesteps"),
     "rss_at_the_bar": (set_field("ppo_s2", peak_tree_rss_mib=6144.0), "peak_tree_rss_mib"),
     "shipped_dirty": (set_field("ppo_s0", git_dirty=True), "git_dirty"),
+    "stale_bundle_on_the_ablation": (
+        set_field("ablate_nopenalty", bundle_hash="8" * 64),
+        "bundle_hash",
+    ),
 }
 
 
@@ -1003,6 +1091,35 @@ def test_g11_needs_two_of_three_ppo_runs(good: GoodSet) -> None:
     assert failing(with_doc(good, lambda doc: weak_ppo(doc, ["ppo_s2"]))) == {}
     failed = failing(with_doc(good, lambda doc: weak_ppo(doc, ["ppo_s1", "ppo_s2"])))
     assert set(failed) == {"G11"}
+    assert "1 of 3" in failed["G11"][0]
+
+
+def make_ineligible(doc: dict[str, Any], run: str, *, score: float) -> None:
+    """``run``'s best (its last checkpoint, now scoring ``score`` on the selection seeds) is
+    below the PID gate, recorded consistently: flag, fresh row and G11 row."""
+    s = runs_of(doc)[run]
+    s["selection_history"][-1].update(eligible=False, score=score)
+    s["best"]["eligible"] = False
+    s["flags"] = ["no_eligible"]
+    for row in doc["fresh"]["rows"]:
+        if row["run"] == run:
+            row.update(report_only=True, below_pid_gate=True)
+    for row in doc["g11"]:
+        if row["run"] == run:
+            row["eligible"] = False
+
+
+def test_g11_counts_only_runs_with_an_eligible_best(good: GoodSet) -> None:
+    """ppo_s1 and ppo_s2 pass G2, G3 and G4 on 0..199 but their bests are not eligible: only
+    ppo_s0 counts. ppo_s1 ranks first on the selection seeds, so a §2.5 replay that ignored
+    eligibility would ship it and G7 would fail too."""
+
+    def two_ineligible(doc: dict[str, Any]) -> None:
+        make_ineligible(doc, "ppo_s1", score=99.0)
+        make_ineligible(doc, "ppo_s2", score=83.0)
+
+    failed = failing(with_doc(good, two_ineligible))
+    assert set(failed) == {"G11"}, failed
     assert "1 of 3" in failed["G11"][0]
 
 
@@ -1056,6 +1173,10 @@ def test_candidates_are_eligible_clean_ppo_runs_by_selection_rank(good: GoodSet)
     runs_of(doc)["ppo_s0"]["flags"] = ["wall_clock_abort"]
     ppo_only = [c for c in cores(doc) if c.run in PPO_RUNS]
     assert common.candidates(ppo_only) == ["ppo_s2", "ppo_s1"]
+    doc = good.doc()
+    make_ineligible(doc, "ppo_s1", score=99.0)  # ranks first, but its best is not eligible
+    ppo_only = [c for c in cores(doc) if c.run in PPO_RUNS]
+    assert common.candidates(ppo_only) == ["ppo_s0", "ppo_s2"]
 
 
 def test_the_section_2_5_fallback_ships_the_next_candidate_on_a_g2b_only_failure(
@@ -1083,9 +1204,24 @@ def test_the_section_2_5_fallback_ships_the_next_candidate_on_a_g2b_only_failure
 
 
 def git(root: Path, *args: str) -> None:
+    """``git`` in ``root`` with neither the developer's global or system config nor their hooks
+    (commit signing or a ``core.hooksPath`` pre-commit hook would fail or run foreign code)."""
+    env = {**common.git_env(), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
     subprocess.run(
-        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            f"core.hooksPath={os.devnull}",
+            *args,
+        ],
         cwd=root,
+        env=env,
         check=True,
         capture_output=True,
         timeout=60,
@@ -1208,6 +1344,30 @@ def test_g8_measures_sizes_without_following_symlinks(good: GoodSet, tmp_path: P
     assert tree.sizes["hero.gif"] is None
 
 
+@needs_git
+@pytest.mark.parametrize("name", ["phase2.json", "phase2.md"])
+def test_g8_refuses_a_committed_symlink_for_the_report(
+    name: str, good: GoodSet, tmp_path: Path
+) -> None:
+    """A committed symlink into the ignored out/ would let the gate read (and phase2.md show)
+    bytes git never sees, however they change: like the results files, it counts as missing."""
+    files = write_files(good, tmp_path)
+    docs = files.root / "docs" / "results"
+    (files.root / "out" / name).write_bytes((docs / name).read_bytes())
+    (docs / name).unlink()
+    (docs / name).symlink_to(files.root / "out" / name)
+    git(files.root, "add", f"docs/results/{name}")
+    git(files.root, "commit", "-q", "-m", "symlink")
+    tree = gate.scan_results(files.results_dir, docs / "phase2.json")
+    assert isinstance(tree, gate.ResultsTree)
+    assert tree.not_regular == (f"docs/results/{name}",)
+    assert (tree.not_tracked, tree.untracked, tree.modified) == ((), (), ())
+    failed = failing(good.inputs(tree=tree))
+    assert set(failed) == {"G8"}
+    message = f"docs/results/{name}: not a regular file (a symlink counts as missing)"
+    assert failed["G8"] == (message,)
+
+
 def test_scanning_outside_a_git_checkout_is_an_input_error(tmp_path: Path) -> None:
     env_ceiling = {"GIT_CEILING_DIRECTORIES": str(tmp_path)}
     (tmp_path / "phase2").mkdir()
@@ -1249,6 +1409,74 @@ def test_error_text_never_echoes_input_values(good: GoodSet, tmp_path: Path) -> 
     assert "\x1b" not in error.message
     assert "‮" not in error.message
     assert "red" not in error.message
+
+
+def put(path: Sequence[str | int], value: object) -> Callable[[dict[str, Any]], None]:
+    def edit(doc: dict[str, Any]) -> None:
+        target: Any = runs_of(doc) if path[0] == "runs" else doc
+        for key in path[1:-1] if path[0] == "runs" else path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+
+    return edit
+
+
+@pytest.mark.parametrize(
+    ("where", "value", "location"),
+    [
+        (("runs", "sac_s1", "peak_tree_rss_mib"), math.nan, "runs.4.summary"),
+        (("runs", "ppo_s0", "selection_history", 0, "score"), math.inf, "runs.0.summary"),
+        (("pilot", "energy_cost_variant", "score"), -math.inf, "pilot"),
+        (("render", "curve"), [1.0, math.nan], "render"),
+        (("render", "ci_run"), 2**53, "render"),
+    ],
+    ids=["nan_in_a_summary", "inf_in_a_history_row", "inf_in_pilot", "nan_in_render", "big_int"],
+)
+def test_phase2_json_refuses_non_finite_and_inexact_numbers(
+    where: Sequence[str | int], value: object, location: str, good: GoodSet, tmp_path: Path
+) -> None:
+    """Contract §15: no NaN or Infinity, also in the free-form objects (Python's json writes
+    NaN by default); integers must be exact in a JSON double. The file is an input error that
+    names where, so G7, G10 and G11 fail by name, never with a traceback."""
+    doc = good.doc()
+    put(where, value)(doc)
+    path = tmp_path / "phase2.json"
+    path.write_text(json.dumps(doc))
+    error = gate.read_report(path)
+    assert isinstance(error, gate.InputError), error
+    assert location in error.message
+    assert "not finite" in error.message or "2**53" in error.message
+    assert set(failing(good.inputs(report=error))) == {"G7", "G10", "G11"}
+    path.write_text(json.dumps(good.doc()).replace('"score": 64.9', '"score": 1e999'))
+    assert isinstance(gate.read_report(path), gate.InputError)
+
+
+def test_a_summary_that_cannot_be_reencoded_names_its_run(good: GoodSet) -> None:
+    """Past the parser (a report built in code, say), a NaN in a summary still fails G7 and
+    G10 by name instead of raising."""
+    report = report_of(good.doc())
+    runs = list(report.runs)
+    runs[5] = runs[5].model_copy(
+        update={"summary": {**runs[5].summary, "peak_tree_rss_mib": math.nan}}
+    )
+    failed = failing(good.inputs(report=report.model_copy(update={"runs": tuple(runs)})))
+    assert set(failed) == {"G7", "G10"}
+    assert all(any("'sac_s2'" in p for p in failed[g]) for g in failed), failed
+
+
+def test_a_summary_error_says_what_is_wrong(good: GoodSet) -> None:
+    """The summary validators' own reasons (fixed text and a number) are named, not just
+    ``value_error``."""
+    failed = failing(with_doc(good, lambda doc: runs_of(doc)["ppo_s1"]["best"].update(step=12)))
+    assert set(failed) == {"G7", "G10", "G11"}
+    for problems in failed.values():
+        assert any(
+            "'ppo_s1'" in p and "best.step 12 must be exactly one selection_history step" in p
+            for p in problems
+        ), problems
+    failed = failing(with_doc(good, set_field("sac_s0", flags=["no_eligible", "no_eligible"])))
+    assert set(failed) == {"G10"}
+    assert "flags must be unique" in failed["G10"][0]
 
 
 # --- phase2_ci_check.py ---------------------------------------------------------------------------
@@ -1419,7 +1647,11 @@ def test_run_command_kills_a_command_that_prints_too_much() -> None:
 # --- phase2_done.sh -------------------------------------------------------------------------------
 
 
-DONE_SH_MARKER = "# docs/design/phase-2.md section 4, verbatim:"
+DONE_SH = SCRIPTS / "phase2_done.sh"
+DONE_SH_MARKER = "# docs/design/phase-2.md section 4 (test_phase2_gate checks these lines):"
+SHELLCHECK_DIRECTIVE = "# shellcheck disable=SC2086  # section 4 splits $S into three submissions"
+REEXPORT = 'uv run topple export "runs/$K" --out "$D"'
+REBUILD_CMP = 'cmp "$D/policy.onnx" submissions/ppo_balance/policy.onnx'
 
 
 def spec_block() -> list[str]:
@@ -1430,40 +1662,138 @@ def spec_block() -> list[str]:
     return block[: block.index("```")].splitlines()
 
 
+def section_4_commands() -> list[str]:
+    """§4's block, with its ``export ... && cmp ...`` line as two commands: errexit ignores a
+    failure on the left of ``&&``, so a failing re-export would skip the ``cmp`` and the script
+    would carry on (the spec block is being changed to two lines; then this is the identity)."""
+    commands: list[str] = []
+    for line in spec_block():
+        if line == f"{REEXPORT} && {REBUILD_CMP}":
+            commands += [REEXPORT, REBUILD_CMP]
+        elif line.strip():
+            commands.append(line)
+    return commands
+
+
+def done_sh_body() -> list[str]:
+    lines = DONE_SH.read_text().splitlines()
+    return [line for line in lines[lines.index(DONE_SH_MARKER) + 1 :] if line.strip()]
+
+
 def test_phase2_done_runs_exactly_the_section_4_commands() -> None:
-    lines = (SCRIPTS / "phase2_done.sh").read_text().splitlines()
+    lines = DONE_SH.read_text().splitlines()
     assert lines[0] == "#!/usr/bin/env bash"
     assert "set -euo pipefail" in lines
-    body = lines[lines.index(DONE_SH_MARKER) + 1 :]
-    assert [line for line in body if line.strip()] == [
-        line for line in spec_block() if line.strip()
-    ]
-    commands = "\n".join(spec_block())
+    assert done_sh_body() == section_4_commands()
+    commands = "\n".join(section_4_commands())
     for needed in (
         "UV_PROJECT_ENVIRONMENT=.venv-eval",
         'find_spec("torch")',
         "topple eval submissions/ppo_balance -p eval_v1",
         "--json out/cmp_cal.json",
-        'cmp "$D/policy.onnx" submissions/ppo_balance/policy.onnx',
+        REEXPORT,
+        REBUILD_CMP,
         "scripts/phase2_ci_check.py",
         "scripts/phase2_gate.py",
     ):
         assert needed in commands
 
 
+def test_phase2_done_never_hides_a_failure_from_errexit() -> None:
+    """``set -e`` does not stop on a failing command left of ``&&`` or ``||``, nor (without
+    ``pipefail``) inside a pipeline, so the done-when runs only simple commands."""
+    for line in done_sh_body():
+        assert "&&" not in line, line
+        assert "||" not in line, line
+    assert done_sh_body().index(REEXPORT) + 1 == done_sh_body().index(REBUILD_CMP)
+
+
 def test_phase2_done_is_valid_bash() -> None:
-    script = SCRIPTS / "phase2_done.sh"
-    assert os.access(script, os.X_OK)
+    assert os.access(DONE_SH, os.X_OK)
+    # §4's block splits $S into three submissions on purpose; shellcheck (preinstalled on CI's
+    # ubuntu-24.04, 0.9.0) reports that as SC2086 and exits 1 unless the file disables it. The
+    # directive must directly follow the shebang to apply to the whole file.
+    assert DONE_SH.read_text().splitlines()[1] == SHELLCHECK_DIRECTIVE
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("no bash")
     result = subprocess.run(
-        [bash, "-n", str(script)], capture_output=True, text=True, timeout=60, check=False
+        [bash, "-n", str(DONE_SH)], capture_output=True, text=True, timeout=60, check=False
     )
     assert result.returncode == 0, result.stderr
     shellcheck = shutil.which("shellcheck")
     if shellcheck is not None:
         checked = subprocess.run(
-            [shellcheck, str(script)], capture_output=True, text=True, timeout=60, check=False
+            [shellcheck, str(DONE_SH)], capture_output=True, text=True, timeout=60, check=False
         )
         assert checked.returncode == 0, checked.stdout
+
+
+STUB_UV = """#!/bin/sh
+# A stand-in uv: logs its arguments, runs nothing. `topple export` follows $STUB_EXPORT.
+printf '%s\\n' "$*" >> "$STUB_LOG"
+case "$*" in
+  *'["shipped"]["run"]'*) echo ppo_s0 ;;
+  "run topple export "*)
+    case "$STUB_EXPORT" in
+      fail) echo "error: runs/ppo_s0 is not a run directory" >&2; exit 2 ;;
+      same) mkdir -p "$6" && cp submissions/ppo_balance/policy.onnx "$6/policy.onnx" ;;
+      other) mkdir -p "$6" && printf 'other bytes' > "$6/policy.onnx" ;;
+    esac ;;
+esac
+exit 0
+"""
+STUB_GIT = """#!/bin/sh
+# A stand-in git: the checkout is $STUB_TOP, clean, at a fixed HEAD.
+case "$*" in
+  "rev-parse --show-toplevel") echo "$STUB_TOP" ;;
+  "rev-parse HEAD") echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+esac
+exit 0
+"""
+
+
+@needs_posix_sh
+@pytest.mark.parametrize(
+    ("export", "passes"),
+    [("same", True), ("fail", False), ("other", False)],
+    ids=["rebuilds_the_shipped_bytes", "export_fails", "export_rebuilds_other_bytes"],
+)
+def test_phase2_done_stops_unless_the_re_export_rebuilds_the_shipped_bytes(
+    export: str, passes: bool, tmp_path: Path
+) -> None:
+    """With stand-in ``uv`` and ``git`` on ``PATH`` (nothing is installed or evaluated): a
+    re-export that fails (``runs/`` is gitignored, so another checkout has none) or rebuilds
+    other bytes stops the script before G9 and the gates; the same bytes let it through."""
+    bash, cmp = shutil.which("bash"), shutil.which("cmp")
+    if bash is None or cmp is None:
+        pytest.skip("needs bash and cmp")
+    bin_dir, top, scratch = tmp_path / "bin", tmp_path / "checkout", tmp_path / "tmp"
+    for d in (bin_dir, top / "submissions" / "ppo_balance", scratch):
+        d.mkdir(parents=True)
+    (top / "submissions" / "ppo_balance" / "policy.onnx").write_bytes(b"shipped onnx bytes")
+    for name, text in (("uv", STUB_UV), ("git", STUB_GIT)):
+        (bin_dir / name).write_text(text)
+        (bin_dir / name).chmod(0o755)
+    log = tmp_path / "calls.log"
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "TMPDIR": str(scratch),
+        "STUB_LOG": str(log),
+        "STUB_TOP": str(top),
+        "STUB_EXPORT": export,
+    }
+    result = subprocess.run(
+        [bash, str(DONE_SH)], capture_output=True, text=True, timeout=60, env=env, check=False
+    )
+    calls = log.read_text()
+    assert "run topple export runs/ppo_s0 --out " in calls
+    if passes:
+        assert result.returncode == 0, result.stderr
+        assert "scripts/phase2_ci_check.py" in calls
+        assert "scripts/phase2_gate.py" in calls
+    else:
+        assert result.returncode != 0
+        assert "phase2_ci_check.py" not in calls
+        assert "phase2_gate.py" not in calls

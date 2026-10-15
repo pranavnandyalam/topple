@@ -22,9 +22,11 @@ reads ``results.json`` (a regular file of at most 16 MiB, never blocking, exact 
 - **G2, G2b, G3 (0..199), G4** hold on the local compare and on the ubuntu one
   (``--ci-dir``), which must record a linux platform, ``cpu_isa`` and onnxruntime.
 - **G5** re-runs batch-1 parity against the fixture (``topple.export``'s parity code), **G6**
-  loads the submission (``load_policy_dir``), **G8** checks the results package's files with
-  local git commands, **G10** reads only ``phase2.json`` and recomputes the selection protocol
-  hash and ``ENV_ALGO_VERSION`` from code. G9 is ``phase2_ci_check.py``.
+  loads the submission (``load_policy_dir``), **G7** also requires the ablation run (so G10
+  judges it), **G8** checks the results package's files (and that ``phase2.json`` and
+  ``phase2.md`` are regular files, not symlinks) with local git commands, **G10** reads only
+  ``phase2.json`` and recomputes the selection protocol hash, ``ENV_ALGO_VERSION`` and the
+  bundle hash from code. G9 is ``phase2_ci_check.py``.
 """
 
 from __future__ import annotations
@@ -42,8 +44,6 @@ from pathlib import Path
 from statistics import median
 from typing import Final
 
-from pydantic import ValidationError
-
 from phase2_common import (
     CHALLENGE_ID,
     FIXTURE_DIR,
@@ -53,6 +53,7 @@ from phase2_common import (
     MAX_RESULTS_ENTRIES,
     MAX_RESULTS_TOTAL_BYTES,
     MIN_G11_RUNS,
+    N_ABLATION_RUNS,
     N_PPO_RUNS,
     N_SAC_RUNS,
     PAIRED_ABS_TOL,
@@ -139,13 +140,16 @@ class ResultsTree:
     """What G8 reads from the file system and git: the size of each ``RESULT_FILES`` entry
     (``None``: missing or not a regular file; symlinks are not followed), the total size of
     ``docs/results/phase2/``, and the paths (relative to the checkout) that are required but not
-    tracked, untracked (not ignored) under the results, or modified since ``HEAD``."""
+    tracked, untracked (not ignored) under the results, modified since ``HEAD``, or (of
+    ``phase2.json`` and ``phase2.md``) missing or not regular files (a committed symlink would
+    let the gate read, and the report show, bytes git never sees)."""
 
     sizes: Mapping[str, int | None]
     total_bytes: int
     not_tracked: tuple[str, ...]
     untracked: tuple[str, ...]
     modified: tuple[str, ...]
+    not_regular: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -460,7 +464,7 @@ def _runs(report: Phase2Report) -> _Runs:
             names.add(name)
         try:
             core = run_core(entry)
-        except ValidationError as exc:
+        except ValueError as exc:  # pydantic's ValidationError is a ValueError
             problems[entry.role].append(f"run {run_label(entry, index)}: {describe_error(exc)}")
             continue
         if core.run in cores:
@@ -477,9 +481,10 @@ def _runs(report: Phase2Report) -> _Runs:
 def gate_g7(inp: GateInputs) -> Problems:
     """phase2.json has 3 PPO and 3 SAC runs, each with a fresh-eval row: its exported policy
     is its best checkpoint's, it is an entry of both fresh comparisons, and a run below the PID
-    gate was exported ``--report-only`` and is marked ``below_pid_gate``. The shipped run is a
-    PPO run exported for shipping, its policy is the submission, and it and its attempts are
-    §2.5's choice among the candidates."""
+    gate was exported ``--report-only`` and is marked ``below_pid_gate``; and the ablation run
+    (§5.1), which G10 judges with the others (§2.3). The shipped run is a PPO run exported for
+    shipping, its policy is the submission, and it and its attempts are §2.5's choice among the
+    candidates."""
     problems = _errors(inp.report, inp.subject)
     if problems:
         return problems
@@ -488,7 +493,12 @@ def gate_g7(inp: GateInputs) -> Problems:
     report = inp.report
     runs = _runs(report)
     problems += runs.all_problems()
-    for role, count, label in (("ppo", N_PPO_RUNS, "PPO"), ("sac", N_SAC_RUNS, "SAC")):
+    expected_runs = (
+        ("ppo", N_PPO_RUNS, "PPO"),
+        ("sac", N_SAC_RUNS, "SAC"),
+        ("ablation", N_ABLATION_RUNS, "ablation"),
+    )
+    for role, count, label in expected_runs:
         if runs.counts[role] != count:
             problems.append(f"phase2.json has {runs.counts[role]} {label} runs, not {count}")
     fresh = report.fresh
@@ -590,6 +600,10 @@ def gate_g8(inp: GateInputs) -> Problems:
     problems += [f"{printable(p)}: not tracked by git" for p in tree.not_tracked]
     problems += [f"{printable(p)}: untracked (commit or remove it)" for p in tree.untracked]
     problems += [f"{printable(p)}: modified since HEAD" for p in tree.modified]
+    problems += [
+        f"{printable(p)}: not a regular file (a symlink counts as missing)"
+        for p in tree.not_regular
+    ]
     if inp.ci_results.controller.policy_sha256 != inp.subject.policy_sha256:
         problems.append("ci_ubuntu/results.json: controller.policy_sha256 is not onnx.sha256")
     return problems
@@ -598,19 +612,20 @@ def gate_g8(inp: GateInputs) -> Problems:
 def gate_g10(inp: GateInputs) -> Problems:
     """Every reported run's summary has exactly the §5.1 fields, no abort flag and no
     ``nondeterministic``, ``num_timesteps >= total_timesteps``, ``peak_tree_rss_mib`` < 6144,
-    and the current selection protocol hash and ``ENV_ALGO_VERSION`` (recomputed here); the
-    shipped run has ``git_dirty: false``."""
+    and the current selection protocol hash, ``ENV_ALGO_VERSION`` and bundle hash (recomputed
+    here; decision log 11); the shipped run has ``git_dirty: false``."""
     problems = _errors(inp.report)
     if problems:
         return problems
     assert isinstance(inp.report, Phase2Report)
     selection_hash = selection_protocol().protocol_hash()
+    bundle_hash = load_challenge(CHALLENGE_ID).bundle_hash()
     names = []
     for index, entry in enumerate(inp.report.runs):
         label = run_label(entry, index)
         try:
             s = run_summary(entry)
-        except ValidationError as exc:
+        except ValueError as exc:  # pydantic's ValidationError is a ValueError
             problems.append(f"run {label}: {describe_error(exc)}")
             continue
         names.append(s.run)
@@ -636,6 +651,11 @@ def gate_g10(inp: GateInputs) -> Problems:
             problems.append(
                 f"run {label}: env_algo_version {s.env_algo_version} is not the current "
                 f"{ENV_ALGO_VERSION}"
+            )
+        if s.bundle_hash != bundle_hash:
+            problems.append(
+                f"run {label}: bundle_hash {s.bundle_hash[:12]} is not the current "
+                f"{bundle_hash[:12]}"
             )
         if s.run == inp.report.shipped.run and s.git_dirty:
             problems.append(f"run {label} (shipped): git_dirty is true")
@@ -817,6 +837,14 @@ def _sizes(results_dir: Path) -> tuple[dict[str, int | None], int]:
     return sizes, total
 
 
+def _is_regular(path: Path) -> bool:
+    """``path`` itself (``lstat``: a symlink is not followed) is a regular file."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
 def scan_results(
     results_dir: Path, report: Path, *, extra_env: Mapping[str, str] | None = None
 ) -> ResultsTree | InputError:
@@ -836,7 +864,9 @@ def scan_results(
         # §4's `git diff --quiet -- docs/results`, and the results package wherever it is.
         rel = [p.relative_to(root).as_posix() for p in (top, doc.parent)]
         required = [(top / r).relative_to(root).as_posix() for r in RESULT_FILES]
-        required += [p.relative_to(root).as_posix() for p in (doc, doc.with_name(PHASE2_MD))]
+        docs = (doc, doc.with_name(PHASE2_MD))
+        required += [p.relative_to(root).as_posix() for p in docs]
+        not_regular = tuple(p.relative_to(root).as_posix() for p in docs if not _is_regular(p))
         tracked = set(_paths(_git(root, ["ls-files", "-z", "--", *required], env)))
         untracked = _paths(
             _git(root, ["ls-files", "-z", "--others", "--exclude-standard", "--", *rel], env)
@@ -850,6 +880,7 @@ def scan_results(
         not_tracked=tuple(p for p in required if p not in tracked),
         untracked=tuple(sorted(untracked)),
         modified=tuple(sorted(modified)),
+        not_regular=not_regular,
     )
 
 

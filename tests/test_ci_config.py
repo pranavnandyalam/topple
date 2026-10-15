@@ -1,11 +1,12 @@
 """The CI workflow and the coverage scopes (docs/design/phase-2.md §7, §4 "Ubuntu evidence").
 
 Three jobs: ``python`` (``-m "not slow and not train"``, coverage, ``TOPPLE_REQUIRE_CC=1``),
-``python-slow`` (``-m "slow and not train"``, then the ubuntu compare of the shipped policy and
-its upload) and ``python-train`` (the train extra, its own coverage scope, the legacy torch
-exporter test advisory). Every action is pinned to a commit sha. The default coverage scope
-omits exactly the five torch modules ``.coveragerc-train`` measures, so the two 80% scopes are
-disjoint. Pushes trigger only on ``main`` until the B12 merge blocker lands.
+``python-slow`` (``-m "slow and not train"``, then the ubuntu compare of the shipped policy, a
+check that both evidence files exist and their upload) and ``python-train`` (the train extra,
+its own coverage scope, the legacy torch exporter test advisory). Every action is pinned to a
+commit sha. The default coverage scope omits exactly the five torch modules
+``.coveragerc-train`` measures, so the two 80% scopes are disjoint, and both exclude the same
+lines. Pushes trigger only on ``main`` until the B12 merge blocker lands.
 """
 
 from __future__ import annotations
@@ -82,9 +83,16 @@ def test_the_slow_job_runs_the_slow_tests_then_the_ubuntu_evidence() -> None:
     assert compare["if"] == SHIPPED
     upload = next(s for s in steps("python-slow") if "upload-artifact" in str(s.get("uses", "")))
     assert upload["if"] == SHIPPED
-    assert upload["with"]["path"].split() == ["out/ci/results.json", "out/cmp_cal_ci.json"]
+    evidence = ["out/ci/results.json", "out/cmp_cal_ci.json"]
+    assert upload["with"]["path"].split() == evidence
     assert upload["with"]["if-no-files-found"] == "error"
-    assert names.index("Test (slow)") < names.index(compare["name"]) < names.index(upload["name"])
+    # if-no-files-found fires only when no path matches at all, so each file is checked first,
+    # one simple command per line (bash -e stops on the first that fails).
+    check = next(s for s in steps("python-slow") if "test -f" in str(s.get("run", "")))
+    assert check["if"] == SHIPPED
+    assert str(check["run"]).splitlines() == [f"test -f {path}" for path in evidence]
+    order = [names.index(s["name"]) for s in (compare, check, upload)]
+    assert names.index("Test (slow)") < order[0] < order[1] < order[2]
     assert workflow()["jobs"]["python-slow"]["env"]["TOPPLE_ARTIFACT_DIR"] == "out/ci"
 
 
@@ -124,3 +132,7 @@ def test_the_coverage_scopes_are_disjoint_and_cover_the_torch_modules() -> None:
     assert "include" not in train["run"]  # ignored when --cov sets the source
     assert train["report"].getint("fail_under") == 80
     assert train["run"].getboolean("branch")
+    # Both 80% scopes count the same lines: --cov-config replaces pyproject's settings.
+    default_report = pyproject["tool"]["coverage"]["report"]
+    assert train["report"]["exclude_also"].strip().splitlines() == default_report["exclude_also"]
+    assert train["run"].getboolean("branch") == run["branch"]
