@@ -3,10 +3,10 @@
 Three jobs: ``python`` (``-m "not slow and not train"``, coverage, ``TOPPLE_REQUIRE_CC=1``),
 ``python-slow`` (``-m "slow and not train"``, then the ubuntu compare of the shipped policy, a
 check that both evidence files exist and their upload) and ``python-train`` (the train extra,
-its own coverage scope, the legacy torch exporter test advisory). Every action is pinned to a
-commit sha. The default coverage scope omits exactly the five torch modules
-``.coveragerc-train`` measures, so the two 80% scopes are disjoint, and both exclude the same
-lines. Pushes trigger only on ``main`` until the B12 merge blocker lands.
+its own coverage scope once ``topple/train/learn.py`` exists, the legacy torch exporter test
+advisory). Every action is pinned to a commit sha; the token is read-only and no checkout keeps
+it. The default coverage scope omits exactly the five torch modules ``.coveragerc-train``
+measures, so the two 80% scopes are disjoint, and both exclude the same lines.
 """
 
 from __future__ import annotations
@@ -29,6 +29,8 @@ SHIPPED_COMPARE = (
     "--json out/cmp_cal_ci.json"
 )
 SHIPPED = "hashFiles('submissions/ppo_balance/policy.onnx') != ''"
+LEARN = "hashFiles('python/topple/train/learn.py')"
+TRAIN_COV = "--cov=topple.train --cov-config=.coveragerc-train --cov-report=term-missing"
 
 
 def workflow() -> dict[str, Any]:
@@ -43,9 +45,14 @@ def steps(job: str) -> list[dict[str, Any]]:
     return found
 
 
+def fold(run: object) -> str:
+    """A ``run:`` folded onto one line."""
+    return " ".join(str(run).split())
+
+
 def runs(job: str) -> list[str]:
     """Each ``run:`` of ``job``, folded onto one line."""
-    return [" ".join(str(s["run"]).split()) for s in steps(job) if "run" in s]
+    return [fold(s["run"]) for s in steps(job) if "run" in s]
 
 
 def pytest_runs(job: str) -> list[str]:
@@ -101,15 +108,38 @@ def test_the_train_job() -> None:
     assert "uv sync --locked --extra train" in commands
     assert any("ruff check ." in c and "ruff format --check ." in c for c in commands)
     assert any(c.endswith("mypy") for c in commands)
-    main, advisory = pytest_runs("python-train")
-    for needed in ("-m train", "-n 2", "--cov=topple.train", "--cov-config=.coveragerc-train"):
-        assert needed in main
-    assert "--ignore=tests/test_pack_torch_legacy.py" in main
-    assert "tests/test_pack_torch_legacy.py" in advisory
-    advisory_steps = [s for s in steps("python-train") if s.get("continue-on-error")]
-    assert len(advisory_steps) == 1
-    assert advisory_steps[0]["continue-on-error"] is True
-    assert " ".join(str(advisory_steps[0]["run"]).split()) == advisory
+    tests = [s for s in steps("python-train") if " pytest " in f" {fold(s.get('run', ''))} "]
+    scoped, interim, advisory = tests
+    # The 80% train scope measures the five torch modules: until learn.py exists none of them
+    # does, coverage reports "No data to report" as 0% and the job would fail on every push
+    # (decision log B37), so the same tests run without the scope until then.
+    assert scoped["if"] == f"{LEARN} != ''"
+    assert interim["if"] == f"{LEARN} == ''"
+    for needed in ("-m train", "-n 2", "--ignore=tests/test_pack_torch_legacy.py"):
+        assert needed in fold(scoped["run"])
+    assert fold(scoped["run"]) == f"{fold(interim['run'])} {TRAIN_COV}"
+    assert "--cov" not in fold(interim["run"])
+    assert "tests/test_pack_torch_legacy.py" in fold(advisory["run"])
+    assert [s for s in steps("python-train") if s.get("continue-on-error")] == [advisory]
+    assert advisory["continue-on-error"] is True
+    assert advisory["if"] == "hashFiles('tests/test_pack_torch_legacy.py') != ''"
+
+
+def test_the_token_is_read_only_and_never_persisted() -> None:
+    """The workflow runs pull-request code (HANDOFF: CI workflows are trust-boundary code)."""
+    doc = workflow()
+    assert doc["permissions"] == {"contents": "read"}
+    assert all("permissions" not in job for job in doc["jobs"].values())
+    checkouts = [
+        s
+        for job in doc["jobs"]
+        for s in steps(job)
+        if str(s.get("uses", "")).startswith("actions/checkout@")
+    ]
+    assert len(checkouts) == len(doc["jobs"])
+    assert all(s["with"] == {"persist-credentials": False} for s in checkouts)
+    # phase2_ci_check.py's "cancelled" message names this setting.
+    assert doc["concurrency"] == {"group": "ci-${{ github.ref }}", "cancel-in-progress": True}
 
 
 def test_every_action_is_pinned_to_a_commit() -> None:

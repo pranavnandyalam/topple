@@ -19,7 +19,8 @@ concurrency:
 # that), `python-slow` runs the sweeps without coverage, `python-train` installs the train extra
 # (torch, stable-baselines3) and runs the `train` tests with their own coverage scope
 # (.coveragerc-train: the five torch modules the default scope omits, so the two 80% scopes are
-# disjoint). Each job's timeout leaves room for another 2x slowdown plus growth.
+# disjoint; applied once topple/train/learn.py exists). Each job's timeout leaves room for
+# another 2x slowdown plus growth.
 # Golden scores: these jobs enforce the linux-x86_64 pins; darwin-arm64 pins are enforced only by
 # test runs on Apple Silicon (tests/test_golden.py says how to re-pin both).
 jobs:
@@ -119,11 +120,20 @@ jobs:
         run: uv run --extra train ruff check . && uv run --extra train ruff format --check .
       - name: Type check
         run: uv run --extra train mypy
+      # The 80% train scope (.coveragerc-train) measures the five torch modules. Until learn.py
+      # exists none of them does, coverage reports "No data to report" as 0% and the job would
+      # fail on every push, so the same tests run without the scope until then (decision log B37).
       - name: Test (train)
+        if: hashFiles('python/topple/train/learn.py') != ''
         run: >-
           uv run --extra train pytest -m train -n 2 -o faulthandler_timeout=600
           --ignore=tests/test_pack_torch_legacy.py
           --cov=topple.train --cov-config=.coveragerc-train --cov-report=term-missing
+      - name: Test (train, before the torch modules)
+        if: hashFiles('python/topple/train/learn.py') == ''
+        run: >-
+          uv run --extra train pytest -m train -n 2 -o faulthandler_timeout=600
+          --ignore=tests/test_pack_torch_legacy.py
       # Advisory: a torch release may remove the legacy (dynamo=False) exporter it packs.
       - name: Test (train, advisory)
         if: hashFiles('tests/test_pack_torch_legacy.py') != ''
