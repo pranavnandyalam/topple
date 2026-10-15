@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import tomllib
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -275,6 +278,26 @@ def drop_normalization(data: bytes) -> bytes:
     return canonicalize(parse(serialize(proto)))
 
 
+def swap_hidden_activations(data: bytes) -> bytes:
+    """The PPO graph with its hidden Tanh nodes turned into Relu (the build refuses to pair Relu
+    hidden layers with a clip(mean) head, so this bug is made by graph surgery)."""
+    proto = parse(data)
+    for i in (4, 6):
+        assert proto.graph.node[i].op_type == "Tanh"
+        proto.graph.node[i].op_type = "Relu"
+    return canonicalize(parse(serialize(proto)))
+
+
+def drop_head_tanh(data: bytes) -> bytes:
+    """The SAC graph without its head Tanh: the head Clip reads the head Gemm directly."""
+    proto = parse(data)
+    graph = proto.graph
+    assert graph.node[8].op_type == "Tanh"
+    graph.node[9].input[0] = graph.node[7].output[0]
+    del graph.node[8]
+    return canonicalize(parse(serialize(proto)))
+
+
 def bug_cases() -> dict[str, tuple[bytes, bytes]]:
     """(correct, buggy) build pairs, one per §6 negative control."""
     ppo, sac = tiny_weights("tanh"), tiny_weights("relu")
@@ -298,12 +321,20 @@ def bug_cases() -> dict[str, tuple[bytes, bytes]]:
                 action=ActionSpec(id="diffdrive.effort.v1", names=("l", "r"), low=-2.0, high=2.0),
             ),
         ),
-        "tanh_relu_swapped": (
-            build(ppo),
-            build(MlpWeights(layers=ppo.layers, activation="relu"), action_rule="clip(mean)"),
-        ),
-        "sac_head_tanh_omitted": (build(sac), build(sac, action_rule="clip(mean)")),
+        "tanh_relu_swapped": (build(ppo), swap_hidden_activations(build(ppo))),
+        "sac_head_tanh_omitted": (build(sac), drop_head_tanh(build(sac))),
     }
+
+
+def test_surgery_negative_controls_change_only_what_they_name() -> None:
+    swapped = parse(swap_hidden_activations(ppo_bytes()))
+    assert tuple(n.op_type for n in swapped.graph.node) == tuple(
+        "Relu" if op == "Tanh" and i in (4, 6) else op for i, op in enumerate(PPO_OPS)
+    )
+    assert inits(swap_hidden_activations(ppo_bytes())) == inits(ppo_bytes())
+    no_tanh = parse(drop_head_tanh(sac_bytes()))
+    assert tuple(n.op_type for n in no_tanh.graph.node) == (*SAC_OPS[:8], "Clip")
+    assert inits(drop_head_tanh(sac_bytes())) == inits(sac_bytes())
 
 
 @pytest.mark.parametrize("case", list(bug_cases()))
@@ -349,6 +380,13 @@ BAD_INPUTS: dict[str, dict[str, Any]] = {
     "zero_epsilon": {"norm": ObsNorm(np.zeros(D), np.ones(D), 0.0, 10.0)},
     "zero_clip": {"norm": ObsNorm(np.zeros(D), np.ones(D), 1e-8, 0.0)},
     "infinite_clip": {"norm": ObsNorm(np.zeros(D), np.ones(D), 1e-8, float("inf"))},
+    "inv_std_overflows_f32": {"norm": ObsNorm(np.zeros(D), np.zeros(D), 1e-80, 10.0)},
+    "mean_overflows_f32": {"norm": ObsNorm(np.full(D, 1e39), np.ones(D), 1e-8, 10.0)},
+    "relu_with_clip_head": {"weights": tiny_weights("relu")},
+    "tanh_with_tanh_head": {
+        "action_rule": "tanh(mean)",
+        "metadata": bad_metadata(action_rule='"tanh(mean)"'),
+    },
     "bad_rule": {"action_rule": "other"},
     "missing_key": {"metadata": bad_metadata(challenge=None)},
     "extra_key": {"metadata": {**bad_metadata(), "topple.note": '"x"'}},
@@ -376,6 +414,56 @@ def test_bad_inputs_raise_value_error(case: str) -> None:
             metadata=args.get("metadata", policy_metadata(balance_spec(), "clip(mean)")),
             action=balance_spec().action,
         )
+
+
+@pytest.mark.parametrize(("activation", "rule"), [("relu", "clip(mean)"), ("tanh", "tanh(mean)")])
+def test_activation_and_head_must_be_one_of_the_two_section_3_2_graphs(
+    activation: str, rule: str
+) -> None:
+    """PPO is Tanh + clip(mean) and SAC is Relu + tanh(mean): any other pairing would build a
+    graph whose ``topple.action_rule`` contradicts its structure match."""
+    weights = tiny_weights(activation)
+    spec = balance_spec()
+    with pytest.raises(ValueError, match="pairs"):
+        build_policy_onnx(
+            weights,
+            tiny_norm(),
+            action_rule=rule,  # type: ignore[arg-type]
+            metadata=policy_metadata(spec, rule),
+            action=spec.action,
+        )
+    rows = fixture_rows()
+    with pytest.raises(ValueError, match="pairs"):
+        reference_actions(weights, tiny_norm(), rule, rows, action=spec.action)
+
+
+@pytest.mark.parametrize(
+    "norm",
+    [
+        ObsNorm(np.zeros(D), np.zeros(D), 1e-80, 10.0),
+        ObsNorm(np.full(D, 1e39), np.ones(D), 1e-8, 10.0),
+    ],
+    ids=["inv_std", "mean"],
+)
+def test_constants_that_overflow_float32_are_refused(norm: ObsNorm) -> None:
+    with pytest.raises(ValueError, match="float32"):
+        build(norm=norm)
+
+
+# §7: onnx and protobuf are imported at module level by topple.policy, so they must be base
+# dependencies; today they are installed by hand because the lock cannot be regenerated.
+@pytest.mark.xfail(
+    strict=True,
+    reason="task #6: move onnx/protobuf to [project] dependencies and re-lock (§7); blocked "
+    "while download.pytorch.org is unreachable. Remove this marker when that lands.",
+)
+def test_onnx_and_protobuf_are_base_dependencies() -> None:
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+    names = {
+        re.split(r"[\s<>=!~;\[]", requirement, maxsplit=1)[0].lower()
+        for requirement in pyproject["project"]["dependencies"]
+    }
+    assert {"onnx", "onnxruntime", "protobuf"} <= names
 
 
 @pytest.mark.parametrize(

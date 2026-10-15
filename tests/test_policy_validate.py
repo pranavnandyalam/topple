@@ -257,11 +257,15 @@ def node_domain(p: onnx.ModelProto) -> None:
 
 @edit_case(2, "field_not_allowed")
 def external_data(p: onnx.ModelProto) -> None:
-    t = p.graph.initializer[0]
-    t.ClearField("raw_data")
-    entry = t.external_data.add()
+    """``external_data`` entries alone (``raw_data`` kept, ``data_location`` unset)."""
+    entry = p.graph.initializer[0].external_data.add()
     entry.key, entry.value = "location", "weights.bin"
-    t.data_location = TensorProto.EXTERNAL
+
+
+@edit_case(2, "field_not_allowed")
+def data_location_external(p: onnx.ModelProto) -> None:
+    """``data_location = EXTERNAL`` alone (``raw_data`` kept, no entries)."""
+    p.graph.initializer[0].data_location = TensorProto.EXTERNAL
 
 
 @edit_case(2, "field_not_allowed")
@@ -843,6 +847,50 @@ def elu_chain_w4096_x52() -> bytes:
     return serialize(chain_model(["Elu"] * 52, 4096))
 
 
+# Chains the unweighted rule accepts (cost <= 2^17 with every OP_WEIGHT 1): only the weights
+# reject them (test_op_weights_reject_chains_the_unweighted_rule_accepts).
+WEIGHTED_CHAINS = {
+    "softplus_chain_w4096_x8": ("Softplus", 8),
+    "elu_chain_w4096_x10": ("Elu", 10),
+    "sigmoid_chain_w4096_x20": ("Sigmoid", 20),
+    "tanh_chain_w4096_x20": ("Tanh", 20),
+}
+
+
+@bytes_case(8, "cost_exceeded")
+def softplus_chain_w4096_x8() -> bytes:
+    return serialize(chain_model(["Softplus"] * 8, 4096))
+
+
+@bytes_case(8, "cost_exceeded")
+def elu_chain_w4096_x10() -> bytes:
+    return serialize(chain_model(["Elu"] * 10, 4096))
+
+
+@bytes_case(8, "cost_exceeded")
+def sigmoid_chain_w4096_x20() -> bytes:
+    return serialize(chain_model(["Sigmoid"] * 20, 4096))
+
+
+@bytes_case(8, "cost_exceeded")
+def tanh_chain_w4096_x20() -> bytes:
+    return serialize(chain_model(["Tanh"] * 20, 4096))
+
+
+@bytes_case(8, "output_not_computed")
+def constant_action() -> bytes:
+    """The action is a Constant: no node computes it, so the batch-major rule never saw it."""
+    value = tensor("", np.zeros((1, A)))
+    value.ClearField("name")
+    k = helper.make_node("Constant", [], ["action"], name="k", value=value)
+    return serialize(graph_model([k]))
+
+
+@bytes_case(8, "output_not_computed")
+def initializer_action() -> bytes:
+    return serialize(graph_model([], [tensor("action", np.zeros((1, A)))]))
+
+
 def reused_256(uses: int) -> onnx.ModelProto:
     """obs -> Gemm(256) -> Tanh -> [Gemm(W) -> Tanh] * uses -> Gemm(2): one 256x256 weight."""
     nodes = [node("Gemm", ["obs", "w_in"], "h0", transB=1), node("Tanh", ["h0"], "t0")]
@@ -990,6 +1038,45 @@ def test_rejected_at_its_check(name: str) -> None:
         assert FIXED.fullmatch(message), message
         assert "<" not in message
         assert "Traceback" not in message
+        assert "raised during" not in message  # the check reported it; it did not crash
+
+
+def test_check2_walks_depth_first_with_own_fields_before_children() -> None:
+    """The walk order fixes which messages a rejection shows (at most ``MAX_MESSAGES``)."""
+    proto = parse(PPO)
+    proto.doc_string = "model"
+    proto.graph.node[3].doc_string = "node 3"
+    proto.graph.node[3].attribute[0].doc_string = "attribute of node 3"
+    proto.graph.node[5].doc_string = "node 5"
+    proto.graph.initializer[0].doc_string = "initializer 0"
+    assert list(validate._check_fields(proto)) == [
+        "field_not_allowed: onnx.ModelProto.doc_string",
+        "field_not_allowed: onnx.NodeProto.doc_string",
+        "field_not_allowed: onnx.AttributeProto.doc_string",
+        "field_not_allowed: onnx.NodeProto.doc_string",
+        "field_not_allowed: onnx.TensorProto.doc_string",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("name", "field"),
+    [("external_data", "external_data"), ("data_location_external", "data_location")],
+)
+def test_each_external_data_field_is_rejected_on_its_own(name: str, field: str) -> None:
+    result = validate_policy_bytes(CASES[name][0](), D, A)
+    assert result == [f"field_not_allowed: onnx.TensorProto.{field}"]
+
+
+@pytest.mark.parametrize("name", list(WEIGHTED_CHAINS))
+def test_op_weights_reject_chains_the_unweighted_rule_accepts(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    op, count = WEIGHTED_CHAINS[name]
+    proto = parse(CASES[name][0]())
+    weighted = static_cost(proto)
+    assert weighted == D * 4096 + count * OP_WEIGHT[op] * 4096 + A * 4096 > MAX_COST
+    monkeypatch.setattr(validate, "OP_WEIGHT", dict.fromkeys(OP_WEIGHT, 1))
+    assert static_cost(proto) <= MAX_COST
 
 
 def test_every_code_names_one_check() -> None:
@@ -1185,6 +1272,29 @@ def test_validated_policy_is_constructible_only_in_validate() -> None:
         v.canonical = b"evil"  # type: ignore[misc]
 
 
+def test_validated_policy_cannot_be_subclassed() -> None:
+    """A subclass could skip the seal in its own ``__post_init__``."""
+    with pytest.raises(TypeError, match="subclass"):
+
+        class Unsealed(ValidatedPolicy):
+            def __post_init__(self, seal: object) -> None:
+                pass
+
+
+def test_make_session_refuses_a_subclass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Even a subclass made despite ``__init_subclass__`` is refused: the type must be exact."""
+    monkeypatch.setattr(ValidatedPolicy, "__init_subclass__", classmethod(lambda cls: None))
+
+    class Unsealed(ValidatedPolicy):
+        def __post_init__(self, seal: object) -> None:
+            pass
+
+    monkeypatch.undo()
+    unsealed = Unsealed(PPO, "0" * 64, 1, D, A, seal=None)
+    with pytest.raises(TypeError, match="ValidatedPolicy"):
+        make_session(unsealed)
+
+
 # --- safe ------------------------------------------------------------------------------------
 
 
@@ -1245,6 +1355,27 @@ def transb_0(p: onnx.ModelProto) -> None:
     p.graph.node[5].ClearField("attribute")
 
 
+def swap_hidden(op: str) -> Callable[[onnx.ModelProto], None]:
+    """The hidden activations replaced by ``op`` (the build refuses such a pairing)."""
+
+    def edit(p: onnx.ModelProto) -> None:
+        for i in (4, 6):
+            p.graph.node[i].op_type = op
+
+    return edit
+
+
+def normalization_bounds(lo: float, hi: float) -> Callable[[onnx.ModelProto], None]:
+    """Symmetric (lo == -hi) but inverted or degenerate normalization Clip bounds: ORT computes
+    min(max(x, lo), hi), a ternary C clip would not, so neither runtime may read them."""
+
+    def edit(p: onnx.ModelProto) -> None:
+        p.graph.initializer[2].raw_data = struct.pack("<f", lo)
+        p.graph.initializer[3].raw_data = struct.pack("<f", hi)
+
+    return edit
+
+
 def float_data_head_bound(p: onnx.ModelProto) -> None:
     t = p.graph.initializer[10]
     t.ClearField("raw_data")
@@ -1264,9 +1395,12 @@ def float_data_head_bound(p: onnx.ModelProto) -> None:
         edited(PPO, extra_gemm_attribute),
         edited(PPO, transb_0),
         edited(PPO, float_data_head_bound),
-        parse(build(tiny_weights("relu"), action_rule="clip(mean)")),
-        parse(build(tiny_weights("tanh"), action_rule="tanh(mean)")),
+        edited(PPO, swap_hidden("Relu")),
+        edited(SAC, swap_hidden("Tanh")),
         parse(canonical(reused_256(1))),
+        edited(PPO, normalization_bounds(5.0, -5.0)),
+        edited(PPO, normalization_bounds(0.0, 0.0)),
+        edited(PPO, normalization_bounds(0.0, -0.0)),
     ],
     ids=[
         "head_clip_2",
@@ -1282,6 +1416,9 @@ def float_data_head_bound(p: onnx.ModelProto) -> None:
         "relu_hidden_clip_head",
         "tanh_hidden_tanh_head",
         "other_graph",
+        "inverted_normalization",
+        "zero_normalization",
+        "signed_zero_normalization",
     ],
 )
 def test_structure_match_other(proto: onnx.ModelProto) -> None:
@@ -1431,14 +1568,18 @@ def test_smoke_feeds_zeros_then_rng1_normals_with_fresh_run_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     timers: list[threading.Timer] = []
-    real_timer = threading.Timer
+    cancelled: list[threading.Timer] = []
 
-    def recording_timer(*args: Any, **kwargs: Any) -> threading.Timer:
-        timer = real_timer(*args, **kwargs)
-        timers.append(timer)
-        return timer
+    class RecordingTimer(threading.Timer):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            timers.append(self)
 
-    monkeypatch.setattr(validate.threading, "Timer", recording_timer)
+        def cancel(self) -> None:
+            cancelled.append(self)
+            super().cancel()
+
+    monkeypatch.setattr(validate.threading, "Timer", RecordingTimer)
     fake = with_fake(monkeypatch, good)
     assert smoke_test(validated(PPO)) == []
     assert len(fake.feeds) == validate.SMOKE_CALLS == 32
@@ -1448,7 +1589,8 @@ def test_smoke_feeds_zeros_then_rng1_normals_with_fresh_run_options(
     assert np.array_equal(np.concatenate(fake.feeds[1:]), normals)
     assert len({id(o) for o in fake.options}) == 32  # a fresh RunOptions per call
     assert len(timers) == 32
-    assert all(t.finished.is_set() for t in timers)  # every timer cancelled
+    assert cancelled == timers  # each timer cancelled exactly once, in call order
+    assert not any(o.terminate for o in fake.options)  # no timer fired
     assert all(not t.is_alive() for t in timers)
 
 

@@ -6,8 +6,9 @@ opset import, producer/doc strings, model domain and version, foreign metadata, 
 I/O named ``x``/``y`` with a static batch of 1, empty and odd node names, a ``;`` in a value
 name, node domains ``""`` and ``"ai.onnx"``, ``Constant`` nodes (a named value tensor with
 ``float_data``, ``value_float``), ``Identity`` nodes (one feeding the output), explicit default
-Gemm attributes in reverse order, ``float_data`` initializers, initializers listed out of
-first-use order and repeated as graph inputs. Packing it gives exactly the first-party build.
+Gemm attributes in reverse order (``alpha`` with a doc string of its own), ``float_data``
+initializers, initializers listed out of first-use order and repeated as graph inputs. Packing
+it gives exactly the first-party build.
 
 Run once from the repository root, then commit the output:
 
@@ -58,8 +59,9 @@ def noncanonical_policy() -> onnx.ModelProto:
     mul = helper.make_node("Mul", ["/norm/Sub_output_0", "inv_std"], ["a;b"], name="/norm/Mul")
     mul.domain = "ai.onnx"
     gemm0 = helper.make_node("Gemm", ["z_id", "layer0.weight", "layer0.bias"], ["h0"], name="g0")
-    for name, value in (("transB", 1), ("transA", 0), ("beta", 1.0), ("alpha", 1.0)):
+    for name, value in (("transB", 1), ("transA", 0), ("beta", 1.0)):
         gemm0.attribute.append(helper.make_attribute(name, value))
+    gemm0.attribute.append(helper.make_attribute("alpha", 1.0, doc_string="a default"))
     nodes = [
         mean_const,
         sub,

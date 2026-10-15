@@ -178,7 +178,9 @@ METADATA_KEY_RE: Final = re.compile(r"topple\.[a-z_]{1,32}")
 _UNSAFE: Final = re.compile(r"[^A-Za-z0-9_.:/-]")
 
 NOT_CANONICAL: Final = "not_canonical: policy.onnx is not canonical; run topple policy pack"
-# The check each rejection code belongs to (codes are the text before the first ":").
+# The check each rejection code belongs to (codes are the text before the first ":"). A check
+# that raises instead reports an ``_EXCEPTION_CODES`` code (or ``validator_error``) with the
+# detail "raised during check N", whatever its code; those codes belong to no check.
 CHECK_OF: Final[Mapping[str, int]] = {
     "onnx_too_large": 1,
     "onnx_parse_failed": 1,
@@ -224,6 +226,7 @@ CHECK_OF: Final[Mapping[str, int]] = {
     "onnx_checker_failed": 8,
     "shape_inference_failed": 8,
     "not_batch_major": 8,
+    "output_not_computed": 8,
     "unused_initializer": 8,
     "dead_node": 8,
     "cost_exceeded": 8,
@@ -250,8 +253,9 @@ _SEAL: Final = object()
 class ValidatedPolicy:
     """Canonical policy bytes that passed checks 1-9, with their identity and static cost.
 
-    Only ``validate_policy_bytes`` can create one (the module-private seal), so holding one
-    proves the bytes were validated: ``make_session`` accepts nothing else.
+    Only ``validate_policy_bytes`` can create one (the module-private seal; no subclass can
+    skip it), so holding one proves the bytes were validated: ``make_session`` accepts
+    nothing else.
     """
 
     canonical: bytes = field(repr=False)
@@ -261,6 +265,10 @@ class ValidatedPolicy:
     action_dim: int
     _: KW_ONLY
     seal: InitVar[object]
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        # a subclass could override __post_init__ and skip the seal
+        raise TypeError("ValidatedPolicy cannot be subclassed")
 
     def __post_init__(self, seal: object) -> None:
         if seal is not _SEAL:
@@ -371,30 +379,49 @@ def _is_utf8(value: object) -> bool:
 def _check_fields(proto: Message) -> Iterator[str]:
     """Check 2: every message has no unknown fields and sets only allow-listed fields, every
     string is valid UTF-8, the opset domain is the default one, and no tensor inside an
-    attribute is named. Disallowed fields are reported, never descended into."""
-    stack: list[tuple[Message, bool]] = [(proto, False)]
-    while stack:
-        message, in_attribute = stack.pop()
-        kind = message.DESCRIPTOR.full_name
-        if len(UnknownFieldSet(message)) > 0:  # msg.UnknownFields() raises on upb protobuf 7
-            yield _msg("unknown_field", kind)
-        allowed = ALLOWED_FIELDS.get(kind, frozenset())
-        inside = in_attribute or kind == "onnx.AttributeProto"
-        children: list[Message] = []
-        for fd, value in message.ListFields():
-            where = f"{kind}.{fd.name}"
-            named_in_attribute = in_attribute and kind == "onnx.TensorProto" and fd.name == "name"
-            if fd.name not in allowed or named_in_attribute:
-                yield _msg("field_not_allowed", where)
-            elif fd.type == fd.TYPE_STRING:
-                values = value if fd.is_repeated else (value,)
-                if not all(_is_utf8(v) for v in values):
-                    yield _msg("invalid_utf8", where)
-                elif kind == "onnx.OperatorSetIdProto" and value not in DEFAULT_DOMAINS:
-                    yield _msg("opset_domain_not_allowed", "only the default domain is allowed")
-            elif fd.type == fd.TYPE_MESSAGE:
-                children.extend(value if fd.is_repeated else (value,))
-        stack.extend((child, inside) for child in reversed(children))
+    attribute is named. Disallowed fields are reported, never descended into.
+
+    Depth first, a message's own fields before its children. The walk keeps one iterator per
+    level, so only the messages on the current path are alive: listing every sibling at once
+    held a wrapper for each of a 1 MiB model's half a million empty nodes (about 130 MiB).
+    """
+    levels: list[tuple[Iterator[Message], bool]] = [(iter((proto,)), False)]
+    while levels:
+        siblings, in_attribute = levels[-1]
+        message = next(siblings, None)
+        if message is None:
+            levels.pop()
+            continue
+        yield from _field_problems(message, in_attribute)
+        inside = in_attribute or message.DESCRIPTOR.full_name == "onnx.AttributeProto"
+        levels.append((_allowed_children(message), inside))
+
+
+def _field_problems(message: Message, in_attribute: bool) -> Iterator[str]:
+    """Check 2's messages about ``message``'s own fields (not its children's)."""
+    kind = message.DESCRIPTOR.full_name
+    if len(UnknownFieldSet(message)) > 0:  # msg.UnknownFields() raises on upb protobuf 7
+        yield _msg("unknown_field", kind)
+    allowed = ALLOWED_FIELDS.get(kind, frozenset())
+    for fd, value in message.ListFields():
+        where = f"{kind}.{fd.name}"
+        named_in_attribute = in_attribute and kind == "onnx.TensorProto" and fd.name == "name"
+        if fd.name not in allowed or named_in_attribute:
+            yield _msg("field_not_allowed", where)
+        elif fd.type == fd.TYPE_STRING:
+            values = value if fd.is_repeated else (value,)
+            if not all(_is_utf8(v) for v in values):
+                yield _msg("invalid_utf8", where)
+            elif kind == "onnx.OperatorSetIdProto" and value not in DEFAULT_DOMAINS:
+                yield _msg("opset_domain_not_allowed", "only the default domain is allowed")
+
+
+def _allowed_children(message: Message) -> Iterator[Message]:
+    """The messages in ``message``'s allow-listed fields, one at a time, in field order."""
+    allowed = ALLOWED_FIELDS.get(message.DESCRIPTOR.full_name, frozenset())
+    for fd, value in message.ListFields():
+        if fd.name in allowed and fd.type == fd.TYPE_MESSAGE:
+            yield from (value if fd.is_repeated else (value,))
 
 
 # --- check 3: header -------------------------------------------------------------------------
@@ -644,9 +671,10 @@ def _tensor_problem(t: TensorProto) -> str | None:
 
 
 def _check_structure(proto: onnx.ModelProto) -> tuple[list[str], int]:
-    """Check 8: the ONNX checker and strict shape inference pass; every node output but a
-    Constant's is float32 ``[batch, 1..4096]``; every initializer is used and every node
-    reaches ``action``; the static cost is at most ``MAX_COST``. Returns (messages, cost)."""
+    """Check 8: the ONNX checker and strict shape inference pass; a node other than a Constant
+    computes ``action``; every node output but a Constant's is float32 ``[batch, 1..4096]``;
+    every initializer is used and every node reaches ``action``; the static cost is at most
+    ``MAX_COST``. Returns (messages, cost)."""
     try:
         onnx.checker.check_model(proto, full_check=True)
     except Exception:
@@ -690,7 +718,11 @@ def _width(info: onnx.ValueInfoProto, batch: str) -> int | None:
 
 
 def _structure_errors(proto: onnx.ModelProto, widths: Mapping[str, int | None]) -> Iterator[str]:
+    """``widths`` holds the output of every node but a Constant, so ``action`` missing from it
+    is produced by a Constant or by no node: the batch-major rule never saw it."""
     graph = proto.graph
+    if graph.output[0].name not in widths:
+        yield _msg("output_not_computed", "'action' must be computed by a node, not a Constant")
     for name, width in widths.items():
         if width is None:
             yield _msg("not_batch_major", f"{safe(name)!r} is not float32 [batch, 1..4096]")
@@ -958,9 +990,11 @@ def _canonical_node(n: onnx.NodeProto, name: str, inputs: list[str], output: str
 
 
 def _canonical_attributes(n: onnx.NodeProto) -> Iterator[AttributeProto]:
+    """The allow-listed parts of each attribute, leaving out every one that is then only its
+    schema default. Default-ness is judged on the attribute as emitted, not as given: a default
+    that carried a field pack drops (an attribute ``doc_string``) is still a default, and
+    judging the input would keep it once and drop it on the next pass (no fixed point)."""
     for a in n.attribute:
-        if _is_default(n.op_type, a):
-            continue
         out = AttributeProto()
         out.name = _text(a.name)
         out.type = a.type
@@ -971,7 +1005,8 @@ def _canonical_attributes(n: onnx.NodeProto) -> Iterator[AttributeProto]:
         if a.HasField("t"):
             out.t.CopyFrom(_canonical_tensor(a.t, None))
         out.floats.extend(a.floats)
-        yield out
+        if not _is_default(n.op_type, out):
+            yield out
 
 
 def _is_default(op: str, a: AttributeProto) -> bool:
@@ -1033,8 +1068,8 @@ def structure_match(proto: onnx.ModelProto) -> Literal["clip(mean)", "tanh(mean)
     A match needs the op types, the wiring (each node reads the previous value and the next
     initializers in §3.2 order), the attributes (only Gemm ``transB = 1``), the §3.2
     initializer shapes with D, H1, H2 and A read from the graph, head Clip bounds bitwise
-    -1.0 / +1.0 and a symmetric, finite normalization Clip. The Phase 8 C path reads the
-    initializers by position, so anything else is ``"other"``.
+    -1.0 / +1.0 and a symmetric, finite normalization Clip with ``hi > 0``. The Phase 8 C
+    path reads the initializers by position, so anything else is ``"other"``.
     """
     ops = tuple(n.op_type for n in proto.graph.node)
     if ops == _SEQUENCES["clip(mean)"] and _matches(proto):
@@ -1101,7 +1136,9 @@ def _bounds_match(tensors: Sequence[TensorProto]) -> bool:
         return False
     (lo,) = struct.unpack("<f", tensors[2].raw_data)
     (hi,) = struct.unpack("<f", tensors[3].raw_data)
-    return math.isfinite(lo) and math.isfinite(hi) and lo == -hi
+    # hi > 0: inverted (lo = +c, hi = -c) or zero bounds are where ORT's min(max(x, lo), hi)
+    # and a ternary C clip disagree, so they are no §3.2 normalization (§3.2: lo = -clip_obs)
+    return math.isfinite(hi) and hi > 0 and lo == -hi
 
 
 # --- smoke test ------------------------------------------------------------------------------

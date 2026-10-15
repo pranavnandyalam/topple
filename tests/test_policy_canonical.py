@@ -19,7 +19,6 @@ from pathlib import Path
 import numpy as np
 import onnx
 import onnx.defs
-import onnx.external_data_helper
 import onnx.numpy_helper
 import pytest
 from onnx import AttributeProto, TensorProto, helper
@@ -83,6 +82,46 @@ def test_fixed_point_of_a_packed_third_party_model() -> None:
     once = canonicalize(parse(FIXTURE.read_bytes()), pack=True)
     assert canonicalize(parse(once), pack=True) == once
     assert canonicalize(parse(once)) == once
+
+
+def default_attributes_with_doc_strings(p: onnx.ModelProto) -> None:
+    for n in p.graph.node:
+        if n.op_type == "Gemm":
+            for name, value in (("alpha", 1.0), ("beta", 1.0), ("transA", 0)):
+                n.attribute.append(helper.make_attribute(name, value, doc_string="d"))
+
+
+def foreign_doc_strings(p: onnx.ModelProto) -> None:
+    p.doc_string = "model"
+    p.graph.doc_string = "graph"
+    for n in p.graph.node:
+        n.doc_string = "node"
+        for a in n.attribute:
+            a.doc_string = "attribute"
+    for t in p.graph.initializer:
+        t.doc_string = "tensor"
+
+
+def identity_wrapped(p: onnx.ModelProto) -> None:
+    p.graph.node[-1].output[0] = "pre"
+    p.graph.node.append(node("Identity", ["pre"], "action"))
+
+
+PACK_INPUTS: dict[str, Callable[[], onnx.ModelProto]] = {
+    "fixture": lambda: parse(FIXTURE.read_bytes()),
+    "default_attributes_with_doc_strings": lambda: edited(PPO, default_attributes_with_doc_strings),
+    "foreign_doc_strings": lambda: edited(SAC, foreign_doc_strings),
+    "identity_wrapped": lambda: edited(PPO, identity_wrapped),
+}
+
+
+@pytest.mark.parametrize("name", list(PACK_INPUTS))
+def test_pack_output_is_a_fixed_point_and_canonical(name: str) -> None:
+    """§3.3 step 3 runs checks 1-9 on pack's output, so it must already be canonical."""
+    once = canonicalize(PACK_INPUTS[name](), pack=True)
+    assert canonicalize(parse(once), pack=True) == once
+    assert canonicalize(parse(once)) == once
+    assert once in (PPO, SAC)
 
 
 def test_float_data_and_raw_data_give_equal_bytes() -> None:
@@ -192,6 +231,33 @@ def test_default_gemm_attributes_are_dropped() -> None:
                 )
 
     assert canonicalize(edited(PPO, explicit)) == PPO
+
+
+DROPPED_ATTRIBUTE_FIELDS = {
+    "doc_string": lambda a: setattr(a, "doc_string", "scale"),
+    "ref_attr_name": lambda a: setattr(a, "ref_attr_name", "alpha"),
+}
+
+
+@pytest.mark.parametrize("extra", list(DROPPED_ATTRIBUTE_FIELDS))
+@pytest.mark.parametrize(("name", "value"), [("alpha", 1.0), ("beta", 1.0), ("transA", 0)])
+def test_pack_drops_a_default_attribute_that_carries_a_dropped_field(
+    name: str, value: float, extra: str
+) -> None:
+    """Default-ness is decided on the attribute pack emits, not on the input: a schema default
+    with a doc string is still a default once the doc string is gone (a fixed point)."""
+
+    def explicit(p: onnx.ModelProto) -> None:
+        attribute = helper.make_attribute(name, value)
+        DROPPED_ATTRIBUTE_FIELDS[extra](attribute)
+        p.graph.node[3].attribute.append(attribute)
+
+    proto = edited(PPO, explicit)
+    once = canonicalize(proto, pack=True)
+    assert once == PPO
+    assert canonicalize(parse(once), pack=True) == once
+    assert canonicalize(parse(once)) == once
+    assert validated(once).canonical == PPO
 
 
 def test_explicit_transb_0_equals_omitted() -> None:
@@ -405,7 +471,6 @@ def test_pack_rejects_external_data_before_any_tensor_read(monkeypatch: pytest.M
         raise AssertionError("tensor read")
 
     monkeypatch.setattr(onnx.numpy_helper, "to_array", forbidden)
-    monkeypatch.setattr(onnx.external_data_helper, "load_external_data_for_model", forbidden)
 
     def external(p: onnx.ModelProto) -> None:
         p.graph.initializer[3].data_location = TensorProto.EXTERNAL
@@ -473,26 +538,34 @@ def duplicate_initializer(p: onnx.ModelProto) -> None:
     p.graph.initializer.append(tensor("c0", np.zeros(D)))
 
 
-@pytest.mark.parametrize(
-    "edit",
-    [
-        two_inputs,
-        two_outputs,
-        duplicate_output,
-        undefined_input,
-        output_is_input,
-        both_payloads,
-        empty_constant,
-        int_constant,
-        opset_16,
-        no_default_opset,
-        duplicate_initializer,
-    ],
-)
+def initializer_shadows_a_node_output(p: onnx.ModelProto) -> None:
+    """Only the definition check sees this: without it pack would silently drop the tensor."""
+    p.graph.initializer.append(tensor("v3", np.zeros((1, 8))))
+
+
+# edit -> (code without pack, code with pack): the fixed code each refusal must carry
+REFUSALS: dict[Callable[[onnx.ModelProto], None], tuple[str, str]] = {
+    two_inputs: ("io_count", "io_count"),
+    two_outputs: ("node_outputs", "node_outputs"),
+    duplicate_output: ("duplicate_value", "duplicate_value"),
+    undefined_input: ("undefined_value", "undefined_value"),
+    output_is_input: ("output_not_computed", "output_not_computed"),
+    both_payloads: ("both_payloads", "both_payloads"),
+    empty_constant: ("constant_value", "constant_value"),
+    int_constant: ("constant_value", "constant_value"),
+    opset_16: ("unsupported_opset", "unsupported_opset"),
+    no_default_opset: ("opset_domain_not_allowed", "bad_opset_import"),
+    duplicate_initializer: ("duplicate_value", "duplicate_value"),
+    initializer_shadows_a_node_output: ("duplicate_value", "duplicate_value"),
+}
+
+
+@pytest.mark.parametrize("edit", list(REFUSALS), ids=lambda edit: edit.__name__)
 @pytest.mark.parametrize("pack", [False, True])
 def test_canonicalize_refuses(edit: Callable[[onnx.ModelProto], None], pack: bool) -> None:
+    code = REFUSALS[edit][pack]
     proto = edited(PPO, edit)
-    with pytest.raises(ValueError):  # noqa: PT011 - fixed codes, checked per case below
+    with pytest.raises(ValueError, match=f"^{code}:"):
         canonicalize(proto, pack=pack)
 
 

@@ -47,6 +47,8 @@ ACTION_RULES: tuple[str, ...] = get_args(ActionRule)
 OPSET = 17
 TINY_STD = 1e-6  # warn when sqrt(var + eps) < TINY_STD * max(1, |mean|)
 _HIDDEN_OP: Mapping[str, str] = {"tanh": "Tanh", "relu": "Relu"}
+# The two §3.2 graphs: PPO (Tanh hidden layers, clip(mean) head), SAC (Relu, tanh(mean)).
+_RULE_OF_ACTIVATION: Mapping[str, ActionRule] = {"tanh": "clip(mean)", "relu": "tanh(mean)"}
 
 F32 = npt.NDArray[np.float32]
 F64 = npt.NDArray[np.float64]
@@ -137,7 +139,7 @@ def build_policy_onnx(
     layers = _checked_layers(w, action)
     obs_dim = layers[0][0].shape[1]
     constants = _norm_constants(norm, obs_dim)
-    rule = _checked_rule(action_rule)
+    rule = _checked_rule(action_rule, w.activation)
     _check_metadata(metadata, rule, action, obs_dim)
     _warn_tiny_std(norm)
     g = _Graph()
@@ -188,7 +190,7 @@ def reference_actions(
     layers = _checked_layers(w, action)
     obs_dim = layers[0][0].shape[1]
     constants = _norm_constants(norm, obs_dim)
-    rule = _checked_rule(action_rule)
+    rule = _checked_rule(action_rule, w.activation)
     if not isinstance(obs, np.ndarray) or obs.dtype != np.float32 or obs.ndim != 2:
         raise ValueError("obs must be a float32 array of rows [N, D]")
     if obs.shape[1] != obs_dim:
@@ -212,12 +214,17 @@ def _activate(activation: str, x: F64) -> F64:
     return out
 
 
-def _checked_rule(action_rule: str) -> ActionRule:
-    if action_rule == "clip(mean)":
-        return "clip(mean)"
-    if action_rule == "tanh(mean)":
-        return "tanh(mean)"
-    raise ValueError(f"action_rule must be one of {ACTION_RULES}")
+def _checked_rule(action_rule: str, activation: str) -> ActionRule:
+    """``action_rule`` if it is the head §3.2 pairs with ``activation`` (which
+    ``_checked_layers`` has checked), else ``ValueError``: any other pairing builds a graph
+    whose structure match is ``"other"``, contradicting the ``topple.action_rule`` it would
+    carry (and the loader would refuse it)."""
+    if action_rule not in ACTION_RULES:
+        raise ValueError(f"action_rule must be one of {ACTION_RULES}")
+    rule = _RULE_OF_ACTIVATION[activation]
+    if action_rule != rule:
+        raise ValueError(f"§3.2 pairs {activation} hidden layers with {rule}, not {action_rule}")
+    return rule
 
 
 def _checked_layers(w: MlpWeights, action: ActionSpec) -> tuple[tuple[F32, F32], ...]:
@@ -259,7 +266,11 @@ def _norm_constants(norm: ObsNorm, obs_dim: int) -> _NormConstants:
     if not (np.isfinite(clip) and clip > 0):
         raise ValueError("clip must be finite and positive in float32")
     inv_std = 1.0 / np.sqrt(var + norm.epsilon)
-    return _NormConstants(mean.astype(np.float32), inv_std.astype(np.float32), clip)
+    with np.errstate(over="ignore"):  # an overflow is refused just below
+        mean32, inv_std32 = mean.astype(np.float32), inv_std.astype(np.float32)
+    if not (np.isfinite(mean32).all() and np.isfinite(inv_std32).all()):
+        raise ValueError("mean and 1 / sqrt(var + eps) must be finite in float32")
+    return _NormConstants(mean32, inv_std32, clip)
 
 
 def _action_bounds(action: ActionSpec) -> tuple[np.float32, np.float32]:

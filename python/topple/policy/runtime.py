@@ -28,7 +28,7 @@ def make_session(v: ValidatedPolicy) -> ort.InferenceSession:
     external data (re-asserted here, though validation already refuses it); ``RuntimeError`` if
     ONNX Runtime did not settle on the CPU provider alone.
     """
-    if not isinstance(v, ValidatedPolicy):
+    if type(v) is not ValidatedPolicy:  # exactly: a subclass could have skipped the seal
         raise TypeError("make_session takes a ValidatedPolicy from validate_policy_bytes")
     reject_external_data(onnx.ModelProto.FromString(v.canonical))
     _scrub_ort_environment()

@@ -207,15 +207,31 @@ def test_open_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 @POSIX_ONLY
 def test_swap_to_a_fifo_after_the_check_never_blocks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_fifo: Callable[[Path], Path]
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A bare FIFO with no writer: only ``O_NONBLOCK`` keeps the open from waiting forever.
+    (``make_fifo``'s writer thread would release a blocking open and hide the bug.)"""
     before = tmp_path / "before.onnx"
     before.write_bytes(b"data")
-    path = make_fifo(tmp_path / "policy.onnx")
+    path = tmp_path / "policy.onnx"
+    os.mkfifo(path)
     fake_lstat(monkeypatch, path, before)  # the check saw a regular file
-    outcome = read_in_thread(path, 64)
+    try:
+        outcome = read_in_thread(path, 64)
+    finally:
+        _release_a_blocked_reader(path)
     assert isinstance(outcome, LoadError)
     assert "changed" in str(outcome)
+
+
+def _release_a_blocked_reader(fifo: Path) -> None:
+    """Open ``fifo`` for writing once without blocking: a reader wrongly blocked in ``open``
+    returns, so its daemon thread ends (ENXIO, no reader waiting, is the passing case)."""
+    try:
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return
+    os.close(fd)
 
 
 def test_swap_to_another_regular_file_is_rejected(
