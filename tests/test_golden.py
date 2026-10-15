@@ -4,8 +4,9 @@ These pin values that must never move once balance-v1 is published (docs/contrac
 controller seed derivation, the scenarios materialized from episode seeds, the bundle and protocol
 hashes, and the baseline controllers' episode scores. A failure here means a change can move a
 fixed controller's score on a fixed seed. Do not "update the numbers": either the change is a bug,
-or it needs a new challenge major version (or an ``ENV_ALGO_VERSION`` bump before publication) and
-a deliberate, reviewed re-pin.
+or it is deliberate and needs a reviewed re-pin: before publication the re-pin itself (with an
+``ENV_ALGO_VERSION`` bump if env code changed, as balance-v1's E_ref recalibration was done),
+after publication a new challenge major version (contract §13).
 
 Seeds, scenario draws and hashes are platform-independent (numpy's ``SeedSequence``/PCG64 raw
 bits and sha256 are portable, and scenario draws apply their affine maps in Python; see

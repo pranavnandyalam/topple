@@ -511,8 +511,9 @@ frozen: 2 × 6.5655 J → `E_ref = 13.1` J, measured on `linux-x86_64`, the cali
 because ranked scores come from it (§13). Physics, unlike scenarios, is only reproducible per
 platform (§14): darwin-arm64 measures 6.49 J, which would round to 13.0 J. 2 × 6.5655 J sits
 0.019 J below the 13.15 rounding boundary (the median averages two seeds' energies 0.093 J apart),
-so a later re-measurement after a physics or dependency change could round elsewhere: E_ref stays
-13.1 regardless, and only a new challenge version recalibrates it.
+so a later re-measurement after a physics or dependency change could round elsewhere: a
+re-measurement alone never changes E_ref. Changing it is a deliberate recalibration: a reviewed
+re-pin before publication, a new challenge version after (§13).
 
 Protocol score = `fsum` of episode scores in seed order / N, and success rate = successes / N,
 where N is the number of episodes the protocol expects: a missing or errored episode counts as 0.

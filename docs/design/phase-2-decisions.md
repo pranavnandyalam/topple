@@ -629,3 +629,19 @@ skeptics) confirmed two findings, fixed in R4 and R5.
 | R4 | The PID median is written 6.5655 J, not 6.566 J (a double rounding of 6.565462 J), in `challenge.yaml`, the contract, the spec, this log and `deferred-risks.md`. The yaml comment is hashed, so the bundle and protocol hashes moved again before any run bound to them: bundle `89a62007…0bbaedd0`, ideal `79450098…`, clean `3f27d1c9…`, standard `b2436063…`, selection `f30ef190…4fcf6287`, calibration `9d3630d3…bde59d5e` (the values R1 cites are these). | Review finding C1 (confirmed). A frozen file must be right before publication; no training had started. |
 | R5 | Contract preamble and §13: calibrated values freeze when their challenge is **published**; before that, a change is a reviewed re-pin of hashes and goldens (as R1). Contract §12 notes that 2 × 6.5655 J sits 0.019 J below the 13.15 boundary and that E_ref stays 13.1 regardless of later re-measurements. | Review finding C2 (confirmed): the contract said "frozen at the end of Phase 1" and "E_ref needs balance-v2", which contradicted R1. The boundary note answers the reproduction reviewer's robustness finding. |
 | R6 | Spec consistency (LOW findings C4–C8): §0's selection-vs-calibration example uses the linux numbers; known answers labelled v5.3; the `test_driver_golden` example names E_ref 13.0; §8.7 waypoint calibration runs on linux-x86_64; §9/§10 no longer list darwin-only calibration as open, only the darwin golden re-pin (R2). | Keeps the spec consistent with R1. |
+| R7 | Re-review of R4–R6 (one verifier): contract §12 now says a re-measurement alone never changes E_ref and a change is a deliberate recalibration (re-pin before publication, new version after), matching the preamble and §13; `tests/test_golden.py`'s docstring says the same; §8 states that waypoint-v1 freezes at the end of 2b, earlier than §13 requires. | Remaining contradiction (MEDIUM) and wording (LOW) found by the re-review. |
+
+## Owner answers (2026-10-15, spec v5.3)
+
+Pranav's answers to the open questions in `HANDOFF.md` (defaults unless stated).
+
+| # | Question | Answer | Effect |
+|---|---|---|---|
+| A1 | Re-measure E_ref on Linux before 2a training? | Yes | Done: E_ref changed, Pranav chose to recalibrate (R1). |
+| A2 | Keep `topple.traj/1` frozen for balance-v1, `topple.traj/2` for other challenges? | Yes | §8.1a as written. |
+| A3 | Waypoint scene `offheight=960` for a 960×960 video, or render ≤ 1280×720? | Render ≤ 1280×720 | §8.2: the waypoint scene is byte-identical to balance-v1's (offscreen 1280×720); §8.9 item 8's MP4 is 720×720 (the GIF stays 480×480). |
+| A4 | One ~7-minute PPO confirmation run on the merged env before building 2a? | Yes | Not run yet: the cloud environment blocks the torch wheel hosts; it runs once torch is installable, before any training of slice 3. The torch-free slices proceed meanwhile. |
+| A5 | Mention `topple.traj/2` in PLAN.md's architecture tree? | Yes, when 2b is built | A 2b task. |
+| A6 | Drop `EvalProtocol.is_named` (S12)? | Yes | §5.3 as written (no `is_named`). |
+| A7 | Commit the round-1/2 critique JSON files? | Skip | They exist only on the old Mac session. |
+| A8 | Where does the old Phase 3 draft live? | On `phase-3-design` only | Cherry-pick only its docs later. |

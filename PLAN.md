@@ -433,7 +433,7 @@ parts ordering, which should happen in month 2 to absorb shipping time.
 7. **Accounts** (Cloudflare, Onshape EDU, domain, optional Anthropic API key): created when a phase needs them, with Pranav doing the signup.
 8. **Direction (2026-10-11):** a workbench for people's own robot projects (Studio: desktop + browser), plus an Arena with FRC drive practice. See section 0 for the revised build order.
 9. **Audience and scope (2026-10-15):** all three audiences (makers, students/FRC, researchers), any robot type, hardware optional; the FRC season target is still open (section 0).
-10. **Calibration platform (2026-10-15):** challenges are calibrated on the ranked platform (linux-x86_64); balance-v1's E_ref moved 13.0 → 13.1 J (`docs/design/phase-2-decisions.md`, rows R1–R3).
+10. **Calibration platform (2026-10-15):** challenges are calibrated on the ranked platform (linux-x86_64); balance-v1's E_ref moved 13.0 → 13.1 J (`docs/design/phase-2-decisions.md`, rows R1–R6).
 
 ---
 

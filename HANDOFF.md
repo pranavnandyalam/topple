@@ -27,19 +27,22 @@ Work branch: **`phase-2-learn`** (based on `main`). Its PR should be opened when
 1. ~~Ask Pranav the open questions~~ (answered 2026-10-15; see below).
 2. ~~Linux re-measure of calibration~~ (done: E_ref 13.1, see the table). **Mac session: re-pin the
    darwin-arm64 golden scores** in `tests/test_golden.py` (the STALE comment there points here).
-3. **Build Phase 2a** from `docs/design/phase-2.md`, in small slices, each with its own review:
+3. **PPO confirmation probe** (Q4: yes): one ~7-minute run of the §0 recipe on the recalibrated env,
+   before any slice-3 training. Blocked in the cloud until torch installs (Network row above).
+4. **Build Phase 2a** from `docs/design/phase-2.md`, in small slices, each with its own review:
    1. ONNX validator + canonicalization, data-only `topple.policy/1` submissions, hardened
       `ONNXPolicy` runtime (no training needed);
    2. training pipeline (PPO config, wrappers, action-excess penalty, selection on seeds 2000..2199,
       CPU budgets) + torch-free `topple export` + parity tests;
    3. train 3 seeds, export, run done-when gates G1–G10, side-by-side PID vs PPO video.
-4. Phase 2a review gate (below), fix, merge. Then Phase 2b (waypoint-v1, `topple.traj/2`).
-5. Then follow the revised build order in `PLAN.md` section 0.
+5. Phase 2a review gate (below), fix, merge. Then Phase 2b (waypoint-v1, `topple.traj/2`).
+6. Then follow the revised build order in `PLAN.md` section 0.
 
 ## Answers from Pranav (2026-10-15)
 
 Q1–Q8 took the defaults in brackets (Q1: re-measured, and E_ref changed, so he chose to recalibrate
-to 13.1). Q9: all of the above (makers, students/FRC, researchers). Q10: any robot. Q11: hardware
+to 13.1); decision log rows A1–A8 record each answer's effect (A3: the waypoint scene stays
+identical to balance-v1's, MP4 720×720). Q9: all of the above (makers, students/FRC, researchers). Q10: any robot. Q11: hardware
 optional. Q12: FRC season still open. PLAN.md section 0 and decisions 9–10 record them.
 
 The original questions, for reference (defaults in brackets):

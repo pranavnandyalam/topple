@@ -5,8 +5,9 @@ v5 resolves re-critique round 3. Every issue from the six critiques (`wf_3f0c2a9
 `docs/design/phase-2-decisions.md`. v5.1 syncs the spec with the merged Phase 1 (main `f997394`,
 PR #3); its changes are rows S1–S22 of the log's "Sync with merged Phase 1". v5.2 fixes the 18
 findings of the sync's adversarial verification (rows V1–V18 of the log's "Sync verification").
-v5.3 records the linux-x86_64 recalibration (E_ref 13.0 → 13.1; row R1 of the log's
-"Linux recalibration").
+v5.3 records the linux-x86_64 recalibration (E_ref 13.0 → 13.1; rows R1–R6 of the log's
+"Linux recalibration") and Pranav's answers to the open questions (rows A1–A8 of "Owner answers"),
+which keep the waypoint scene identical to balance-v1's (§8.2).
 
 The design builds on the merged Phase 1 code and `docs/contract.md` ("contract §n", also for a
 list such as "contract §9, §14"; a bare §n is this spec): `controller_obs(obs_arr, t)`,
@@ -1049,6 +1050,10 @@ train"`; torch-free):
 
 ## 8. Phase 2b: `waypoint-v1` (frozen at the end of 2b)
 
+waypoint-v1 freezes at the end of 2b, earlier than contract §13 requires (there a challenge
+freezes when it is published, Phase 3): after the 2b freeze it is treated as published, so any
+change to a fixed controller's score on a fixed seed is `waypoint-v2`, not a re-pin.
+
 ### 8.1 Generalization (balance-v1 must not change)
 
 balance-v1 `protocol_hash`, scores, success and every existing metric value MUST NOT change; new
@@ -1081,7 +1086,7 @@ metric keys may be added (`fall_cause`, §8.5). Golden tests pin the existing ke
   constant. Waypoint: **before the 2b freeze**, every course-generator, event or observation code
   change bumps it (nothing is published, and stale 2b runs become detectable, §8.9 item 11); **at
   the freeze** its value is recorded in `phase2.json`; **after the freeze** any change to a fixed
-  controller's score on a fixed seed is `waypoint-v2` (contract §13), and the version only guards
+  controller's score on a fixed seed is `waypoint-v2` (the early freeze above, then contract §13), and the version only guards
   against accidental drift. Stream `TARGETS = 6` and `balancer-target.obs.v1` freeze at the same
   point.
 - **Dispatch** through the registry (Phase 1 hard-codes balance in each): `iter_episodes` and
@@ -1152,9 +1157,10 @@ D = `len(TaskSpec.obs_features)` of its challenge, 1 ≤ D ≤ `MAX_OBS_WIDTH = 
 
 - **Identity.** gym id `topple/Waypoint-v1`; action `diffdrive.effort.v1`; `robot/` byte-identical
   to balance-v1's (test on `robot_hash`), so it passes `validate_robot` (contract §3) as is.
-  `scene.xml` is balance-v1's (same options, lights, `grid` material, 40 × 40 m plane `floor` at
-  z = 0) except `<global offwidth="1280" offheight="960"/>`: `video.py` refuses frames larger than
-  the offscreen buffer, and the §8.9 MP4 is 960×960. The scene holds no other world geom or site
+  `scene.xml` is byte-identical to balance-v1's (same options, lights, `grid` material, 40 × 40 m
+  plane `floor` at z = 0, `<global offwidth="1280" offheight="720"/>`; decision log A3):
+  `video.py` refuses frames larger than the offscreen buffer, so the §8.9 MP4 is 720×720. The
+  scene holds no other world geom or site
   (`validate_robot` refuses them) and no name the robot uses (`build_model`), so gates and the dock
   are drawn by the renderer, never as scene geoms.
 - **Episode.** `episode_seconds: 20.0` (`max_steps` 2000), `control_dt: 0.01`.
@@ -1507,7 +1513,7 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
    - Trim: `e_i` = t_finish if docked, t_fall if fell, else 20 s; end = min(20 s, max_i e_i +
      1.5 s). A docked robot keeps playing; a fallen robot plays its 1.0 s epilogue, then holds
      with a `FELL at t` stamp.
-   - MP4 960×960 at 50 fps, ≤ 8 MB; GIF 480×480 ≤ 5 MB (waypoint ladder, §5.2).
+   - MP4 720×720 at 50 fps, ≤ 8 MB; GIF 480×480 ≤ 5 MB (waypoint ladder, §5.2).
    - **Waypoint failure gallery:** PPO's 3 lowest-scoring seeds on 0..399 as overview GIFs at
      480×480 (gallery ladder from 10 fps, ≤ 3 MB each), captioned with `fall_cause`, t_fall and
      the current waypoint index.
