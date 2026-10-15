@@ -146,9 +146,24 @@ RESULT_FILES: Final[Mapping[str, int | None]] = {
     "shove.png": None,
     "ci_ubuntu/results.json": MAX_RESULTS_BYTES,
     "ci_ubuntu/cmp_cal.json": MAX_RESULTS_BYTES,
+    "ci_ubuntu/source.json": 4096,
 }
 """Every required file of ``docs/results/phase2/`` (§5.2 items 1, 3, 4, 5 and the ubuntu
-evidence) and its size cap in bytes (``None``: only the total cap applies). ``MB`` is 10^6."""
+evidence with its source) and its size cap in bytes (``None``: only the total cap applies).
+``MB`` is 10^6."""
+CI_SOURCE_FILE: Final = "source.json"
+"""Beside the ubuntu evidence (``--ci-dir``): the CI run it came from (``CiSource``)."""
+MAX_CI_SOURCE_BYTES: Final = 4096
+EVIDENCE_PATHS: Final = (
+    "python",
+    "submissions",
+    "pyproject.toml",
+    "uv.lock",
+    ".github/workflows/ci.yml",
+    "tests/test_shipped_policy.py",
+)
+"""What produces the ubuntu evidence's numbers: G8 fails if any of these changed between the CI
+run's commit and HEAD (§4), so the evidence is what HEAD's code computes."""
 MAX_RESULTS_TOTAL_BYTES: Final = 20 * MB
 """§5.2: all of ``docs/results/phase2/``."""
 MAX_RESULTS_ENTRIES: Final = 256
@@ -436,6 +451,23 @@ class Phase2Report(_Strict):
     """Pilot constants (§5.1), each with its ``source``."""
     render: FreeObject
     """Values only ``phase2.md`` renders (shove curves, GIF rungs, the CI run id, ...)."""
+
+
+class CiSource(_Strict):
+    """``ci_ubuntu/source.json`` (``topple.ci_source/1``, written by ``phase2_results.py
+    --fetch-ci``): the CI run the ubuntu evidence was downloaded from, a ``push`` run (never
+    ``pull_request``) of ``branch`` at ``head_sha``."""
+
+    format: Literal["topple.ci_source/1"]
+    run_id: Annotated[int, Field(ge=1, lt=MAX_SEED)]
+    head_sha: GitCommit
+    event: Literal["push"]
+    branch: Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.][A-Za-z0-9_./-]{0,254}$")]
+
+
+def parse_ci_source(data: bytes) -> CiSource:
+    """``data`` as ``ci_source/source.json``: exact JSON types, every field required."""
+    return CiSource.model_validate_json(data, strict=True)
 
 
 def parse_phase2(data: bytes) -> Phase2Report:

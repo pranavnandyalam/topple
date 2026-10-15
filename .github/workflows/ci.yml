@@ -76,8 +76,10 @@ jobs:
       # The ubuntu half of G2-G4 (docs/design/phase-2.md §4), once a policy is shipped: the pool
       # clamps --workers 4 to the runner's 2 vCPUs. phase2_results.py --fetch-ci copies both
       # files to docs/results/phase2/ci_ubuntu/ from the run whose results.json is this policy's.
+      # Push runs only: a pull request runs its own code, which need not be the code the policy
+      # ships with, so its numbers are never evidence (G8 also checks the run's commit, B40).
       - name: Ubuntu compare (0..199)
-        if: hashFiles('submissions/ppo_balance/policy.onnx') != ''
+        if: github.event_name == 'push' && hashFiles('submissions/ppo_balance/policy.onnx') != ''
         run: >-
           uv run topple compare submissions/pid_example.py submissions/lqr_example.py
           submissions/ppo_balance -p balance-v1/standard --seeds 0..199 --workers 4
@@ -86,12 +88,12 @@ jobs:
       # missing test_shipped_policy's results.json would otherwise upload the compare alone and
       # pass. One command per line: bash -e stops on the first file that is missing.
       - name: Check the ubuntu evidence
-        if: hashFiles('submissions/ppo_balance/policy.onnx') != ''
+        if: github.event_name == 'push' && hashFiles('submissions/ppo_balance/policy.onnx') != ''
         run: |
           test -f out/ci/results.json
           test -f out/cmp_cal_ci.json
       - name: Upload the ubuntu evidence
-        if: hashFiles('submissions/ppo_balance/policy.onnx') != ''
+        if: github.event_name == 'push' && hashFiles('submissions/ppo_balance/policy.onnx') != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ubuntu-evidence

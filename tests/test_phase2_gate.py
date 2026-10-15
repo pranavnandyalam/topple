@@ -34,6 +34,7 @@ from typing import Any, get_args
 
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
 import phase2_ci_check as ci_check
 import phase2_common as common
@@ -449,6 +450,27 @@ def good_tree() -> gate.ResultsTree:
     )
 
 
+CI_HEAD = "c1" * 20
+
+
+def ci_source_doc(**changes: Any) -> dict[str, Any]:
+    return {
+        "format": "topple.ci_source/1",
+        "run_id": 38822681250,
+        "head_sha": CI_HEAD,
+        "event": "push",
+        "branch": "phase-2-learn",
+        **changes,
+    }
+
+
+def good_ci_source(**changes: Any) -> gate.CiProvenance:
+    """The ubuntu evidence's run: a push of an ancestor of HEAD that changed no evidence path
+    since."""
+    source = common.parse_ci_source(json.dumps(ci_source_doc()).encode())
+    return replace(gate.CiProvenance(source=source, is_ancestor=True, changed=()), **changes)
+
+
 @dataclass(frozen=True)
 class GoodSet:
     """Every gate input, all passing; ``inputs(**changes)`` swaps any of them."""
@@ -483,6 +505,7 @@ class GoodSet:
             report=report_of(self.doc()),
             ci_results=self.results(),
             ci_cmp=self.cal(),
+            ci_source=good_ci_source(),
             subject=self.subject,
             policy=self.shipped["policy"],
             fixture=self.shipped["fixture"],
@@ -1104,6 +1127,48 @@ G8_TREES = {
 }
 
 
+G8_CI_SOURCES = {
+    "not_an_ancestor": (good_ci_source(is_ancestor=False), "not an ancestor of HEAD"),
+    "code_changed_since": (
+        good_ci_source(changed=("python/topple/compare.py",)),
+        "python/topple/compare.py",
+    ),
+    "unreadable": (gate.InputError("ci_ubuntu/source.json: No such file"), "No such file"),
+}
+
+
+@pytest.mark.parametrize("name", G8_CI_SOURCES)
+def test_g8_binds_the_ubuntu_evidence_to_this_branch_and_code(name: str, good: GoodSet) -> None:
+    """The ubuntu evidence must come from a push run of an ancestor of HEAD whose evidence
+    paths (code, submissions, lock, workflow) HEAD has not changed (§4, decision log B40)."""
+    source, words = G8_CI_SOURCES[name]
+    failed = failing(good.inputs(ci_source=source))
+    assert set(failed) == {"G8"}, failed
+    assert any(words in p for p in failed["G8"]), failed["G8"]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"event": "pull_request"},
+        {"event": "workflow_dispatch"},
+        {"head_sha": "C1" * 20},
+        {"head_sha": "-" + "c" * 39},
+        {"run_id": 0},
+        {"branch": "--upload-pack=x"},
+        {"format": "topple.ci_source/2"},
+        {"extra": 1},
+    ],
+)
+def test_the_ci_source_is_read_strictly(changes: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        common.parse_ci_source(json.dumps(ci_source_doc(**changes)).encode())
+    doc = ci_source_doc()
+    del doc["format"]
+    with pytest.raises(ValidationError, match="format"):
+        common.parse_ci_source(json.dumps(doc).encode())
+
+
 @pytest.mark.parametrize("name", G8_TREES)
 def test_g8_names_a_bad_results_package(name: str, good: GoodSet) -> None:
     tree = replace(good_tree(), **G8_TREES[name])
@@ -1302,11 +1367,11 @@ def test_the_section_2_5_fallback_ships_the_next_candidate_on_a_g2b_only_failure
 # --- reading the inputs from files ----------------------------------------------------------------
 
 
-def git(root: Path, *args: str) -> None:
+def git(root: Path, *args: str) -> str:
     """``git`` in ``root`` with neither the developer's global or system config nor their hooks
     (commit signing or a ``core.hooksPath`` pre-commit hook would fail or run foreign code)."""
     env = {**common.git_env(), "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
-    subprocess.run(
+    return subprocess.run(
         [
             "git",
             "-c",
@@ -1323,8 +1388,9 @@ def git(root: Path, *args: str) -> None:
         env=env,
         check=True,
         capture_output=True,
+        text=True,
         timeout=60,
-    )
+    ).stdout
 
 
 @dataclass(frozen=True)
@@ -1335,7 +1401,14 @@ class Files:
 
 
 def write_files(good: GoodSet, root: Path) -> Files:
-    """A checkout-like tree: out/ with the local evidence and docs/results/ committed to git."""
+    """A checkout-like tree: a first commit with the code, then out/ with the local evidence
+    and docs/results/ committed to git, its ubuntu evidence from a CI run of the first."""
+    git(root, "init", "-q")
+    (root / "python").mkdir()
+    (root / "python" / "code.py").write_text("x = 1\n")
+    git(root, "add", "python")
+    git(root, "commit", "-q", "-m", "code")
+    ci_head = git(root, "rev-parse", "HEAD").strip()
     out = root / "out"
     (out / "ppo_eval_v1").mkdir(parents=True)
     (out / "cmp_cal.json").write_text(to_json(good.cal()))
@@ -1348,10 +1421,11 @@ def write_files(good: GoodSet, root: Path) -> Files:
         (results_dir / rel).write_bytes(b"x" * 100)
     write_results(good.results(), results_dir / "ci_ubuntu" / "results.json")
     (results_dir / "ci_ubuntu" / "cmp_cal.json").write_text(to_json(good.cal()))
+    source = ci_source_doc(head_sha=ci_head)
+    (results_dir / "ci_ubuntu" / "source.json").write_text(json.dumps(source))
     (docs / "phase2.json").write_text(json.dumps(good.doc(), indent=1))
     (docs / "phase2.md").write_text("# Phase 2\n")
     (root / ".gitignore").write_text("*.mp4\n!docs/results/**/*.mp4\n/out/\n")
-    git(root, "init", "-q")
     git(root, "add", ".gitignore", "docs")
     git(root, "commit", "-q", "-m", "results")
     argv = [
@@ -1465,6 +1539,38 @@ def test_g8_refuses_a_committed_symlink_for_the_report(
     assert set(failed) == {"G8"}
     message = f"docs/results/{name}: not a regular file (a symlink counts as missing)"
     assert failed["G8"] == (message,)
+
+
+@needs_git
+def test_the_ci_source_is_checked_against_git(good: GoodSet, tmp_path: Path) -> None:
+    """From a real checkout: the CI run's commit is an ancestor of HEAD with no evidence path
+    changed since; a code change after it, a commit off HEAD's history or one git does not
+    have each fail G8."""
+    files = write_files(good, tmp_path)
+    path = files.results_dir / "ci_ubuntu" / "source.json"
+    found = gate.read_ci_source(path)
+    assert isinstance(found, gate.CiProvenance), found
+    assert (found.is_ancestor, found.changed) == (True, ())
+    (files.root / "python" / "code.py").write_text("x = 2\n")
+    (files.root / "uv.lock").write_text("lock\n")
+    git(files.root, "add", "python", "uv.lock")
+    git(files.root, "commit", "-q", "-m", "code after the CI run")
+    found = gate.read_ci_source(path)
+    assert isinstance(found, gate.CiProvenance), found
+    assert (found.is_ancestor, found.changed) == (True, ("python/code.py", "uv.lock"))
+    assert set(failing(good.inputs(ci_source=found))) == {"G8"}
+    git(files.root, "checkout", "-q", "-b", "elsewhere", "HEAD~1")
+    (files.root / "other.txt").write_text("other\n")
+    git(files.root, "add", "other.txt")
+    git(files.root, "commit", "-q", "-m", "off HEAD's history")
+    elsewhere = git(files.root, "rev-parse", "HEAD").strip()
+    git(files.root, "checkout", "-q", "-")
+    path.write_text(json.dumps(ci_source_doc(head_sha=elsewhere)))
+    found = gate.read_ci_source(path)
+    assert isinstance(found, gate.CiProvenance), found
+    assert found.is_ancestor is False
+    path.write_text(json.dumps(ci_source_doc(head_sha="0" * 40)))
+    assert isinstance(gate.read_ci_source(path), gate.InputError)
 
 
 def test_scanning_outside_a_git_checkout_is_an_input_error(tmp_path: Path) -> None:

@@ -28,7 +28,9 @@ SHIPPED_COMPARE = (
     "submissions/ppo_balance -p balance-v1/standard --seeds 0..199 --workers 4 "
     "--json out/cmp_cal_ci.json"
 )
-SHIPPED = "hashFiles('submissions/ppo_balance/policy.onnx') != ''"
+# Only push runs carry evidence (§4): a pull request's run executes its own code, which need not
+# be the code the policy is shipped with.
+SHIPPED = "github.event_name == 'push' && hashFiles('submissions/ppo_balance/policy.onnx') != ''"
 LEARN = "hashFiles('python/topple/train/learn.py')"
 TRAIN_COV = "--cov=topple.train --cov-config=.coveragerc-train --cov-report=term-missing"
 

@@ -48,9 +48,12 @@ from typing import Final
 
 from phase2_common import (
     CHALLENGE_ID,
+    CI_SOURCE_FILE,
+    EVIDENCE_PATHS,
     FIXTURE_DIR,
     LOCAL_SHIP_GATES,
     LQR_SUBMISSION,
+    MAX_CI_SOURCE_BYTES,
     MAX_MEAN_SATURATION,
     MAX_PEAK_TREE_RSS_MIB,
     MAX_RESULTS_ENTRIES,
@@ -68,6 +71,7 @@ from phase2_common import (
     SHIP_GATES,
     SUCCESS_MARGIN,
     UBUNTU_GATES,
+    CiSource,
     CommandError,
     Fresh,
     FreshRow,
@@ -80,6 +84,7 @@ from phase2_common import (
     describe_error,
     eval_protocol,
     git_env,
+    parse_ci_source,
     printable,
     read_input,
     read_phase2,
@@ -158,6 +163,17 @@ class ResultsTree:
 
 
 @dataclass(frozen=True)
+class CiProvenance:
+    """Where the ubuntu evidence came from (``ci_ubuntu/source.json``) and what local git says
+    about that run's commit: whether it is an ancestor of ``HEAD`` and which ``EVIDENCE_PATHS``
+    changed between it and ``HEAD``."""
+
+    source: CiSource
+    is_ancestor: bool
+    changed: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class GateInputs:
     """Every input, parsed. ``None`` marks an input that is not part of this evaluation (a §2.5
     candidate is judged on its local evaluations before the ubuntu half exists): the ubuntu
@@ -169,6 +185,7 @@ class GateInputs:
     report: Phase2Report | InputError | None
     ci_results: EvalResults | InputError | None
     ci_cmp: Comparison | InputError | None
+    ci_source: CiProvenance | InputError | None
     subject: Subject | InputError
     policy: LoadedPolicy | InputError
     fixture: bytes | InputError
@@ -635,14 +652,26 @@ def _shipped(
 
 def gate_g8(inp: GateInputs) -> Problems:
     """Every required ``docs/results/phase2/`` file exists within its §5.2 cap (and the total
-    within 20 MB), is tracked and unmodified, nothing under the results is untracked, and
-    ``ci_ubuntu/results.json`` is the submission's."""
-    problems = _errors(inp.tree, inp.ci_results, inp.subject)
+    within 20 MB), is tracked and unmodified, nothing under the results is untracked,
+    ``ci_ubuntu/results.json`` is the submission's, and the CI run it came from was a push of an
+    ancestor of ``HEAD`` with no ``EVIDENCE_PATHS`` changed since."""
+    problems = _errors(inp.tree, inp.ci_results, inp.subject, inp.ci_source)
     if problems:
         return problems
     assert isinstance(inp.tree, ResultsTree)
     assert isinstance(inp.ci_results, EvalResults)
     assert isinstance(inp.subject, Subject)
+    assert isinstance(inp.ci_source, CiProvenance)
+    run = f"ci_ubuntu/{CI_SOURCE_FILE}: CI run {inp.ci_source.source.run_id}"
+    head = inp.ci_source.source.head_sha[:12]
+    if not inp.ci_source.is_ancestor:
+        problems.append(f"{run} at {head} is not an ancestor of HEAD")
+    if inp.ci_source.changed:
+        shown = ", ".join(printable(p, 120) for p in inp.ci_source.changed[:5])
+        problems.append(
+            f"{run} at {head}: {len(inp.ci_source.changed)} evidence path(s) changed since "
+            f"({shown}); re-run CI and fetch its evidence"
+        )
     tree = inp.tree
     for rel, cap in RESULT_FILES.items():
         size = tree.sizes.get(rel)
@@ -941,6 +970,32 @@ def scan_results(
     )
 
 
+def read_ci_source(
+    path: Path, *, extra_env: Mapping[str, str] | None = None
+) -> CiProvenance | InputError:
+    """``ci_ubuntu/source.json`` and, from local git (``merge-base --is-ancestor``, ``diff``),
+    whether its ``head_sha`` is an ancestor of ``HEAD`` and which ``EVIDENCE_PATHS`` changed
+    since; ``InputError`` when git does not have the commit (a shallow clone) or fails."""
+    env = {**git_env(), **(extra_env or {})}
+    try:
+        source = parse_ci_source(read_input(path, MAX_CI_SOURCE_BYTES))
+        root = Path(_git(path.parent, ["rev-parse", "--show-toplevel"], env).rstrip("\n"))
+        sha = source.head_sha  # 40 hex digits: never an option
+        check = run_command(
+            ["git", "-C", str(root), "merge-base", "--is-ancestor", sha, "HEAD"], env=env
+        )
+        if check.returncode not in (0, 1):
+            raise CommandError(f"git merge-base failed: {check.stderr.strip()[:200]}")
+        changed = _paths(
+            _git(root, ["diff", "--name-only", "-z", sha, "HEAD", "--", *EVIDENCE_PATHS], env)
+        )
+    except (OSError, ValueError, CommandError) as exc:
+        return InputError(f"{printable(str(path))}: {describe_error(exc)}")
+    return CiProvenance(
+        source=source, is_ancestor=check.returncode == 0, changed=tuple(sorted(changed))
+    )
+
+
 def baselines() -> Baselines:
     return Baselines(
         pid_sha256=submission_sha256(REPO / PID_SUBMISSION),
@@ -958,6 +1013,7 @@ def load_inputs(args: argparse.Namespace, base: Baselines) -> GateInputs:
         report=read_report(args.phase2),
         ci_results=read_eval_results(ci_dir / "results.json"),
         ci_cmp=read_compare(ci_dir / "cmp_cal.json"),
+        ci_source=read_ci_source(ci_dir / CI_SOURCE_FILE),
         subject=read_subject(args.submission),
         policy=read_policy(args.submission),
         fixture=read_fixture(fixture),
