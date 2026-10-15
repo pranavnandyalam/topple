@@ -5,10 +5,11 @@ v5 resolves re-critique round 3. Every issue from the six critiques (`wf_3f0c2a9
 `docs/design/phase-2-decisions.md`. v5.1 syncs the spec with the merged Phase 1 (main `f997394`,
 PR #3); its changes are rows S1–S22 of the log's "Sync with merged Phase 1". v5.2 fixes the 18
 findings of the sync's adversarial verification (rows V1–V18 of the log's "Sync verification").
-v5.3 records slices 1a and 1b's resolved deviations (rows B1–B12 of the log's "Slice 1a build",
-B13–B16 of "Slice 1b build") and the linux-x86_64 recalibration (E_ref 13.0 → 13.1; rows R1–R6 of the log's
-"Linux recalibration") and Pranav's answers to the open questions (rows A1–A8 of "Owner answers"),
-which keep the waypoint scene identical to balance-v1's (§8.2).
+v5.3 records slices 1a, 1b and 1c's resolved deviations (rows B1–B12 of the log's "Slice 1a build",
+B13–B16 of "Slice 1b build", B17–B26 of "Slice 1c build") and the linux-x86_64 recalibration
+(E_ref 13.0 → 13.1; rows R1–R6 of the log's "Linux recalibration") and Pranav's answers to the
+open questions (rows A1–A8 of "Owner answers"), which keep the waypoint scene identical to
+balance-v1's (§8.2).
 
 The design builds on the merged Phase 1 code and `docs/contract.md` ("contract §n", also for a
 list such as "contract §9, §14"; a bare §n is this spec): `controller_obs(obs_arr, t)`,
@@ -755,10 +756,16 @@ def policy_from_bytes(data: bytes, *, challenge: Challenge, expected_sha256: str
 @dataclass(frozen=True)
 class PolicyRef: kind: Literal["onnx", "python"]; payload: bytes | str; sha256: str; challenge_id: str
 def policy_ref(sub: Path, *, challenge: Challenge) -> PolicyRef   # parent: reads + validates ONCE
+def submission_ref(sub: Path, *, challenge: Challenge) -> tuple[Submission, PolicyRef]
+    # policy_ref with its load: a report's id, sha256 and policy_sha256 come from the read the workers check
 def worker_factory(ref: PolicyRef) -> ControllerFactory           # worker: re-checks sha256 before the first episode
 def eval_pool(workers: int) -> ProcessPoolExecutor
-def submit_episodes(pool: Executor, ref: PolicyRef, protocol: EvalProtocol, indices: Sequence[int]) -> Future[list[EpisodeResult]]
-    # refuses a private protocol, another challenge or bad indices in the PARENT, before anything is pickled
+def submit_episodes(pool: Executor, ref: PolicyRef, protocol: EvalProtocol, indices: Iterable[int], *,
+                    pushes: Iterable[Push] | None = None) -> Future[list[EpisodeResult]]
+    # refuses a private protocol, another challenge, bad indices or bad pushes in the PARENT, before anything
+    # is pickled; indices (≤ 10,000) and pushes (≤ 16) are read once, bounded, into tuples (B16)
+def run_episodes(ref: PolicyRef, protocol: EvalProtocol, indices: Iterable[int],
+                 pushes: Iterable[Push] | None = None) -> list[EpisodeResult]   # the task; checks again in the worker
 ```
 
 - **SessionOptions:** `intra_op_num_threads=1`, `inter_op_num_threads=1`, `ORT_SEQUENTIAL`,
@@ -789,7 +796,12 @@ def submit_episodes(pool: Executor, ref: PolicyRef, protocol: EvalProtocol, indi
   pickle; this is acceptable locally only (local eval is not a security boundary; §10 (iii)).
   Workers receive public protocols only (Phase 2 never runs a private one; a private
   `EvalProtocol`'s salt would reach every worker, and only its `repr` is redacted, contract §8):
-  `submit_episodes` refuses a private protocol in the parent.
+  `submit_episodes` refuses a private protocol in the parent. `pushes` replaces each episode's
+  scenario pushes through the trusted `reset(options={"pushes": …})` hook (contract §9; `None`
+  keeps them, and `run_episode` then calls `env.reset(seed=seed)` as before); each injected push
+  MUST be exactly a `Push` with an int `start_step ≥ 0`, an int `n_substeps ≥ 1` and finite
+  `magnitude_n`, `forward_sign` and `lateral_ratio`, sorted by `start_step` without repeats, else
+  `ValueError` (B21).
 - **Determinism** (contract §17): bit-exact per (os, arch, `cpu_isa`, onnxruntime version);
   across runtimes within 1e-5, never bit-exact, so replays play stored trajectories. No test pins
   an ONNX episode score; tests compare orderings only (PPO > PID).
@@ -914,13 +926,16 @@ Under the scoreboard: "Measured on {platform} {cpu_isa}, onnxruntime {v}. CI's u
 per episode (§3.5) and are shown in the second block, from `docs/results/phase2/ci_ubuntu/` (CI
 run {ci_run}, policy {policy_sha256[:12]})."
 
-**GIF ladders** (each rung in order; the rung used goes into `phase2.json`; the build fails only
-if the last rung exceeds the cap; `video.py` renders only sizes that are multiples of 16 px
-(`MACRO_BLOCK`) and fit the scene's offscreen buffer, so a rung below the rendered size resamples
-the composed frame; every fps divides the 100 Hz control rate, which `video._stride` requires of
-every render, so each fps rung is rendered at its own stride):
-- hero: pane 480×240 at 20 → 10 → 5 fps, then pane × 0.9 three times at 5 fps (432, 389, 350 px
-  wide);
+**GIF ladders** (`video.render_gif_ladder`: every rung is checked before any renders, then each in
+order; the rung used goes into `phase2.json`; the build fails only if the last rung exceeds the
+cap, `GifTooLargeError`; `video.py` renders only sizes that are multiples of 16 px (`MACRO_BLOCK`)
+and fit the scene's offscreen buffer; every fps divides the 100 Hz control rate, which
+`video._stride` requires of every render, so each fps rung is rendered at its own stride). A
+rung's width is the whole GIF's: its square panes render at the smallest multiple of 16 px
+covering width/panes, and the composed frame is resampled (LANCZOS) to width × round(width/panes)
+(rung 389: two 208 px panes rendered, 389×194 written):
+- hero: GIF 480×240 (two 240 px panes) at 20 → 10 → 5 fps, then width × 0.9 three times at 5 fps
+  (432, 389, 350 px wide);
 - failure galleries: 320 px at 10 → 5 → 4 fps, then × 0.9 three times at 4 fps;
 - waypoint: 480 px at 10 → 5 → 4 fps, then × 0.9 three times at 4 fps.
 
@@ -931,7 +946,11 @@ every render, so each fps rung is rendered at its own stride):
    fell; a median seed is below." Also MP4s of the median-difference seed (lower median) for PID vs
    PPO and LQR vs PPO. Both panes play stored trajectories on one clock; a pane whose episode ended
    in a fall or an error plays its epilogue (`wants_epilogue`, contract §11), then holds its last
-   frame stamped `FELL at 4.31 s` (or `ERROR at`).
+   frame stamped `FELL at 4.31 s` (or `ERROR at`, `sim_unstable` included; t = T · `control_dt`).
+   The video ends when the longest pane does, or 1.0 s (`STAMP_HOLD_S`) after the last stamped
+   pane, whichever is later. Labels are printable ASCII (others shown as `?`, ≤ 200 characters,
+   Pillow's default font), trimmed to the pane with `...`. Trajectory meta is untrusted: a
+   termination reason that is not a string names no fall (the pane is unstamped, exit 0).
 2. **Scoreboard.** Rows PID, LQR, "PPO (shipped: best of 3 by selection seeds)", "PPO recipe (3
    seeds)" (mean ± sd and min of fresh score and success), each PPO seed, each SAC seed (label
    "SAC (1.0M steps, UTD 0.25)"); "k of 3 PPO seeds reached the PID gate" and "j of 3 at LQR level
@@ -942,8 +961,10 @@ every render, so each fps rung is rendered at its own stride):
 3. **Shove test.** Preset `clean`, seeds 0..99, one push at 2.0 s (0.1 s pulse, lateral 0;
    injected with the trusted `reset(options={"pushes": …})` hook, contract §9),
    impulses 0.30:0.65:0.025 N·s (15 levels), `forward_sign` +1 and −1. Survival vs impulse for both
-   directions; i50 per direction (first downward 50% crossing, linear interpolation) and their
-   minimum. Pilot: PID 0.42/0.42, LQR 0.45/0.45, PPO 0.48–0.50.
+   directions; i50 per direction (the first adjacent pair of levels whose survival goes from ≥ 50%
+   to < 50%, linearly interpolated on impulse between them; a plateau at exactly 50% crosses at its
+   last level; none if there is no such pair) and their minimum (none unless both directions have
+   one). Pilot: PID 0.42/0.42, LQR 0.45/0.45, PPO 0.48–0.50.
 4. **Learning curves.** Selection success and score vs env steps and vs CPU-minutes, per seed and
    algorithm, PID and LQR lines. "Env steps to PID level" = [previous eval, first eligible eval].
    Wall-clock only as a footnote with the recorded load.
@@ -971,6 +992,8 @@ Total size of `docs/results/phase2/` ≤ 20 MB.
 ```python
 # topple/stats.py  (normative algorithm; G2/G2b and compare use only this)
 def paired_bootstrap(a, b, *, n_resamples=10_000, seed=0, level=0.95) -> tuple[float, float, float]:
+    # checks first (ValueError): a, b finite, 1-D, one length ≥ 1; int n_resamples ≥ 1; int seed ≥ 0;
+    # 0 < level < 1; n_resamples · len(a) ≤ MAX_BOOTSTRAP_ELEMENTS = 10**8 (the protocol maximum)
     d = np.asarray(a, np.float64) - np.asarray(b, np.float64)        # seed order
     idx = np.random.default_rng(seed).integers(0, d.size, size=(n_resamples, d.size))   # one call
     means = d[idx].mean(axis=1)
@@ -978,36 +1001,55 @@ def paired_bootstrap(a, b, *, n_resamples=10_000, seed=0, level=0.95) -> tuple[f
     return float(d.mean()), float(lo), float(hi)
 def bootstrap_ci(x, **kw) -> tuple[float, float, float]                 # paired_bootstrap(x, zeros)
 # topple/compare.py: paired rows for every ordered pair i > j (a = entry_i, b = entry_j)
+MAX_ENTRIES = 32; CHUNK_EPISODES = 25                                   # episodes per pool task; results never depend on it
 def compare(subs: Sequence[Path], protocol: EvalProtocol, *, workers: int = 4) -> Comparison
-def to_markdown(c: Comparison) -> str; def to_json(c: Comparison) -> str
-# topple/bench.py
+def to_markdown(c: Comparison) -> str; def to_json(c: Comparison) -> str   # Markdown escapes every ASCII punctuation char of an id
+def read_comparison(path: Path) -> Comparison                           # as read_results: open_regular, ≤ 16 MiB
+# topple/bench.py: protocol fixed to balance-v1/clean; ≤ MAX_IMPULSES = 200 levels, strictly increasing, in
+# [0, 5] N·s (MAX_PUSH_IMPULSE_NS); 1..10,000 int seeds in [0, 2^53); CHUNK_EPISODES = 25
 def shove_curve(sub: Path, impulses, seeds, *, forward_sign: int = 1, workers: int = 4) -> ShoveCurve
-def impulse_at_50(curve: ShoveCurve) -> float | None
+def shove_curves(sub: Path, impulses, seeds, *, forward_signs=(1, -1), workers: int = 4) -> tuple[ShoveCurve, ...]
+def run_shoves(subs, impulses, seeds, signs, workers) -> list[tuple[ShoveCurve, ...]]   # one pool for all (the CLI)
+def shove_push(impulse: float, forward_sign: int, protocol: EvalProtocol) -> Push  # force = impulse / (n_substeps · timestep)
+def parse_impulses(text: str) -> tuple[float, ...]                     # START:STOP:STEP, decimal-exact, STOP included
+def impulse_at_50(curve: ShoveCurve) -> float | None                   # §5.2 item 3's rule
+def to_markdown(curves: Sequence[ShoveCurve]) -> str
 # topple/video.py (extend; scene and obs width from the challenge registry)
-def render_side_by_side(trajs, labels, out: Path, *, pane: int = 480, fps: int = 50) -> None
+def render_side_by_side(trajs, labels, out: Path, *, pane: int = 480, fps: int = 50) -> int   # frames; 1–4 panes
+def render_gif_ladder(trajs, labels, out: Path, rungs: Sequence[GifRung], *, max_bytes: int) -> GifRung   # §5.2
 def render_overlay(trajs, labels, out: Path, *, alphas, frame_m: tuple[float, float]) -> None  # waypoint ghost
 ```
 
 `topple.compare/1` JSON (pydantic, frozen, `extra="forbid"`, `allow_inf_nan=False`; read like
-contract §15's `read_results`): `{format, protocol, protocol_hash, complete, seeds[], entries[{id,
+contract §15's `read_results`): `{format, protocol, protocol_hash, complete, seeds[], platform,
+versions{topple, mujoco, numpy, obs_schema, action_spec, onnxruntime, onnx, cpu_isa}, entries[{id,
 policy_sha256|null, sha256, scores[], success[], energy_j[], saturation_fraction[], termination[],
-extras{}}], paired[{a, b, mean, lo, hi, n_resamples, seed}]}`; arrays in seed order, bounded as
-in contract §15. `termination` is the recorded reason (contract §11; `error` for an episode the
-harness stopped). `complete` iff every entry has all N episodes and none is `missing`. `extras` maps
-a metric name to its per-seed array: for waypoint `docked`, `fell`, `fall_cause`, `t_finish_s`,
+extras{}}], paired[{a, b, mean, lo, hi, n_resamples, seed}]}`; `platform` and `versions` as in
+`results.json` (ONNX episodes are bit-exact only per platform, `cpu_isa` and onnxruntime, §3.5);
+1–10,000 seeds, 1–32 entries; every array in seed order with len(seeds) values, bounded as in
+contract §15. `termination` is one of `fell`, `floor_contact`, `sim_unstable`, `timeout`, `error`
+(contract §11; `error` for an episode the harness stopped) or `missing`; an `error`,
+`sim_unstable` or `missing` episode has score 0 and success false (`compare` writes a `missing`
+one's energy and saturation as 0.0), and only a `timeout` episode can be a success (contract §12).
+`complete` iff no episode is `missing`. Entry ids are unique (`compare` refuses two submissions
+with one name). `paired` rows come in the order (i, j) = (1, 0), (2, 0), (2, 1), …, `a` and `b`
+the entry ids, `lo ≤ hi`, differences in [−100, 100], `n_resamples` in 1..10^6. `extras` maps a
+metric name to its per-seed array: for waypoint `docked`, `fell`, `fall_cause`, `t_finish_s`,
 `course_pts`, `speed_pts`, `alive_pts`, `battery_pts` (§8.6).
 
 CLI: `topple train CONFIG --out DIR [--seed S]` (without the train extra: message + exit 2);
 `topple export ...`; `topple policy pack ...`; `topple compare SUB... -p P [--seeds A..B]
 [--workers N] [--json PATH]`; `topple shove SUB... [--impulses 0.30:0.65:0.025] [--seeds 0..99]
-[--direction both]`; `topple video --side-by-side A.npz B.npz --labels A B --out X.mp4 [--fps N]
-[--size W]`. `--seeds A..B` replaces the named protocol's seeds, as `topple run --seed` does
+[--direction both|forward|backward] [--workers N]`; `topple video --side-by-side A.npz B.npz
+--labels A B --out X.mp4 [--fps N] [--size W]` (pane size: each pane W×W px, default 480).
+`--seeds A..B` replaces the named protocol's seeds, as `topple run --seed` does
 (`dataclasses.replace(EvalProtocol.from_id(P), seeds=...)`, ≤ 10,000, contract §8), so
 `protocol_hash` covers them; there is no `is_named` field. Every new command checks a relative
 output path with `cli._check_output` before anything runs (never through a symlinked directory,
-contract §14), writes through `_atomic.replacement` (`results.json` via `write_results`) and
-fails through `cli._fail` (one escaped line, exit 2). `topple video` loads inputs with `load_npz`,
-bounded by their challenge's `max_steps` and layout (§8.1a).
+contract §14), writes through `_atomic.replacement` (`results.json` via `write_results`; `policy
+pack` through `_atomic.new_directory`, contract §14) and fails through `cli._fail` (one escaped
+line, exit 2). `topple video` loads inputs with `load_npz`, bounded by their challenge's
+`max_steps` and layout (§8.1a).
 
 ## 6. Tests
 
@@ -1033,9 +1075,9 @@ train"`; torch-free):
 | `test_harness_finite_obs` | A fake env emitting NaN makes `evaluate` raise `RuntimeError` before `act()` is called, also under `python -O`. |
 | `test_driver_golden` (2b) | Per platform tag, as `tests/test_golden.py` pins balance-v1's baselines (contract §13; physics reproduces only per platform, e.g. LQR seed 1001 scored 84.08 on darwin-arm64 and 85.40 on linux-x86_64 under E_ref 13.0): `EPISODES[platform_tag()]` holds `submissions/waypoint_pid_example.py`'s scores on `waypoint-v1/clean` seeds 0..4 (to 1e-9) and docked/fell on `standard` 0..19, for `darwin-arm64` and `linux-x86_64`; a platform without pins skips locally and fails in CI, and CI must run on `linux-x86_64` (the same `pins_for` / `check_ci_platform` rule); a re-pin updates both platforms in one change. The platform-independent `WaypointScore` dump is pinned once. |
 | `test_traj_v2` (2b) | The §8.1a cases. |
-| `test_import_hygiene` | Importing `topple.cli`, `topple.export`, `topple.policy.*`, `topple.pool`, `topple.controllers.onnx_policy` leaves no `torch`, `stable_baselines3`, `tensorboard`, `psutil` in `sys.modules`. |
-| `test_no_unsafe_loads` | AST scan of `python/topple`, `scripts/`, `tests/`. Outside `topple/train/`: no `pickle, cloudpickle, dill, joblib, shelve, marshal, torch, stable_baselines3` imports, except a fixed (file → modules) allow-list in the test: the `train`-marked test files (`test_train_smoke`, `test_snapshot_reference`, `test_pack_torch_legacy`, `test_resources`, `test_surgery`) → `torch`, `stable_baselines3`; the merged `tests/test_contract.py` → `pickle` (its `TaskSpec` pickle round trip, contract §8); `scripts/make_thirdparty_fixtures.py` → `torch` (§3.3, run once with the train extra). Torch-free tree: onnx entry point only `onnx.ModelProto.FromString`; banned `onnx.load(`, `load_external_data_for_model`, `onnx.external_data_helper`, `numpy_helper.to_array`, `register_custom_ops_library`; `InferenceSession(` and `add_session_config_entry` (the three §3.5 literal keys) only in `runtime.make_session`. `PPO.load`, `SAC.load`, `VecNormalize.load`, `load_from_zip_file` only in `learn.resume_from` (`test_snapshot_reference` reloads through it). Everywhere: no `yaml.load/full_load/unsafe_load`, `allow_pickle=True`, `torch.load` without `weights_only=True`. Name-based; `getattr` evasion out of scope. |
-| `test_repo_hygiene` | No pickle-family, `.onnx.data` or hidden files under `submissions/`; `.gitignore` covers `runs/`, `*.pkl`, `.venv-eval/`, `.DS_Store`; `git check-ignore docs/results/phase2/hero.mp4` and `.../waypoint.mp4` return non-zero. |
+| `test_import_hygiene` | A fresh interpreter with an import hook imports `topple.cli`, `topple.pool`, `topple.controllers.onnx_policy`, `topple.compare`, `topple.bench`, `topple.stats`, every `topple.policy.*` module it finds, and `topple.export` once it exists: no attempt to import `torch`, `stable_baselines3`, `tensorboard` or `psutil` (a guarded `try: import` counts, installed or not; positive control) and none in `sys.modules`. |
+| `test_no_unsafe_loads` | AST scan of `python/topple`, `scripts/`, `tests/`. Outside `topple/train/`: no `pickle, cloudpickle, dill, joblib, shelve, marshal, torch, stable_baselines3` imports (`__import__` / `importlib.import_module` of a literal included), except a fixed (file → names) allow-list in the test, each entry still used by its file (a stale one fails): the `train`-marked test files (`test_train_smoke`, `test_snapshot_reference`, `test_pack_torch_legacy`, `test_resources`, `test_surgery`) → `torch`, `stable_baselines3`; the merged `tests/test_contract.py` → `pickle` (its `TaskSpec` pickle round trip, contract §8); `tests/test_onnx_policy.py`, `tests/test_pool.py` → `pickle` (pickling refused, `PolicyRef` pickled); `scripts/make_thirdparty_fixtures.py` → `torch` (§3.3, run once with the train extra); `tests/test_policy_validate.py`, `tests/test_policy_canonical.py` → `numpy_helper` and `tests/test_policy_pack.py` → `numpy_helper`, `external_data_helper` (they monkeypatch the readers to raise). Torch-free tree: onnx entry point only `onnx.ModelProto.FromString`; banned any `onnx.load*` and any reference to `numpy_helper`, `external_data_helper`, `load_external_data_for_model`, `register_custom_ops_library`, `onnx.shape_inference.infer_shapes_path`, `onnx.hub`, and `check_model` given a path (a string, f-string, `/` join, `Path(…)`/`str(…)` call, or a name containing "path" or "file"). `InferenceSession(` and `add_session_config_entry` (the three §3.5 literal keys) only in `runtime.make_session`. `PPO.load`, `SAC.load`, `VecNormalize.load` (qualified or not), `load_from_zip_file` only in `learn.resume_from` (`test_snapshot_reference` reloads through it). Everywhere: no `yaml.load/full_load/unsafe_load` (and their `_all` forms), `allow_pickle=True`, `torch.load` without `weights_only=True`. Every rule has a positive control. Name-based, reading import aliases as what they import; `getattr` evasion out of scope. |
+| `test_repo_hygiene` | No pickle-family (`.zip` included: SB3's `model.zip`), native-code (`.so/.dylib/.pyd/.dll`), external-data (`.onnx.data`, `.onnx_data`, `.data`) or hidden files under `submissions/`, tracked or untracked and not ignored; `.gitignore` covers `runs/`, `*.pkl`, `.venv-eval/`, `.DS_Store`; `git check-ignore docs/results/phase2/hero.mp4` and `.../waypoint.mp4` return non-zero. |
 | `test_stats`, `test_compare`, `test_bench` | `paired_bootstrap` known answer pinning (mean, lo, hi) for a committed 200-element vector; n = 1; all-equal; compare round-trip, all ordered pairs on 2 `ideal` seeds; shove both directions and interpolation. |
 | `test_video_sbs` | Timeline (hold-last-frame, labels, trims), GIF ladder, frame rule; one `render`-marked 64 px smoke. |
 | `test_resource_caps` | Pools clamp to 4; shipped configs `n_envs` ≤ 8; `limits` complete; `topple train` on a non-empty `--out` exits 2; `--retry` renames only a `wall_clock_abort` attempt. |
