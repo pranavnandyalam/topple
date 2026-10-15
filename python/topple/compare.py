@@ -389,9 +389,17 @@ def to_markdown(c: Comparison) -> str:
 
 def _seed_span(seeds: Sequence[int]) -> str:
     first, last = seeds[0], seeds[-1]
-    if list(seeds) == list(range(first, last + 1)):
+    if contiguous(seeds):
         return f"{first}..{last}"
     return f"{first}, ..., {last}" if len(seeds) > 2 else ", ".join(map(str, seeds))
+
+
+def contiguous(seeds: Sequence[int]) -> bool:
+    """Whether ``seeds`` is ``first..last`` with no gap, decided without building the range: the
+    lengths are compared first, so seeds read from a file (``[0, 2**53 - 1]``) cost nothing."""
+    if not seeds or seeds[-1] - seeds[0] + 1 != len(seeds):
+        return False
+    return all(b == a + 1 for a, b in itertools.pairwise(seeds))
 
 
 def escape_markdown(text: str) -> str:

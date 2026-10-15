@@ -1,0 +1,24 @@
+# The train CI job's PPO smoke run (docs/design/phase-2.md §2.2): ppo_balance.yaml written out in
+# full, differing only in total_timesteps, n_envs, vec_env, selection.seeds, selection.every_steps,
+# selection.workers, selection.gate, limits, ppo.n_steps and ppo.batch_size.
+algo: ppo
+seed: 0
+total_timesteps: 2048       # 2 rollouts of 1,024: evals at 1,024 and the final 2,048
+n_envs: 2
+vec_env: dummy
+start_method: forkserver
+env:
+  challenge: balance-v1
+  preset: standard
+  max_drift_m: 2.0
+  reward: {tilt: 0.30, rate: 0.10, drift: 0.25, yaw_rate: 0.05, effort: 0.10, smooth: 0.20}
+  action_excess: {enabled: true, box: 2.0, weight: 0.10}
+normalize: {obs: true, reward: false, clip_obs: 10.0, epsilon: 1.0e-8}
+policy: {net_arch: {pi: [64, 64], vf: [64, 64]}, activation: tanh, log_std_init: 0.0}
+ppo: {n_steps: 512, batch_size: 256, n_epochs: 10, gamma: 0.99, gae_lambda: 0.95,
+      learning_rate: {schedule: linear, initial: 3.0e-4, final: 0.0},
+      clip_range: 0.2, ent_coef: 0.0, vf_coef: 0.5, max_grad_norm: 0.5, target_kl: null}
+selection: {protocol: balance-v1/standard, seeds: {first: 2000, last: 2001}, every_steps: 1024,
+            workers: 2, gate: none, max_saturation: 0.08}   # 1 periodic + final = 2 evals
+limits: {max_wall_clock_s: 300, max_cpu_s: 600, max_tree_rss_mib: 4096}
+health: {min_std: 0.03, min_std_before_step: 2_000_000, regression_after_step: 2_000_000, regression_drop: 0.10}

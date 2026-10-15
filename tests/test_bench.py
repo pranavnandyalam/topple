@@ -164,6 +164,26 @@ def test_survival_is_the_fraction_of_seeds() -> None:
     assert curve([1.0, 0.75, 0.0]).survival == (1.0, 0.75, 0.0)
 
 
+def test_markdown_names_a_contiguous_seed_span() -> None:
+    assert ", 4 seeds 0..3, one push" in bench_module.to_markdown([curve([1.0, 0.0])])
+
+
+def test_markdown_never_builds_the_range_of_a_seed_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A curve's seeds can span [0, 2**53) (slice 1c re-review): the lengths are compared first,
+    and a guard stands in for ``range`` so a regression fails here instead of allocating."""
+    import topple.compare as compare_module
+
+    def guarded(*args: int) -> range:
+        assert args[-1] - (args[0] if len(args) > 1 else 0) <= 10**6, args
+        return range(*args)
+
+    for module in (bench_module, compare_module):
+        monkeypatch.setattr(module, "range", guarded, raising=False)
+    wide = replace(curve([1.0, 0.0]), seeds=(0, 2**53 - 1), survived=((True, True), (False, False)))
+    text = bench_module.to_markdown([wide])
+    assert ", 2 seeds , one push" in text
+
+
 @pytest.mark.parametrize(
     "fields",
     [

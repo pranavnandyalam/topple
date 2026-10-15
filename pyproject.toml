@@ -75,6 +75,7 @@ addopts = "-ra --strict-markers"
 markers = [
     "render: needs a headless OpenGL backend (cgl on macOS, osmesa/egl on Linux)",
     "slow: takes more than a few seconds",
+    "train: needs the train extra (torch, stable-baselines3); the python-train CI job runs these",
 ]
 
 [tool.coverage.run]

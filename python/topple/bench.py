@@ -292,11 +292,11 @@ def to_markdown(curves: Sequence[ShoveCurve]) -> str:
     """One submission's curves (one per direction, same levels and seeds) as a Markdown table
     of survival per impulse, then each direction's ``impulse_at_50`` and their minimum. The id
     is escaped (every ASCII punctuation character backslash-escaped)."""
-    from topple.compare import escape_markdown
+    from topple.compare import contiguous, escape_markdown
 
     first = curves[0]
     seeds = first.seeds
-    span = f"{seeds[0]}..{seeds[-1]}" if seeds == tuple(range(seeds[0], seeds[-1] + 1)) else ""
+    span = f"{seeds[0]}..{seeds[-1]}" if contiguous(seeds) else ""
     lines = [
         f"## {escape_markdown(first.id)}: survival vs push impulse",
         "",

@@ -650,6 +650,31 @@ def test_markdown_names_any_seed_list(three: Comparison) -> None:
     assert seeds_line((5, 6, 7)).endswith("3 seeds (5..7)")
     assert seeds_line((9, 2)).endswith("2 seeds (9, 2)")
     assert seeds_line((9, 2, 4)).endswith("3 seeds (9, ..., 4)")
+    assert seeds_line((5, 7, 7)).endswith("3 seeds (5, ..., 7)")  # the right length, a gap
+    assert seeds_line((7, 6, 7)).endswith("3 seeds (7, ..., 7)")
+
+
+def test_markdown_never_builds_the_range_of_a_seed_file(
+    three: Comparison, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seeds read from a file can span [0, 2**53): the lengths are compared before any range
+    is walked, so ``[0, 2**53 - 1]`` costs nothing (slice 1c re-review). A guard stands in for
+    ``range`` in the module, so a regression fails here instead of allocating."""
+
+    def guarded(*args: int) -> range:
+        assert args[-1] - (args[0] if len(args) > 1 else 0) <= 10**6, args
+        return range(*args)
+
+    monkeypatch.setattr(compare_module, "range", guarded, raising=False)
+    doc = doc_of(three)
+    doc["seeds"] = [0, 2**53 - 1]
+    for entry in doc["entries"]:
+        for key in ("scores", "success", "energy_j", "saturation_fraction", "termination"):
+            entry[key] = [entry[key][0]] * 2
+    first = to_markdown(parse(doc)).splitlines()[0]
+    assert first.endswith(f"2 seeds (0, {2**53 - 1})")
+    assert compare_module.contiguous((2**53 - 2, 2**53 - 1))
+    assert not compare_module.contiguous(())
 
 
 def test_parse_comparison_caps_its_input() -> None:

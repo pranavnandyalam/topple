@@ -818,6 +818,183 @@ def _load_trajectory(path: Path) -> Trajectory:
         _fail(str(exc))
 
 
+# ------------------------------------------------------------------ training and export
+
+TRAIN_EXTRA_MODULES = frozenset({"torch", "stable_baselines3", "tensorboard", "psutil"})
+MAX_RETRIES = 2
+EXIT_HARD_LIMIT = 4
+
+
+@app.command()
+def train(
+    config: Annotated[Path, typer.Argument(help="A configs/train/*.yaml file.")],
+    out: Annotated[
+        Path, typer.Option("--out", "-o", help="The run directory to create (must be empty).")
+    ],
+    seed: Annotated[
+        int | None,
+        typer.Option(min=0, max=2**32 - 1, help="Replaces the config's seed (0, 1, 2, ...)."),
+    ] = None,
+    retry: Annotated[
+        bool,
+        typer.Option(
+            "--retry",
+            help="Re-run a run that stopped on its wall-clock limit: the old --out becomes "
+            "<out>.attempt1 (then .attempt2).",
+        ),
+    ] = False,
+) -> None:
+    """Train a policy (PPO or SAC) with periodic selection evals and pickle-free snapshots.
+    Needs the train extra (torch, stable-baselines3). Exits 4 when a hard limit stopped it."""
+    from topple.train.config import read_train_config
+    from topple.yamlsafe import ConfigError
+
+    _check_output(out)
+    try:
+        loaded = read_train_config(config, seed=seed)
+    except ConfigError as exc:
+        _fail(f"{config.name}: {exc}")
+    attempt = _retry_target(out, retry=retry)
+    learn = _learn_module()
+    if attempt is not None:
+        try:
+            os.rename(out, attempt)
+        except OSError as exc:
+            _fail(f"cannot move {out} to {attempt}: {exc.strerror or type(exc).__name__}")
+        typer.echo(f"retry: moved the aborted run to {attempt}")
+    run_dir = learn.train(loaded.config, out, config_file_sha256=loaded.file_sha256)
+    if _hard_limit_flags(Path(run_dir)):
+        raise typer.Exit(code=EXIT_HARD_LIMIT)
+
+
+def _retry_target(out: Path, *, retry: bool) -> Path | None:
+    """Where ``--retry`` moves the existing ``out`` (``None``: nothing to move). Exit 2 if
+    ``out`` exists and is not an empty directory, unless ``--retry`` and its
+    ``train_meta.json`` carries ``wall_clock_abort`` and fewer than 2 attempts are kept."""
+    from topple.export import ExportError, read_run_json
+
+    if not os.path.lexists(out) or _empty_directory(out):
+        return None
+    if not retry:
+        _fail(
+            f"--out {out} exists and is not empty (a run never writes into another; --retry "
+            "re-runs a run that stopped on its wall-clock limit)"
+        )
+    try:
+        meta = read_run_json(out / "train_meta.json")
+    except ExportError as exc:
+        _fail(f"--retry: {exc}")
+    flags = meta.get("flags") if isinstance(meta, dict) else None
+    if not isinstance(flags, list) or "wall_clock_abort" not in flags:
+        _fail(
+            f"--retry re-runs only a run whose train_meta.json carries wall_clock_abort; {out} "
+            "does not (rss_abort and cpu_abort are bugs to fix, not to re-run)"
+        )
+    if out.name in ("", ".", ".."):
+        _fail(f"--retry needs a named --out, not {out}")
+    for k in range(1, MAX_RETRIES + 1):
+        target = out.with_name(f"{out.name}.attempt{k}")
+        if not os.path.lexists(target):
+            return target
+    _fail(f"{out} was already retried {MAX_RETRIES} times: wait for a lower load")
+
+
+def _empty_directory(path: Path) -> bool:
+    try:
+        if not os.path.isdir(path) or os.path.islink(path):
+            return False
+        with os.scandir(path) as listing:
+            return next(listing, None) is None
+    except OSError as exc:
+        _fail(f"cannot examine {path}: {exc.strerror or type(exc).__name__}")
+
+
+def _learn_module() -> Any:
+    """``topple.train.learn``, imported only here; exit 2 with one line without the train
+    extra (or in a build that does not have the module)."""
+    import importlib
+
+    try:
+        return importlib.import_module("topple.train.learn")
+    except ImportError as exc:
+        missing = (exc.name or "").split(".")[0]
+        if missing in TRAIN_EXTRA_MODULES:
+            _fail(
+                f"topple train needs the train extra ({missing} is not installed): "
+                "uv sync --extra train"
+            )
+        if exc.name == "topple.train.learn":
+            _fail("topple train is not available: this build has no topple.train.learn")
+        raise
+
+
+def _hard_limit_flags(run_dir: Path) -> list[str]:
+    """The abort flags the finished run recorded (exit 4 when there are any)."""
+    from topple.export import ExportError, read_run_json
+    from topple.train.selection import ABORT_FLAGS
+
+    try:
+        meta = read_run_json(run_dir / "train_meta.json")
+    except ExportError as exc:
+        _fail(f"the run wrote no readable train_meta.json: {exc}")
+    flags = meta.get("flags") if isinstance(meta, dict) else None
+    if not isinstance(flags, list):
+        _fail("the run's train_meta.json has no flags list")
+    return [flag for flag in ABORT_FLAGS if flag in flags]
+
+
+@app.command("export")
+def export_cmd(
+    run_dir: Annotated[Path, typer.Argument(help="A training run directory (runs/<name>).")],
+    out: Annotated[Path, typer.Option("--out", "-o", help="The policy directory to write.")],
+    step: Annotated[
+        int | None,
+        typer.Option(min=0, max=MAX_SEED - 1, help="The checkpoint (default: best.json's)."),
+    ] = None,
+    report_only: Annotated[
+        bool,
+        typer.Option(
+            "--report-only",
+            help="Export any checkpoint for a report row, to RUN_DIR/report_policy (replaced).",
+        ),
+    ] = False,
+    test_fixture: Annotated[
+        str | None,
+        typer.Option(help="Also write tests/data/NAME_parity.{npz,bin,json}."),
+    ] = None,
+    replace_out: Annotated[
+        bool, typer.Option("--replace", help="Replace an existing policy directory.")
+    ] = False,
+) -> None:
+    """Export a training checkpoint as a topple.policy/1 directory, without torch or pickle:
+    rebuild the ONNX from the checkpoint's arrays, bind it to the bytes training scored, check
+    parity row by row, and write policy.onnx + policy.json."""
+    from topple.export import FIXTURE_DIR, ExportError, export_policy
+
+    _check_output(out)
+    if test_fixture is not None:
+        _check_output(FIXTURE_DIR)
+    try:
+        manifest = export_policy(
+            run_dir,
+            out,
+            step=step,
+            report_only=report_only,
+            replace=replace_out,
+            test_fixture=test_fixture,
+        )
+    except ExportError as exc:
+        _fail(str(exc))
+    parity = manifest.claims.export_parity
+    if parity is None:  # export always records it
+        _fail("internal error: the export recorded no parity")
+    typer.echo(
+        f"exported step {manifest.claims.selected_step} -> {out}: policy_sha256 "
+        f"{manifest.onnx.sha256[:12]}, parity max |diff| {parity.max_abs_diff:.2e} over "
+        f"{parity.n} rows" + (" (coverage vacuous: report only)" if parity.vacuous else "")
+    )
+
+
 # ------------------------------------------------------------------ policies
 
 

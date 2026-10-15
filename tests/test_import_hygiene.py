@@ -1,9 +1,11 @@
 """The torch-free surface stays torch-free (docs/design/phase-2.md §6 ``test_import_hygiene``).
 
-Eval, compare, shove, pack and CI never need torch, Stable-Baselines3, TensorBoard or psutil
-(the ``train`` extra). A fresh interpreter imports every torch-free module with an import hook
-that records (and refuses) any attempt to import one of them, so a guarded ``try: import
-torch`` counts as much as a plain one, whether or not the package is installed.
+Eval, compare, shove, pack, export and CI never need torch, Stable-Baselines3, TensorBoard or
+psutil (the ``train`` extra), and neither do the torch-free training modules (configs, wrappers,
+selection: ``make_train_env`` imports SB3's ``Monitor`` only when called). A fresh interpreter
+imports every torch-free module with an import hook that records (and refuses) any attempt to
+import one of them, so a guarded ``try: import torch`` counts as much as a plain one, whether or
+not the package is installed.
 """
 
 from __future__ import annotations
@@ -22,6 +24,13 @@ MODULES = (
     "topple.compare",
     "topple.bench",
     "topple.stats",
+    "topple.export",
+    "topple._npz",
+    "topple.yamlsafe",
+    "topple.train",
+    "topple.train.config",
+    "topple.train.wrappers",
+    "topple.train.selection",
 )
 PROBE = """
 import importlib, importlib.abc, json, pkgutil, sys

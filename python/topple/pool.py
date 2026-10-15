@@ -27,6 +27,11 @@ refused after ``MAX_TASK_EPISODES + 1`` items instead of being read until memory
 A task may replace its episodes' pushes (``pushes``): the trusted ``reset(options={"pushes":
 ...})`` hook (contract §9) that robustness benches such as ``topple shove`` use; ``None`` keeps
 each seed's own scenario.
+
+A selection eval's task (``submit_episodes_with_rows``) also returns, per episode, up to
+``ONPOLICY_ROWS`` of the observations the policy saw (docs/design/phase-2.md §2.4 parity rows
+(a)): ``traj.obs`` at ``np.linspace(0, T - 1, 5).round()`` for an episode of T >= 1 steps, none
+for T = 0. The trajectory itself never leaves the worker.
 """
 
 from __future__ import annotations
@@ -35,15 +40,18 @@ import itertools
 import math
 import multiprocessing
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import Executor, Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, cast
 
+import numpy as np
+import numpy.typing as npt
+
 from topple.disturbances import Push, check_push_schedule
 from topple.envs.balance import BalanceEnv
-from topple.evaluate import ControllerFactory, EvalProtocol, run_episode
+from topple.evaluate import ControllerFactory, EpisodeRun, EvalProtocol, run_episode
 from topple.ids import validate_challenge_id
 from topple.loader import Submission, load_submission
 from topple.policy.manifest import HEX64
@@ -58,6 +66,8 @@ POOL_MAX_WORKERS: Final = 4
 START_METHOD: Final = "spawn"  # a fresh interpreter: no inherited sessions, threads or locks
 MAX_TASK_EPISODES: Final = MAX_EPISODES  # a results file lists at most this many (contract §15)
 MAX_TASK_PUSHES: Final = 16  # an episode of 1,000 steps holds a handful; a bench uses one
+ONPOLICY_ROWS: Final = 5
+"""On-policy parity rows per episode of at least one step (§2.4 (a))."""
 
 
 @dataclass(frozen=True)
@@ -213,13 +223,72 @@ def run_episodes(
     scenario's when given. The arguments are checked again here, and the controller is rebuilt
     (its sha256 re-checked) before the first episode."""
     checked, injected = _check_task(ref, protocol, indices, pushes)
+    return _run(ref, protocol, checked, injected, lambda run: run.result)
+
+
+@dataclass(frozen=True)
+class EpisodeRows:
+    """One episode's result and its on-policy parity rows (``onpolicy_rows``)."""
+
+    result: EpisodeResult
+    obs_rows: npt.NDArray[np.float32]
+
+
+def onpolicy_rows(obs: npt.NDArray[np.float32]) -> npt.NDArray[np.float32]:
+    """§2.4 (a): the rows ``np.linspace(0, T - 1, 5).round().astype(int)`` of an episode's
+    ``obs`` (T x D float32, row t is what the policy saw at step t): ``ONPOLICY_ROWS`` rows for
+    T >= 1, repeats allowed for T < 5; a (0, D) array for T = 0 (an episode that ended before
+    its first action, e.g. ``invalid_action`` at step 0)."""
+    if obs.ndim != 2 or obs.dtype != np.float32:
+        raise ValueError("obs must be a float32 array of rows [T, D]")
+    steps = obs.shape[0]
+    if steps == 0:
+        return np.empty((0, obs.shape[1]), dtype=np.float32)
+    picked = np.linspace(0, steps - 1, ONPOLICY_ROWS).round().astype(int)
+    return np.ascontiguousarray(obs[picked], dtype=np.float32)
+
+
+def submit_episodes_with_rows(
+    pool: Executor, ref: PolicyRef, protocol: EvalProtocol, indices: Iterable[int]
+) -> Future[list[EpisodeRows]]:
+    """``submit_episodes`` for a selection eval: the task (``run_episodes_with_rows``) also
+    returns each episode's on-policy parity rows. Checked in the parent as ``submit_episodes``
+    checks (public protocol, its challenge, indices read once)."""
+    checked, _ = _check_task(ref, protocol, indices, None)
+    return pool.submit(run_episodes_with_rows, ref, protocol, checked)
+
+
+def run_episodes_with_rows(
+    ref: PolicyRef, protocol: EvalProtocol, indices: Iterable[int]
+) -> list[EpisodeRows]:
+    """A pool task (``submit_episodes_with_rows``): ``run_episodes`` (each seed's own
+    scenario) with each episode's ``onpolicy_rows`` of its trajectory, in seed order."""
+    checked, _ = _check_task(ref, protocol, indices, None)
+    return _run(
+        ref,
+        protocol,
+        checked,
+        None,
+        lambda run: EpisodeRows(run.result, onpolicy_rows(run.trajectory.obs)),
+    )
+
+
+def _run[T](
+    ref: PolicyRef,
+    protocol: EvalProtocol,
+    checked: tuple[int, ...],
+    injected: tuple[Push, ...] | None,
+    keep: Callable[[EpisodeRun], T],
+) -> list[T]:
+    """``keep`` of each of the checked episodes, in order, on one env; the controller is rebuilt
+    (its sha256 re-checked) before the first episode."""
     factory = worker_factory(ref)
     env = BalanceEnv(protocol.preset, challenge=protocol.challenge, record=True)
     try:
         return [
-            run_episode(
-                env, factory, protocol.seeds[i], i, salt=protocol.salt, pushes=injected
-            ).result
+            keep(
+                run_episode(env, factory, protocol.seeds[i], i, salt=protocol.salt, pushes=injected)
+            )
             for i in checked
         ]
     finally:

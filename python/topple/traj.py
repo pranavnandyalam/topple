@@ -4,15 +4,14 @@ A trajectory is the complete, replayable record of one episode. Files are plain 
 small allow-list of dtypes so browsers can decode them. A file is untrusted: loading parses the
 archive and every member by hand (never unpickles, never evaluates a header, never allocates more
 than the format allows) and is only ever scored through trusted verification (``topple.verify``,
-contract §16).
+contract §16). The hand-parsed npz/npy reading lives in ``topple._npz``, shared with
+``topple export``'s run-directory inputs.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import re
-import struct
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -25,7 +24,9 @@ import numpy.typing as npt
 
 from topple._atomic import replacement
 from topple._inputs import open_regular
-from topple._zip import READ_CHUNK, Archive, MemberReader
+from topple._npz import MAX_NPY_HEADER_BYTES as MAX_NPY_HEADER_BYTES
+from topple._npz import read_member
+from topple._zip import Archive
 from topple.contract import BALANCE_V1_ACTION, FEATURES
 
 FORMAT = "topple.traj/1"
@@ -34,24 +35,11 @@ MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_DIRECTORY_BYTES = 16 * 1024
 """Largest zip central directory (an honest one lists its 11 members in under 1 KiB)."""
 MAX_MEMBER_BYTES = 16 * 1024 * 1024
-MAX_NPY_HEADER_BYTES = 4096
-"""Longest npy header (numpy writes 118 bytes for these arrays)."""
 MAX_STATE_DIM = 256
 """Most columns ``qpos``, ``qvel`` and ``epilogue_qpos`` may have (nq, nv <= this)."""
 MAX_META_BYTES = 256 * 1024
 """Most bytes of ``meta_json`` (an honest one is a few KiB)."""
 META = "meta_json"
-_NPY_MAGIC = b"\x93NUMPY"
-_NPY_LENGTH = {(1, 0): struct.Struct("<H"), (2, 0): struct.Struct("<I")}
-_NPY_HEADER = re.compile(
-    r"\{\s*'descr'\s*:\s*'(?P<descr>[\x20-\x26\x28-\x5b\x5d-\x7e]{1,32})'\s*,"
-    r"\s*'fortran_order'\s*:\s*(?P<fortran_order>True|False)\s*,"
-    r"\s*'shape'\s*:\s*\((?P<shape>[0-9,\s-]{0,256})\)\s*(?:,\s*)?\}\s*",
-    re.ASCII,
-)
-"""The header dict exactly as numpy writes it (key order fixed, whitespace and a trailing comma
-free): parsed here, never handed to a Python parser."""
-_NPY_DIM = re.compile(r"-?(?:0|[1-9][0-9]{0,18})", re.ASCII)
 _ALLOWED_DTYPES = {np.dtype("<f8"), np.dtype("<f4"), np.dtype("<i4"), np.dtype("|u1")}
 # name -> (dtype, fixed trailing shape, or None for the model-dependent nq / nv widths)
 _SCHEMA: dict[str, tuple[str, tuple[int, ...] | None]] = {
@@ -197,7 +185,7 @@ def _open_members(path: Path) -> Iterator[Archive]:
 def _build(path: Path, max_steps: int) -> Trajectory:
     with _open_members(path) as archive:
         arrays = {
-            name: _read_member(
+            name: read_member(
                 archive, name, np.dtype(dtype), partial(_array_limits, name, max_steps=max_steps)
             )
             for name, (dtype, _) in _SCHEMA.items()
@@ -212,7 +200,7 @@ def _read_meta_only(path: Path) -> dict[str, Any]:
 
 
 def _read_meta_member(archive: Archive) -> dict[str, Any]:
-    return _parse_meta(_read_member(archive, META, np.dtype("|u1"), _meta_limits))
+    return _parse_meta(read_member(archive, META, np.dtype("|u1"), _meta_limits))
 
 
 def _array_limits(name: str, shape: tuple[int, ...], *, max_steps: int) -> None:
@@ -244,103 +232,6 @@ def _meta_limits(shape: tuple[int, ...]) -> None:
     size = math.prod(shape)
     if size > MAX_META_BYTES:
         raise ValueError(f"{META} has {size} bytes, more than {MAX_META_BYTES}")
-
-
-def _read_member(
-    archive: Archive,
-    name: str,
-    dtype: np.dtype[Any],
-    limits: Callable[[tuple[int, ...]], None],
-) -> npt.NDArray[Any]:
-    """One ``.npy`` member, read by hand so a lying header can never trigger a big allocation:
-    its shape must pass ``limits`` and need exactly the bytes the member holds before any data
-    is read, and the member must then end exactly there (``MemberReader.finish``)."""
-    member = archive.open(f"{name}.npy")
-    shape = _read_header(member, name, dtype)
-    limits(shape)
-    nbytes = math.prod(shape) * dtype.itemsize
-    left = member.size - member.tell()
-    if nbytes > left:
-        raise ValueError(f"{name}: header shape {shape} needs more data than the member holds")
-    if nbytes < left:
-        raise ValueError(f"{name}: member size does not match its header shape {shape}")
-    data = _read_bounded(member, nbytes)
-    if len(data) != nbytes:
-        raise ValueError(f"{name}: the member holds less data than its size declares")
-    member.finish()
-    return np.frombuffer(data, dtype=dtype).reshape(shape)
-
-
-def _read_bounded(fh: MemberReader, size: int) -> bytes:
-    """Up to ``size`` bytes of a zip member, asking for at most ``READ_CHUNK`` at a time.
-
-    A deflated member inflates at most as many bytes as one read asks for, so no single read can
-    balloon, whatever the member declares.
-    """
-    parts: list[bytes] = []
-    while size > 0:
-        chunk = fh.read(min(size, READ_CHUNK))
-        if not chunk:
-            break
-        parts.append(chunk)
-        size -= len(chunk)
-    return b"".join(parts)
-
-
-def _read_header(fh: MemberReader, name: str, dtype: np.dtype[Any]) -> tuple[int, ...]:
-    """The shape in the npy header of member ``name``, which must hold C-ordered ``dtype``.
-
-    The header's length is checked before the header is read, and its text is parsed here,
-    never evaluated (``ast.literal_eval`` can exhaust the parser on a crafted header).
-    """
-    magic = _read_bounded(fh, len(_NPY_MAGIC) + 2)
-    if len(magic) != len(_NPY_MAGIC) + 2 or not magic.startswith(_NPY_MAGIC):
-        raise ValueError(f"{name}: not an npy member")
-    version = (magic[-2], magic[-1])
-    length_format = _NPY_LENGTH.get(version)
-    if length_format is None:
-        raise ValueError(f"{name}: unsupported npy version {version}")
-    raw_length = _read_bounded(fh, length_format.size)
-    if len(raw_length) != length_format.size:
-        raise ValueError(f"{name}: truncated npy header")
-    (length,) = length_format.unpack(raw_length)
-    if length > MAX_NPY_HEADER_BYTES:
-        raise ValueError(f"{name}: npy header has {length} bytes, more than {MAX_NPY_HEADER_BYTES}")
-    header = _read_bounded(fh, length)
-    if len(header) != length:
-        raise ValueError(f"{name}: truncated npy header")
-    return _parse_header(header.decode("latin1"), name, dtype)
-
-
-def _parse_header(text: str, name: str, dtype: np.dtype[Any]) -> tuple[int, ...]:
-    match = _NPY_HEADER.fullmatch(text)
-    if match is None:
-        raise ValueError(f"{name}: malformed npy header")
-    if match["fortran_order"] == "True":
-        raise ValueError(f"{name}: Fortran-ordered arrays are not allowed")
-    descr = match["descr"]
-    if descr.lstrip("<>|=").startswith("O"):
-        raise ValueError(f"{name}: Object arrays are not allowed")
-    if descr != dtype.str:
-        raise ValueError(f"{name}: expected dtype {dtype.str}, got {descr}")
-    shape = _parse_shape(match["shape"], name)
-    if any(n < 0 for n in shape):
-        raise ValueError(f"{name}: negative dimension in header shape {shape}")
-    return shape
-
-
-def _parse_shape(text: str, name: str) -> tuple[int, ...]:
-    """A tuple literal's contents: ``""`` is ``()``, one dimension needs its trailing comma."""
-    parts = [part.strip() for part in text.split(",")]
-    if parts == [""]:
-        return ()
-    if parts[-1] == "":
-        parts.pop()
-    elif len(parts) == 1:
-        raise ValueError(f"{name}: malformed npy header")  # ``(5)`` is an int, not a tuple
-    if not all(_NPY_DIM.fullmatch(part) for part in parts):
-        raise ValueError(f"{name}: malformed npy header")
-    return tuple(int(part) for part in parts)
 
 
 class _NonFiniteError(ValueError):

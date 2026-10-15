@@ -26,6 +26,11 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 SCANNED = ("python/topple", "scripts", "tests")
 TRAIN_DIR = "python/topple/train/"
+# The torch-free half of topple/train/ is scanned like the rest of the tree (§2.1: configs,
+# wrappers and selection never import torch; the CLI and ``topple export`` import them).
+TORCH_FREE_TRAIN = frozenset(
+    f"{TRAIN_DIR}{name}.py" for name in ("__init__", "config", "wrappers", "selection")
+)
 BANNED_MODULES = frozenset(
     {"pickle", "cloudpickle", "dill", "joblib", "shelve", "marshal", "torch", "stable_baselines3"}
 )
@@ -47,6 +52,14 @@ ALLOWED: dict[str, frozenset[str]] = {
     "tests/test_pool.py": frozenset({"pickle"}),
     # §3.3: generated once with the train extra
     "scripts/make_thirdparty_fixtures.py": frozenset({"torch"}),
+    # §2.1: make_train_env imports SB3's Monitor inside the function, never at module import
+    "python/topple/train/wrappers.py": frozenset({"stable_baselines3"}),
+    # its make_train_env case with SB3's real Monitor is train-marked (skipped without SB3)
+    "tests/test_train_wrappers.py": frozenset({"stable_baselines3"}),
+    # lr_fn's schedule pickles (SB3 saves it inside model.zip, resume only)
+    "tests/test_train_config.py": frozenset({"pickle"}),
+    # a selection task's EpisodeRows pickles small, never with its trajectory
+    "tests/test_selection.py": frozenset({"pickle"}),
     # these monkeypatch the readers to raise, proving validation and pack never call them
     "tests/test_policy_validate.py": frozenset({"numpy_helper"}),
     "tests/test_policy_canonical.py": frozenset({"numpy_helper"}),
@@ -59,8 +72,10 @@ ONNX_REFERENCES = frozenset(
         "load_external_data_for_model",
         "register_custom_ops_library",
         "infer_shapes_path",
+        "extract_model",  # onnx.utils.extract_model reads and writes model paths only
     }
 )
+REFERENCE_EVALUATOR = "ReferenceEvaluator"  # onnx.reference: a path argument means onnx.load
 ONNX_HUB = "onnx.hub"
 CHECK_MODEL = "onnx.checker.check_model"
 # what a ``check_model`` argument that is a path looks like (§3.4 bans ``check_model(path)``)
@@ -144,7 +159,7 @@ class Scanner(ast.NodeVisitor):
 
     def __init__(self, rel: str, aliases: dict[str, str] | None = None) -> None:
         self.rel = rel
-        self.train = rel.startswith(TRAIN_DIR)
+        self.train = rel.startswith(TRAIN_DIR) and rel not in TORCH_FREE_TRAIN
         self.allowed = ALLOWED.get(rel, frozenset())
         self.torch_free = not self.train and "torch" not in self.allowed
         self.aliases = aliases or {}
@@ -231,6 +246,10 @@ class Scanner(ast.NodeVisitor):
             model = node.args[0] if node.args else keyword(node, "model")
             if looks_like_a_path(model, self.canonical):
                 self.flag(node, "check_model(path)")
+        if self.torch_free and last == REFERENCE_EVALUATOR:
+            model = node.args[0] if node.args else keyword(node, "proto")
+            if looks_like_a_path(model, self.canonical):
+                self.flag(node, "ReferenceEvaluator(path)")
         if last == "InferenceSession" and not self.inside(SESSION_SITE):
             self.flag(node, "InferenceSession")
         if last == "add_session_config_entry":
@@ -354,6 +373,23 @@ OFFENDERS = {
     "onnx.checker.check_model(model=str(p))": "check_model(path)",
     "from onnx.checker import check_model as cm\ncm('m.onnx')": "check_model(path)",
     "import onnx.numpy_helper as nh\nnh.to_array(t)": "numpy_helper",
+    # path-based ONNX readers (slice 1c re-review)
+    "onnx.utils.extract_model('m.onnx', 'out.onnx', ['obs'], ['action'])": "extract_model",
+    "from onnx.utils import extract_model": "extract_model",
+    "import onnx.utils as u\nu.extract_model(src, dst, i, o)": "extract_model",
+    "onnx.reference.ReferenceEvaluator('m.onnx')": "ReferenceEvaluator(path)",
+    "from onnx.reference import ReferenceEvaluator\nReferenceEvaluator(model_path)": (
+        "ReferenceEvaluator(path)"
+    ),
+    "ReferenceEvaluator(proto=Path(p))": "ReferenceEvaluator(path)",
+    "ReferenceEvaluator(f'{d}/m.onnx', verbose=1)": "ReferenceEvaluator(path)",
+    # the torch-free half of topple/train/ is not exempt (§2.1)
+}
+TORCH_FREE_TRAIN_OFFENDERS = {
+    "import torch": "torch",
+    "from stable_baselines3 import PPO": "stable_baselines3",
+    "import pickle": "pickle",
+    "onnx.load('m.onnx')": "onnx.load",
 }
 
 
@@ -379,6 +415,9 @@ def test_each_rule_fires(source: str, what: str) -> None:
         "model.load(path)",  # no SB3 class named
         "PPO_load(p)",
         "from topple.traj import load_npz\nload_npz(p, max_steps=1000)",
+        "from onnx.reference import ReferenceEvaluator\nReferenceEvaluator(proto)",
+        "onnx.reference.ReferenceEvaluator(model, verbose=0)",
+        "ReferenceEvaluator(proto=model)",
     ],
 )
 def test_safe_code_passes(source: str) -> None:
@@ -415,3 +454,23 @@ def test_allow_listed_files_are_exempt_only_for_their_names() -> None:
     assert scan_source("tests/test_train_smoke.py", "import torch\nimport stable_baselines3") == []
     assert scan_source("tests/test_policy_canonical.py", "onnx.numpy_helper.to_array(t)") == []
     assert scan_source("tests/test_policy_canonical.py", "onnx.load('m')") != []
+
+
+@pytest.mark.parametrize("name", sorted(TORCH_FREE_TRAIN))
+@pytest.mark.parametrize(
+    ("source", "what"),
+    list(TORCH_FREE_TRAIN_OFFENDERS.items()),
+    ids=list(TORCH_FREE_TRAIN_OFFENDERS),
+)
+def test_the_torch_free_train_modules_are_scanned(name: str, source: str, what: str) -> None:
+    allowed = ALLOWED.get(name, frozenset())
+    found = {v.what for v in scan_source(name, source)}
+    assert what in found or what in allowed
+
+
+def test_the_train_extra_modules_stay_exempt() -> None:
+    assert scan_source("python/topple/train/callbacks.py", "import torch") == []
+    assert scan_source("python/topple/train/wrappers.py", "import torch") != []
+    lazy = "def make_train_env(cfg, i):\n    from stable_baselines3.common.monitor import Monitor\n"
+    assert scan_source("python/topple/train/wrappers.py", lazy) == []
+    assert scan_source("python/topple/train/config.py", lazy) != []

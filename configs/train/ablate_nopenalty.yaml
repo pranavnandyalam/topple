@@ -1,0 +1,24 @@
+# Action-excess penalty ablation (docs/design/phase-2.md §2.2, §5.2 item 6): ppo_balance.yaml
+# written out in full, differing only in seed, total_timesteps and env.action_excess. Its LR
+# schedule runs over 1M steps; the comparison point is the 1M eval of both runs.
+algo: ppo
+seed: 1
+total_timesteps: 1_000_000  # about 80 s; SB3 stops at 1,015,808
+n_envs: 8
+vec_env: subproc
+start_method: forkserver
+env:
+  challenge: balance-v1
+  preset: standard
+  max_drift_m: 2.0
+  reward: {tilt: 0.30, rate: 0.10, drift: 0.25, yaw_rate: 0.05, effort: 0.10, smooth: 0.20}
+  action_excess: {enabled: false}
+normalize: {obs: true, reward: false, clip_obs: 10.0, epsilon: 1.0e-8}
+policy: {net_arch: {pi: [64, 64], vf: [64, 64]}, activation: tanh, log_std_init: 0.0}
+ppo: {n_steps: 2048, batch_size: 2048, n_epochs: 10, gamma: 0.99, gae_lambda: 0.95,
+      learning_rate: {schedule: linear, initial: 3.0e-4, final: 0.0},
+      clip_range: 0.2, ent_coef: 0.0, vf_coef: 0.5, max_grad_norm: 0.5, target_kl: null}
+selection: {protocol: balance-v1/standard, seeds: {first: 2000, last: 2199}, every_steps: 250_000,
+            workers: 4, gate: pid, max_saturation: 0.08}   # 3 periodic + final = 4 evals
+limits: {max_wall_clock_s: 2400, max_cpu_s: 4500, max_tree_rss_mib: 8192}
+health: {min_std: 0.03, min_std_before_step: 2_000_000, regression_after_step: 2_000_000, regression_drop: 0.10}

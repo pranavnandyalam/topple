@@ -1,0 +1,22 @@
+# PPO on balance-v1 (docs/design/phase-2.md §2.2): the measured layout.
+algo: ppo
+seed: 0                     # runs use --seed 0, 1, 2
+total_timesteps: 5_000_000  # SB3 stops at 5,013,504 (306 rollouts of 16,384)
+n_envs: 8
+vec_env: subproc            # subproc | dummy (tests)
+start_method: forkserver    # SubprocVecEnv start method, pinned and recorded (determinism key)
+env:
+  challenge: balance-v1
+  preset: standard          # from step 0; no curriculum
+  max_drift_m: 2.0          # training-only termination (reason "drift")
+  reward: {tilt: 0.30, rate: 0.10, drift: 0.25, yaw_rate: 0.05, effort: 0.10, smooth: 0.20}
+  action_excess: {enabled: true, box: 2.0, weight: 0.10}
+normalize: {obs: true, reward: false, clip_obs: 10.0, epsilon: 1.0e-8}
+policy: {net_arch: {pi: [64, 64], vf: [64, 64]}, activation: tanh, log_std_init: 0.0}
+ppo: {n_steps: 2048, batch_size: 2048, n_epochs: 10, gamma: 0.99, gae_lambda: 0.95,
+      learning_rate: {schedule: linear, initial: 3.0e-4, final: 0.0},   # clamped: progress reaches -0.0027
+      clip_range: 0.2, ent_coef: 0.0, vf_coef: 0.5, max_grad_norm: 0.5, target_kl: null}
+selection: {protocol: balance-v1/standard, seeds: {first: 2000, last: 2199}, every_steps: 250_000,
+            workers: 4, gate: pid, max_saturation: 0.08}   # 19 periodic + final = 20 evals
+limits: {max_wall_clock_s: 2400, max_cpu_s: 4500, max_tree_rss_mib: 8192}
+health: {min_std: 0.03, min_std_before_step: 2_000_000, regression_after_step: 2_000_000, regression_drop: 0.10}
