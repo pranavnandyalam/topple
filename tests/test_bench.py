@@ -130,6 +130,18 @@ def test_a_level_at_exactly_50_percent_is_the_crossing() -> None:
     assert impulse_at_50(curve([1.0, 0.75, 0.5, 0.0])) == pytest.approx(0.35, abs=1e-12)
 
 
+def test_a_plateau_at_50_percent_crosses_at_its_last_level() -> None:
+    """Survival that holds at exactly 50% over several levels falls through 50% only after
+    the last of them, so i50 is that level, not the first one at 50% (quality-F7)."""
+    assert impulse_at_50(curve([1.0, 0.5, 0.5, 0.0])) == pytest.approx(0.35, abs=1e-12)
+    assert impulse_at_50(curve([0.5, 0.5, 0.25])) == pytest.approx(0.325, abs=1e-12)
+
+
+def test_a_curve_that_starts_below_half_can_cross_later() -> None:
+    # 0.325 (75%) to 0.35 (25%): 0.325 + (0.75 - 0.5) / (0.75 - 0.25) * 0.025
+    assert impulse_at_50(curve([0.25, 0.75, 0.25])) == pytest.approx(0.3375, abs=1e-12)
+
+
 def test_only_the_first_crossing_counts() -> None:
     assert impulse_at_50(curve([0.75, 0.25, 1.0, 0.0])) == pytest.approx(0.3125, abs=1e-12)
 

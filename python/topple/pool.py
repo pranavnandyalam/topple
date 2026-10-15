@@ -166,18 +166,40 @@ def _check_task(
 
 
 def _checked_pushes(pushes: Iterable[Push]) -> tuple[Push, ...]:
-    """``pushes`` as a tuple of ``Push`` (exactly), sorted by start step with no repeats; the
-    env checks the rest of the schedule against its clock at reset (contract §9)."""
+    """``pushes`` as a tuple of ``Push`` (exactly), each one that can fire (an int
+    ``start_step >= 0``, an int ``n_substeps >= 1``) with a finite magnitude, direction and
+    lateral ratio, sorted by start step with no repeats; the env checks the rest of the
+    schedule against its clock at reset (contract §9)."""
     injected = tuple(itertools.islice(pushes, MAX_TASK_PUSHES + 1))
     if len(injected) > MAX_TASK_PUSHES:
         raise ValueError(f"a task injects at most {MAX_TASK_PUSHES} pushes")
     if not all(type(p) is Push for p in injected):
         raise ValueError("pushes must be topple.disturbances.Push objects")
     for p in injected:  # a trusted hook skips the bounds, never the arithmetic (contract §9)
-        if not (math.isfinite(p.magnitude_n) and math.isfinite(p.lateral_ratio)):
-            raise ValueError("injected pushes must have a finite magnitude and lateral ratio")
+        if not (_whole(p.start_step, 0) and _whole(p.n_substeps, 1)):
+            raise ValueError(
+                "injected pushes need an int start_step >= 0 and an int n_substeps >= 1"
+            )
+        if not all(map(_finite, (p.magnitude_n, p.forward_sign, p.lateral_ratio))):
+            raise ValueError(
+                "injected pushes must have a finite magnitude, direction and lateral ratio"
+            )
     check_push_schedule(injected)
     return injected
+
+
+def _whole(value: object, least: int) -> bool:
+    return type(value) is int and value >= least
+
+
+def _finite(value: object) -> bool:
+    """A real number (not a bool) that is a finite float: an int too large for a float is not."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def run_episodes(

@@ -103,7 +103,9 @@ def _set_mode(fd: int, path: Path) -> None:
 def new_directory(path: Path) -> Iterator[Path]:
     """A new, private, empty directory next to ``path`` for the block to fill, renamed to
     ``path`` (mode ``DIRECTORY_MODE``) when the block succeeds, and removed with everything in
-    it when the block fails: ``path`` appears complete or not at all.
+    it when the block fails: ``path`` appears complete or not at all. Missing parent
+    directories are created; a failure removes the ones created here again (each only if it
+    is empty), so a failure leaves nothing behind.
 
     ``FileExistsError`` if anything (a symlink included) is at ``path`` before the block, or
     after it: an existing directory is never written into or replaced. A directory created at
@@ -112,8 +114,13 @@ def new_directory(path: Path) -> Iterator[Path]:
     """
     if os.path.lexists(path):
         raise FileExistsError(errno.EEXIST, "already exists", str(path))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=".partial"))
+    created = _missing_directories(path.parent)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=".partial"))
+    except BaseException:
+        _remove_empty(created)
+        raise
     try:
         yield tmp
         os.chmod(tmp, DIRECTORY_MODE)
@@ -122,7 +129,27 @@ def new_directory(path: Path) -> Iterator[Path]:
         os.rename(tmp, path)
     except BaseException:
         shutil.rmtree(tmp, ignore_errors=True)
+        _remove_empty(created)
         raise
+
+
+def _missing_directories(directory: Path) -> list[Path]:
+    """``directory`` and those of its ancestors that do not exist yet, deepest first."""
+    missing: list[Path] = []
+    while not os.path.lexists(directory) and directory.parent != directory:
+        missing.append(directory)
+        directory = directory.parent
+    return missing
+
+
+def _remove_empty(directories: list[Path]) -> None:
+    """Remove ``directories`` (deepest first) while they are empty; stop at the first that is
+    not (someone else wrote into it) or cannot be removed."""
+    for directory in directories:
+        try:
+            os.rmdir(directory)
+        except OSError:
+            return
 
 
 def write_new_file(path: Path, data: bytes) -> None:

@@ -69,6 +69,7 @@ class _Playback:
     width: int
     height: int
     camera: str
+    control_dt: float
 
 
 def render_trajectory(
@@ -150,7 +151,7 @@ def _playback(
     rows = np.concatenate([traj.qpos, traj.epilogue_qpos]) if with_epilogue else traj.qpos
     starts = range(0, rows.shape[0], stride)
     pushes = tuple(_push_at(traj.push_force, k, stride) if show_pushes else None for k in starts)
-    return _Playback(model, rows[::stride], pushes, width, height, camera)
+    return _Playback(model, rows[::stride], pushes, width, height, camera, control_dt)
 
 
 def _model(traj: Trajectory) -> tuple[mujoco.MjModel, float]:
@@ -310,14 +311,19 @@ def side_by_side_timeline(
     ``STAMP_HOLD_S`` hold after the end of the last stamped pane, whichever is later."""
     if not trajs:
         raise ValueError("a side-by-side video has at least one pane")
-    panes = tuple(_pane_timeline(t, fps) for t in trajs)
+    return _timeline(trajs, [_model(t)[1] for t in trajs], fps)
+
+
+def _timeline(
+    trajs: Sequence[Trajectory], control_dts: Sequence[float], fps: int
+) -> tuple[tuple[PaneTimeline, ...], int]:
+    panes = tuple(_pane_timeline(t, dt, fps) for t, dt in zip(trajs, control_dts, strict=True))
     hold = round(STAMP_HOLD_S * fps)
     total = max(p.frames + (hold if p.stamp is not None else 0) for p in panes)
     return panes, total
 
 
-def _pane_timeline(traj: Trajectory, fps: int) -> PaneTimeline:
-    _, control_dt = _model(traj)
+def _pane_timeline(traj: Trajectory, control_dt: float, fps: int) -> PaneTimeline:
     stride = _stride(fps, control_dt)
     rows = traj.qpos.shape[0] + (traj.epilogue_qpos.shape[0] if _shows_epilogue(traj.meta) else 0)
     return PaneTimeline(frames=math.ceil(rows / stride), stamp=_stamp(traj, control_dt))
@@ -325,13 +331,14 @@ def _pane_timeline(traj: Trajectory, fps: int) -> PaneTimeline:
 
 def _stamp(traj: Trajectory, control_dt: float) -> str | None:
     """``ERROR at t`` for an episode with an error (``sim_unstable`` included), ``FELL at t`` for
-    a fall, else ``None``; t is when the episode ended (its T steps, from the arrays)."""
+    a fall, else ``None``; t is when the episode ended (its T steps, from the arrays). The meta
+    is untrusted (contract §14): a reason that is not a string names no fall."""
     t = traj.steps * control_dt
     if traj.meta.get("error") is not None:
         return f"ERROR at {t:.2f} s"
     termination = traj.meta.get("termination")
     reason = termination.get("reason") if isinstance(termination, dict) else None
-    if reason in FALL_REASONS:
+    if isinstance(reason, str) and reason in FALL_REASONS:
         return f"FELL at {t:.2f} s"
     return None
 
@@ -370,7 +377,7 @@ def side_by_side_frames(
     ``render_side_by_side``. Arguments are validated at once; the renderers open at the first
     frame and close when the generator is exhausted or closed."""
     plays = _side_by_side_plays(trajs, labels, pane, fps)
-    panes, total = side_by_side_timeline(trajs, fps)
+    panes, total = _timeline(trajs, [play.control_dt for play in plays], fps)
     return _composed(plays, tuple(labels), panes, total)
 
 
@@ -455,9 +462,11 @@ def text_width(text: str, px: int) -> float:
     return float(_font(px).getlength(text))
 
 
+@lru_cache(maxsize=64)
 def fit_text(text: str, max_width: float, px: int) -> str:
     """``printable_ascii(text)``, cut and ended with ``...`` if it is wider than
-    ``max_width`` pixels at ``px``; empty if not even that fits."""
+    ``max_width`` pixels at ``px``; empty if not even that fits. Cached: a pane's label is
+    fitted once, not on every frame (each fit measures up to one candidate per character)."""
     shown = printable_ascii(text)
     if text_width(shown, px) <= max_width:
         return shown

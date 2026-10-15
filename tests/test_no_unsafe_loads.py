@@ -5,17 +5,19 @@ imports a pickle-family module, torch or Stable-Baselines3, except the fixed (fi
 allow-list below. In the torch-free tree the only ONNX entry point is
 ``onnx.ModelProto.FromString``: no ``onnx.load*``, no external-data loading, no
 ``numpy_helper`` (its ``to_array`` reads external data), no custom-op libraries, and ONNX
-Runtime sessions and their config entries only in ``runtime.make_session``. SB3 and
-VecNormalize loads only in ``learn.resume_from``. Everywhere: no unsafe YAML loads, no
-``allow_pickle=True``, no ``torch.load`` without ``weights_only=True``.
+Runtime sessions and their config entries only in ``runtime.make_session``; no path-based
+readers either (``infer_shapes_path``, ``onnx.hub``, ``check_model`` given a path, §3.4). SB3
+and VecNormalize loads (qualified or not) only in ``learn.resume_from``. Everywhere: no unsafe
+YAML loads, no ``allow_pickle=True``, no ``torch.load`` without ``weights_only=True``.
 
-The scan is name-based: ``getattr`` evasion is out of scope (§6).
+The scan is name-based: ``getattr`` evasion is out of scope (§6). Names imported under another
+name (``import onnx as ox``, ``from yaml import load as y``) are read as what they import.
 """
 
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,8 +58,14 @@ ONNX_REFERENCES = frozenset(
         "external_data_helper",
         "load_external_data_for_model",
         "register_custom_ops_library",
+        "infer_shapes_path",
     }
 )
+ONNX_HUB = "onnx.hub"
+CHECK_MODEL = "onnx.checker.check_model"
+# what a ``check_model`` argument that is a path looks like (§3.4 bans ``check_model(path)``)
+PATH_CALLS = frozenset({"Path", "PurePath", "PosixPath", "str", "fspath", "join", "joinpath"})
+PATH_WORDS = ("path", "file")
 SESSION_SITE = ("python/topple/policy/runtime.py", "make_session")
 SESSION_KEYS = frozenset(
     {
@@ -100,16 +108,55 @@ def keyword(call: ast.Call, name: str) -> ast.expr | None:
     return next((k.value for k in call.keywords if k.arg == name), None)
 
 
+def import_aliases(tree: ast.AST) -> dict[str, str]:
+    """(local name -> what it imports) for every ``import x as y`` and ``from m import n [as
+    y]`` in ``tree`` (absolute imports; file-wide, as the scan is name-based)."""
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    aliases[a.asname] = a.name
+        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+            for a in node.names:
+                if a.name != "*":
+                    aliases[a.asname or a.name] = f"{node.module}.{a.name}"
+    return aliases
+
+
+def looks_like_a_path(node: ast.expr | None, canonical: Callable[[str], str]) -> bool:
+    """Whether a ``check_model`` argument is (by its form or name) a path, not a proto."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if isinstance(node, ast.BinOp):
+        return isinstance(node.op, ast.Div)  # Path / "m.onnx"
+    if isinstance(node, ast.Call):
+        return canonical(dotted(node.func) or "").rsplit(".", 1)[-1] in PATH_CALLS
+    name = dotted(node) if node is not None else None
+    last = (name or "").rsplit(".", 1)[-1].lower()
+    return any(word in last for word in PATH_WORDS)
+
+
 class Scanner(ast.NodeVisitor):
     """Collects the violations of one file (``rel``, repository-relative POSIX path)."""
 
-    def __init__(self, rel: str) -> None:
+    def __init__(self, rel: str, aliases: dict[str, str] | None = None) -> None:
         self.rel = rel
         self.train = rel.startswith(TRAIN_DIR)
         self.allowed = ALLOWED.get(rel, frozenset())
         self.torch_free = not self.train and "torch" not in self.allowed
+        self.aliases = aliases or {}
         self.functions: list[str] = []
         self.found: list[Violation] = []
+
+    def canonical(self, name: str) -> str:
+        """``name`` with its first part replaced by what that part imports, if it is an alias
+        (``ox.load`` after ``import onnx as ox`` is ``onnx.load``)."""
+        first, dot, rest = name.partition(".")
+        target = self.aliases.get(first)
+        return f"{target}{dot}{rest}" if target else name
 
     def flag(self, node: ast.AST, what: str) -> None:
         if what not in self.allowed:
@@ -125,6 +172,8 @@ class Scanner(ast.NodeVisitor):
             for part in name.split("."):
                 if part in ONNX_REFERENCES:
                     self.flag(node, part)
+            if name == ONNX_HUB or name.startswith(f"{ONNX_HUB}."):
+                self.flag(node, ONNX_HUB)
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -166,7 +215,7 @@ class Scanner(ast.NodeVisitor):
     # calls ----------------------------------------------------------------------------------
 
     def visit_Call(self, node: ast.Call) -> None:
-        name = dotted(node.func) or ""
+        name = self.canonical(dotted(node.func) or "")
         last = name.rsplit(".", 1)[-1]
         if name in ("__import__", "importlib.import_module") and node.args:
             target = node.args[0]
@@ -174,6 +223,14 @@ class Scanner(ast.NodeVisitor):
                 self.module(node, target.value)
         if self.torch_free and name.startswith("onnx.load"):
             self.flag(node, "onnx.load")
+        if self.torch_free and name.startswith(f"{ONNX_HUB}."):
+            self.flag(node, ONNX_HUB)
+        if self.torch_free and last == "infer_shapes_path":
+            self.flag(node, "infer_shapes_path")
+        if self.torch_free and name == CHECK_MODEL:
+            model = node.args[0] if node.args else keyword(node, "model")
+            if looks_like_a_path(model, self.canonical):
+                self.flag(node, "check_model(path)")
         if last == "InferenceSession" and not self.inside(SESSION_SITE):
             self.flag(node, "InferenceSession")
         if last == "add_session_config_entry":
@@ -181,8 +238,11 @@ class Scanner(ast.NodeVisitor):
             literal = isinstance(first, ast.Constant) and first.value in SESSION_KEYS
             if not (self.inside(SESSION_SITE) and literal):
                 self.flag(node, "add_session_config_entry")
-        if (name in SB3_LOADS or last == "load_from_zip_file") and not self.inside(SB3_SITE):
-            self.flag(node, name)
+        sb3 = next((s for s in SB3_LOADS if name == s or name.endswith(f".{s}")), None)
+        if last == "load_from_zip_file":
+            sb3 = last
+        if sb3 is not None and not self.inside(SB3_SITE):
+            self.flag(node, sb3)
         if name.startswith("yaml.") and last in UNSAFE_YAML:
             self.flag(node, name)
         if is_true(keyword(node, "allow_pickle")):
@@ -193,8 +253,9 @@ class Scanner(ast.NodeVisitor):
 
 
 def scan_source(rel: str, source: str) -> list[Violation]:
-    scanner = Scanner(rel)
-    scanner.visit(ast.parse(source, filename=rel))
+    tree = ast.parse(source, filename=rel)
+    scanner = Scanner(rel, import_aliases(tree))
+    scanner.visit(tree)
     return scanner.found
 
 
@@ -225,9 +286,10 @@ def test_the_allow_list_names_real_reasons() -> None:
         path = REPO / rel
         if not path.exists():
             continue  # a deferred or train-only file (§6)
-        scanner = Scanner(rel)
+        tree = ast.parse(path.read_text("utf-8"))
+        scanner = Scanner(rel, import_aliases(tree))
         scanner.allowed = frozenset()
-        scanner.visit(ast.parse(path.read_text("utf-8")))
+        scanner.visit(tree)
         used = {v.what for v in scanner.found}
         assert names <= used, f"{rel}: unused allow-list entries {sorted(names - used)}"
 
@@ -267,6 +329,31 @@ OFFENDERS = {
     "np.load(path, allow_pickle=True)": "allow_pickle=True",
     "torch.load(path)": "torch.load without weights_only=True",
     "torch.load(path, weights_only=False)": "torch.load without weights_only=True",
+    # qualified SB3 loads (spec-SPEC-4)
+    "stable_baselines3.PPO.load(p)": "PPO.load",
+    "sb3.SAC.load(p)": "SAC.load",
+    "vec_env.VecNormalize.load(p, env)": "VecNormalize.load",
+    "from stable_baselines3 import PPO as Algo\nAlgo.load(p)": "PPO.load",
+    "save_util.load_from_zip_file(p)": "load_from_zip_file",
+    # aliased modules and path-based ONNX readers (quality-F9)
+    "import onnx as ox\nox.load('m.onnx')": "onnx.load",
+    "from onnx import load_model_from_string as lm\nlm(b'')": "onnx.load",
+    "import yaml as y\ny.load(text)": "yaml.load",
+    "from yaml import unsafe_load as ul\nul(text)": "yaml.unsafe_load",
+    "onnx.shape_inference.infer_shapes_path('m.onnx')": "infer_shapes_path",
+    "from onnx.shape_inference import infer_shapes_path": "infer_shapes_path",
+    "import onnx as ox\nox.shape_inference.infer_shapes_path(p, q)": "infer_shapes_path",
+    "from onnx import hub\nhub.load('resnet50')": "onnx.hub",
+    "import onnx.hub": "onnx.hub",
+    "onnx.hub.load('resnet50')": "onnx.hub",
+    "onnx.checker.check_model('m.onnx')": "check_model(path)",
+    "onnx.checker.check_model(f'{d}/m.onnx')": "check_model(path)",
+    "onnx.checker.check_model(Path(p))": "check_model(path)",
+    "onnx.checker.check_model(model_path, full_check=True)": "check_model(path)",
+    "onnx.checker.check_model(d / 'm.onnx')": "check_model(path)",
+    "onnx.checker.check_model(model=str(p))": "check_model(path)",
+    "from onnx.checker import check_model as cm\ncm('m.onnx')": "check_model(path)",
+    "import onnx.numpy_helper as nh\nnh.to_array(t)": "numpy_helper",
 }
 
 
@@ -284,6 +371,14 @@ def test_each_rule_fires(source: str, what: str) -> None:
         "monkeypatch.setattr(ort, 'InferenceSession', fake)",
         "import onnxruntime as ort",
         "from onnx import helper, TensorProto",
+        "onnx.checker.check_model(proto, full_check=True)",
+        "import onnx as ox\nox.checker.check_model(model)",
+        "onnx.shape_inference.infer_shapes(proto, strict_mode=True)",
+        "from yaml import safe_load as load\nload(text)",
+        "import numpy as np\nnp.load(path)",
+        "model.load(path)",  # no SB3 class named
+        "PPO_load(p)",
+        "from topple.traj import load_npz\nload_npz(p, max_steps=1000)",
     ],
 )
 def test_safe_code_passes(source: str) -> None:

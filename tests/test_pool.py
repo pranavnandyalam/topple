@@ -378,8 +378,34 @@ def test_pushes_reach_the_worker_as_a_tuple(tmp_path: Path) -> None:
         itertools.repeat(SHOVE),
         [replace(SHOVE, magnitude_n=float("nan"))],
         [replace(SHOVE, lateral_ratio=float("inf"))],
+        # pushes that could never fire, or fire as NaN (quality-F6)
+        [replace(SHOVE, start_step=100.5)],  # type: ignore[arg-type]
+        [replace(SHOVE, start_step=-1)],
+        [replace(SHOVE, start_step=True)],
+        [replace(SHOVE, n_substeps=0)],
+        [replace(SHOVE, n_substeps=50.0)],  # type: ignore[arg-type]
+        [replace(SHOVE, forward_sign=float("nan"))],
+        [replace(SHOVE, magnitude_n="40")],  # type: ignore[arg-type]
+        [replace(SHOVE, lateral_ratio=None)],  # type: ignore[arg-type]
+        [replace(SHOVE, magnitude_n=10**400)],
     ],
-    ids=["not-a-push", "unsorted", "repeated", "endless", "nan-force", "inf-lateral"],
+    ids=[
+        "not-a-push",
+        "unsorted",
+        "repeated",
+        "endless",
+        "nan-force",
+        "inf-lateral",
+        "fractional-start",
+        "negative-start",
+        "bool-start",
+        "no-substeps",
+        "float-substeps",
+        "nan-direction",
+        "string-force",
+        "none-lateral",
+        "huge-int-force",
+    ],
 )
 def test_bad_pushes_are_refused_in_the_parent(tmp_path: Path, pushes: Any) -> None:
     ref = policy_ref(write_policy_dir(tmp_path / "bot"), challenge=BALANCE)

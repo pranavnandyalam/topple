@@ -171,6 +171,34 @@ def test_timeline_follows_fps(fallen: Trajectory) -> None:
         assert pane.frames == math.ceil(rows / (100 // fps))
 
 
+ODD_TERMINATIONS: dict[str, object] = {
+    "reason-list": {"step": 0, "reason": ["fell"]},
+    "reason-dict": {"step": 0, "reason": {"a": 1}},
+    "reason-int": {"step": 0, "reason": 5},
+    "reason-missing": {"step": 0},
+    "termination-list": ["fell"],
+    "termination-string": "fell",
+}
+
+
+def odd_meta(traj: Trajectory, termination: object) -> Trajectory:
+    """``traj`` with an untrusted ``termination`` of another JSON shape (contract §14) and no
+    error."""
+    return replace(traj, meta={**traj.meta, "error": None, "termination": termination})
+
+
+@pytest.mark.parametrize("termination", list(ODD_TERMINATIONS.values()), ids=list(ODD_TERMINATIONS))
+def test_a_reason_that_is_not_a_string_names_no_fall(
+    fallen: Trajectory, termination: object
+) -> None:
+    """A reason of another JSON type is no recorded reason (as ``_shows_epilogue`` reads it):
+    the pane plays its rows without the epilogue and is never stamped; nothing raises."""
+    (pane,), total = side_by_side_timeline([odd_meta(fallen, termination)], fps=50)
+    assert pane.stamp is None
+    assert pane.frames == math.ceil(fallen.qpos.shape[0] / 2)
+    assert total == pane.frames
+
+
 # --- labels and frame rule --------------------------------------------------------------------
 
 
@@ -184,6 +212,34 @@ def test_fit_text_trims_to_the_width() -> None:
 
 def test_fit_text_shows_untrusted_text_as_printable_ascii() -> None:
     assert fit_text("bot\x1b[2J\nnext‮é", 1000, 20) == "bot?[2J?next??"
+
+
+def blank_frames(play: Any) -> Iterator[Frame]:
+    """Stands in for ``video._frames`` (no GL): one black pane per row."""
+    for _ in play.rows:
+        yield np.zeros((play.height, play.width, 3), np.uint8)
+
+
+def test_each_label_is_fitted_once_not_per_frame(
+    fallen: Trajectory, survivor: Trajectory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fitting a label measures up to one candidate per character; the label and the pane
+    never change, so a long label costs that once, not on every frame (quality-F11)."""
+    calls = 0
+    real = video.text_width
+
+    def counting(text: str, px: int) -> float:
+        nonlocal calls
+        calls += 1
+        return real(text, px)
+
+    monkeypatch.setattr(video, "_frames", blank_frames)
+    monkeypatch.setattr(video, "text_width", counting)
+    label = "F11" + "x" * (video.MAX_LABEL_CHARS - 3)  # fitted by no other test
+    with closing(side_by_side_frames([fallen, survivor], [label, "PPO"], pane=64, fps=10)) as it:
+        count = sum(1 for _ in it)
+    assert count > 50
+    assert calls < 4 * video.MAX_LABEL_CHARS  # per frame, it was about 200 calls each
 
 
 def test_annotate_draws_inside_the_pane() -> None:
@@ -492,6 +548,27 @@ def test_cli_video_refuses_a_file_naming_no_known_challenge(
     result = invoke(odd, npzs[1], tmp_path / "x.mp4")
     assert result.exit_code == 2
     assert "odd.npz" in result.output
+
+
+@pytest.mark.parametrize("termination", list(ODD_TERMINATIONS.values()), ids=list(ODD_TERMINATIONS))
+def test_cli_video_survives_odd_termination_meta(
+    npzs: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    termination: object,
+) -> None:
+    """A crafted file whose ``termination`` (or its reason) is another JSON type (quality-F2:
+    a list or dict reason raised ``TypeError: unhashable``, exit 1 with a traceback) renders
+    unstamped (no GL here: the panes are blank)."""
+    traj = traj_module.load_npz(npzs[1], max_steps=1000)
+    odd = tmp_path / "odd.npz"
+    odd_meta(traj, termination).save_npz(odd)
+    monkeypatch.setattr(video, "_frames", blank_frames)
+    out = tmp_path / "x.mp4"
+    result = invoke(odd, npzs[0], out, "--fps", "10", "--size", "64")
+    assert result.exit_code == 0, result.output
+    assert result.exception is None
+    assert out.is_file()
 
 
 def test_cli_video_a_file_that_does_not_load_exits_2(

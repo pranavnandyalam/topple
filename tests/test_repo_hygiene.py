@@ -16,7 +16,10 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-PICKLE_FAMILY = (".pkl", ".pickle", ".joblib", ".pt", ".pth", ".ckpt", ".npz.pkl", ".dill")
+# §3.1's refused entries that a submission directory never holds: the pickle family (SB3's
+# model.zip is a zip of pickles) and native code
+PICKLE_FAMILY = (".pkl", ".pickle", ".joblib", ".pt", ".pth", ".ckpt", ".npz.pkl", ".dill", ".zip")
+NATIVE_CODE = (".so", ".dylib", ".pyd", ".dll")
 EXTERNAL_DATA = (".onnx.data", ".onnx_data", ".data")
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -37,14 +40,47 @@ def submission_files() -> list[str]:
     return sorted(set(filter(None, (tracked.stdout + untracked.stdout).split("\0"))))
 
 
+def refused(rel: str) -> bool:
+    """Whether ``rel`` (a path under ``submissions/``) is a file the repository never holds
+    there: pickle family, native code, external tensor data or anything hidden."""
+    name = rel.lower()
+    return name.endswith(PICKLE_FAMILY + NATIVE_CODE + EXTERNAL_DATA) or any(
+        part.startswith(".") for part in Path(rel).parts
+    )
+
+
 def test_submissions_hold_no_pickles_external_data_or_hidden_files() -> None:
     files = submission_files()
     assert files, "submissions/ is empty?"
-    for rel in files:
-        name = rel.lower()
-        assert not name.endswith(PICKLE_FAMILY), rel
-        assert not name.endswith(EXTERNAL_DATA), rel
-        assert not any(part.startswith(".") for part in Path(rel).parts), rel
+    assert [rel for rel in files if refused(rel)] == []
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "submissions/ppo_balance/model.zip",  # spec-SPEC-6
+        "submissions/ppo_balance/vecnormalize.pkl",
+        "submissions/ppo_balance/policy.onnx.data",
+        "submissions/bot/_ext.cpython-312-x86_64-linux-gnu.so",
+        "submissions/ppo_balance/.DS_Store",
+        "submissions/.hidden/policy.onnx",
+    ],
+)
+def test_the_refused_files(rel: str) -> None:
+    assert refused(rel)
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "submissions/pid_example.py",
+        "submissions/README.md",
+        "submissions/ppo_balance/policy.onnx",
+        "submissions/ppo_balance/policy.json",
+    ],
+)
+def test_the_kept_files(rel: str) -> None:
+    assert not refused(rel)
 
 
 @pytest.mark.parametrize(

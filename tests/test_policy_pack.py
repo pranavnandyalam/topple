@@ -54,7 +54,13 @@ from topple.policy.build import policy_metadata
 from topple.policy.manifest import read_manifest
 from topple.policy.pack import pack_policy
 from topple.policy.runtime import load_policy_dir
-from topple.policy.validate import CANONICAL_IR, MAX_ONNX_BYTES, METADATA_KEYS, structure_match
+from topple.policy.validate import (
+    CANONICAL_IR,
+    MAX_ONNX_BYTES,
+    METADATA_KEYS,
+    identity_resolver,
+    structure_match,
+)
 
 BALANCE = load_challenge("balance-v1")
 DATA = Path(__file__).parent / "data"
@@ -294,6 +300,86 @@ def test_foreign_metadata_is_dropped_and_the_seven_keys_replaced() -> None:
     assert meta == policy_metadata(balance_spec(), "clip(mean)")
 
 
+def length_delimited(tag: int, payload: bytes) -> bytes:
+    """One protobuf length-delimited field (``payload`` under 128 bytes)."""
+    assert len(payload) < 128
+    return bytes([(tag << 3) | 2, len(payload)]) + payload
+
+
+INVALID_UTF8 = b"\xff\xfe"
+# ModelProto field 14 is metadata_props (StringStringEntryProto: key = 1, value = 2); appended
+# fields merge into the message.
+FOREIGN_INVALID_UTF8 = {
+    "value": length_delimited(
+        14, length_delimited(1, b"author") + length_delimited(2, INVALID_UTF8)
+    ),
+    "key": length_delimited(
+        14, length_delimited(1, b"a" + INVALID_UTF8) + length_delimited(2, b"x")
+    ),
+    "both": length_delimited(
+        14, length_delimited(1, INVALID_UTF8) + length_delimited(2, INVALID_UTF8)
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "extra", list(FOREIGN_INVALID_UTF8.values()), ids=list(FOREIGN_INVALID_UTF8)
+)
+def test_foreign_metadata_that_is_not_utf8_is_dropped_too(extra: bytes) -> None:
+    """Pack drops all foreign metadata (§3.3), so a key or value that is not valid UTF-8 is
+    dropped unread, like an invalid doc string, not refused as ``invalid_utf8`` (quality-F5)."""
+    assert pack(ppo_bytes() + extra)["policy.onnx"] == ppo_bytes()
+
+
+class CountingAliases(dict[str, str]):
+    """An alias map that counts its lookups."""
+
+    lookups = 0
+
+    def __contains__(self, key: object) -> bool:
+        self.lookups += 1
+        return super().__contains__(key)
+
+    def __getitem__(self, key: str) -> str:
+        self.lookups += 1
+        return super().__getitem__(key)
+
+
+def test_an_identity_chain_is_walked_once_however_often_it_is_read() -> None:
+    """A chain of n Identity nodes read m times costs O(n + m) lookups, not O(n·m): a 1 MiB
+    model (17,000 Identity nodes, 27,000 readers) took 35 s of CPU in pack before any node cap
+    could refuse it (quality-F4)."""
+    n = m = 2_000
+    aliases = CountingAliases({f"i{k}": f"i{k - 1}" if k else "obs" for k in range(n)})
+    resolve = identity_resolver(aliases)
+    assert all(resolve(f"i{n - 1}") == "obs" for _ in range(m))
+    assert all(resolve(f"i{k}") == "obs" for k in range(n))
+    assert resolve("obs") == "obs"
+    assert aliases.lookups < 4 * (n + m)
+    with pytest.raises(ValueError, match="identity_cycle"):
+        identity_resolver({"a": "b", "b": "c", "c": "a"})("a")
+    with pytest.raises(ValueError, match="identity_cycle"):
+        identity_resolver({"t": "a", "a": "b", "b": "a"})("t")
+
+
+def test_a_long_identity_chain_is_canonicalized_then_refused() -> None:
+    """End to end: 4,000 Identity nodes read by 4,000 nodes are resolved in one pass and the
+    canonical model is then refused by check 7."""
+    nodes = [helper.make_node("Identity", ["x"], ["i0"])]
+    nodes += [helper.make_node("Identity", [f"i{k - 1}"], [f"i{k}"]) for k in range(1, 4_000)]
+    nodes += [helper.make_node("Relu", ["i3999"], [f"r{k}"]) for k in range(4_000)]
+    nodes.append(helper.make_node("Relu", ["i3999"], ["y"]))
+    graph = helper.make_graph(
+        nodes,
+        "g",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, D])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, A])],
+    )
+    model = helper.make_model(graph, ir_version=8, opset_imports=[helper.make_opsetid("", 17)])
+    with pytest.raises(LoadError, match="too_many_node"):
+        pack(model)
+
+
 def test_the_manifest_states_the_challenge_and_null_claims() -> None:
     files = pack(legacy_style())
     m = read_manifest(files["policy.json"])
@@ -368,13 +454,57 @@ def test_pack_refuses_with_a_fixed_code(edit: Callable[[onnx.ModelProto], Any], 
         pack(proto)
 
 
-def test_pack_refusals_never_echo_the_model(tmp_path: Path) -> None:
+HOSTILE = "<b>\x1b[31m\u202erm"
+
+
+def hostile_op_type(proto: onnx.ModelProto) -> None:
+    proto.graph.node[6].op_type = HOSTILE
+
+
+def hostile_attribute_name(proto: onnx.ModelProto) -> None:
+    proto.graph.node[6].attribute.append(helper.make_attribute(HOSTILE, 1))
+
+
+def hostile_names(proto: onnx.ModelProto) -> None:
+    proto.graph.node.add(op_type="Sin", input=["y"], output=[HOSTILE], name=HOSTILE)
+
+
+@pytest.mark.parametrize(
+    ("edit", "code"),
+    [
+        (hostile_op_type, "bad_op_type"),
+        (hostile_attribute_name, "bad_attribute_name"),
+        (hostile_names, "op_not_allowed"),
+    ],
+    ids=["op-type", "attribute-name", "node-and-value-names"],
+)
+def test_pack_refusals_never_echo_the_model(
+    edit: Callable[[onnx.ModelProto], None], code: str
+) -> None:
+    """Op types and attribute names survive canonicalization (node and value names do not:
+    they become n{i}/v{i}), so hostile text there reaches the refusal; it shows as ``?``
+    (quality-F8)."""
     proto = legacy_style()
-    proto.graph.node.add(op_type="Sin", input=["y"], output=["<b>\x1b[31m"], name="<script>")
-    with pytest.raises(LoadError) as caught:
+    edit(proto)
+    with pytest.raises(LoadError, match=code) as caught:
         pack(proto)
-    assert "<" not in str(caught.value)
-    assert "\x1b" not in str(caught.value)
+    message = str(caught.value)
+    assert not {"<", "\x1b", "\u202e"} & set(message), message
+
+
+def test_pack_never_echoes_an_unknown_value_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only ``canonicalize``'s own fixed codes pass through; a ``ValueError`` with any other
+    text (it could quote the model) is ``pack_failed`` without it (quality-F8, M11)."""
+    import topple.policy.pack as pack_module
+
+    def weird(*args: object, **kwargs: object) -> bytes:
+        raise ValueError("weird: <raw text from the model>")
+
+    monkeypatch.setattr(pack_module, "canonicalize", weird)
+    with pytest.raises(LoadError, match="pack_failed: raised while canonicalizing") as caught:
+        pack(legacy_style())
+    assert "<raw" not in str(caught.value)
+    assert "weird" not in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -470,9 +600,11 @@ def test_cli_pack_failure_leaves_nothing(tmp_path: Path) -> None:
     assert not (tmp_path / "out").exists() or list((tmp_path / "out").iterdir()) == []
 
 
+@pytest.mark.parametrize("out", ["bot", "new/deeper/bot"])
 def test_cli_pack_a_failed_write_leaves_no_partial_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: str
 ) -> None:
+    """Nothing is left behind, not even the parent directories pack created (quality-F10)."""
     import topple._atomic as atomic
 
     calls: list[Path] = []
@@ -486,7 +618,7 @@ def test_cli_pack_a_failed_write_leaves_no_partial_directory(
     real = atomic.write_new_file
     monkeypatch.setattr(atomic, "write_new_file", failing)
     model = write_model(tmp_path / "model.onnx", legacy_style())
-    result = invoke(model, tmp_path / "bot")
+    result = invoke(model, tmp_path / out)
     assert result.exit_code == 2
     assert "No space left on device" in result.output
     assert sorted(p.name for p in tmp_path.iterdir()) == ["model.onnx"]

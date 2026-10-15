@@ -345,7 +345,40 @@ EDITS: dict[str, Callable[[dict[str, Any]], None]] = {
     "incomplete-without-missing": lambda d: d.update(complete=False),
     "string-complete": lambda d: d.update(complete="true"),
     "bad-platform": lambda d: d.update(platform="linux\x1b[31m"),
+    # termination is a closed set (contract §11, or ``missing``), consistent with the score
+    # and success (contract §15: an error scores 0 and is no success; §12: success = survived)
+    "unknown-termination": lambda d: set_episode(d, 0, termination="zzz", score=0.0, success=False),
+    "drift-termination": lambda d: set_episode(d, 0, termination="drift", score=0.0, success=False),
+    "error-with-score": lambda d: set_episode(d, 0, termination="error", success=False),
+    "error-with-success": lambda d: set_episode(d, 0, termination="error", score=0.0),
+    "unstable-with-score": lambda d: set_episode(d, 0, termination="sim_unstable", success=False),
+    "unstable-with-success": lambda d: set_episode(d, 0, termination="sim_unstable", score=0.0),
+    "missing-with-success": lambda d: set_episode(d, 0, termination="missing", score=0.0),
+    "fell-with-success": lambda d: set_episode(d, 2, termination="fell", success=True),
+    "floor-contact-with-success": lambda d: set_episode(
+        d, 2, termination="floor_contact", success=True
+    ),
+    # every array of one entry consistently one seed short (quality-F8, M19)
+    "entry-one-seed-short": lambda d: shorten_entry(d, 0),
 }
+
+
+def set_episode(doc: dict[str, Any], entry: int, **fields: Any) -> None:
+    """Set fields of seed 0's episode in ``entry`` (score 50 and success true unless given)."""
+    e = doc["entries"][entry]
+    e["termination"][0] = fields.get("termination", e["termination"][0])
+    e["scores"][0] = fields.get("score", 50.0)
+    e["success"][0] = fields.get("success", True)
+
+
+def shorten_entry(doc: dict[str, Any], entry: int) -> None:
+    """Drop the last seed from every per-seed array of ``entry``: the entry is consistent on
+    its own, but holds one episode fewer than there are seeds."""
+    e = doc["entries"][entry]
+    for key in ("scores", "success", "energy_j", "saturation_fraction", "termination"):
+        e[key].pop()
+    assert len(doc["seeds"]) == 2
+    assert len(e["scores"]) == 1
 
 
 @pytest.mark.parametrize("edit", list(EDITS.values()), ids=list(EDITS))
@@ -353,6 +386,45 @@ def test_the_reader_refuses(three: Comparison, edit: Callable[[dict[str, Any]], 
     doc = doc_of(three)
     edit(doc)
     with pytest.raises(ValueError):  # noqa: PT011 - ValidationError or the reader's own
+        parse(doc)
+
+
+@pytest.mark.parametrize(
+    ("entry", "termination", "score", "success"),
+    [
+        (0, "error", 0.0, False),
+        (0, "sim_unstable", 0.0, False),
+        (2, "fell", 12.5, False),
+        (2, "floor_contact", 0.0, False),
+        (0, "timeout", 80.0, True),
+        (0, "timeout", 80.0, False),
+    ],
+)
+def test_the_reader_accepts_every_recorded_reason(
+    three: Comparison, entry: int, termination: str, score: float, success: bool
+) -> None:
+    doc = doc_of(three)
+    set_episode(doc, entry, termination=termination, score=score, success=success)
+    episode = parse(doc).entries[entry]
+    assert (episode.termination[0], episode.scores[0], episode.success[0]) == (
+        termination,
+        score,
+        success,
+    )
+
+
+def test_the_reader_names_the_inconsistent_episode(three: Comparison) -> None:
+    doc = doc_of(three)
+    set_episode(doc, 0, termination="error", score=90.0, success=False)
+    with pytest.raises(ValueError, match=r"'pid_example': seed 0 \(error\) must score 0"):
+        parse(doc)
+    doc = doc_of(three)
+    set_episode(doc, 2, termination="fell", score=10.0, success=True)
+    with pytest.raises(ValueError, match=r"seed 0 \(fell\) cannot be a success"):
+        parse(doc)
+    doc = doc_of(three)
+    shorten_entry(doc, 0)
+    with pytest.raises(ValueError, match="one episode per seed"):
         parse(doc)
 
 

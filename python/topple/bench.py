@@ -88,10 +88,12 @@ class ShoveCurve:
 
 
 def impulse_at_50(curve: ShoveCurve) -> float | None:
-    """The impulse at which survival first falls through 50%: between the first level with
-    survival >= 0.5 whose next level is below 0.5, linearly interpolated on impulse (a level
-    at exactly 50% is the crossing itself). ``None`` if survival never falls through 50%
-    within the levels (it starts below, or never drops below)."""
+    """The impulse at which survival first falls through 50%: for the first pair of adjacent
+    levels whose survival goes from at least 0.5 to below 0.5, linearly interpolated on
+    impulse between them. A level at exactly 50% followed by one below is the crossing itself,
+    so a plateau at exactly 50% crosses at its last level (``[1.0, 0.5, 0.5, 0.0]`` gives the
+    third impulse). ``None`` if no such pair exists: survival never goes from 50% or more to
+    below 50% between adjacent levels."""
     s, x = curve.survival, curve.impulses
     for k in range(len(s) - 1):
         if s[k] >= 0.5 > s[k + 1]:

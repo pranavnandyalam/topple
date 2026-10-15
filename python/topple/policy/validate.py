@@ -841,13 +841,7 @@ def canonicalize(proto: onnx.ModelProto, *, pack: bool = False) -> bytes:
     source, target = inputs[0], graph.output[0]
     _check_definitions(source.name, initializers, folded, alias, kept)
 
-    def resolve(name: str) -> str:
-        for _ in range(len(alias) + 1):
-            if name not in alias:
-                return name
-            name = alias[name]
-        raise ValueError("identity_cycle: Identity nodes form a cycle")
-
+    resolve = identity_resolver(alias)
     in_name = INPUT_NAME if pack else _text(source.name)
     out_name = OUTPUT_NAME if pack else _text(target.name)
     produced = resolve(target.name)
@@ -895,6 +889,31 @@ def canonicalize(proto: onnx.ModelProto, *, pack: bool = False) -> bytes:
         entry.value = value
     data: bytes = model.SerializeToString(deterministic=True)
     return data
+
+
+def identity_resolver(alias: Mapping[str, str]) -> Callable[[str], str]:
+    """``resolve(name)``: the value an ``Identity`` chain ending at ``name`` copies (``name``
+    itself if no ``Identity`` defines it); ``ValueError`` (``identity_cycle``) for a cycle.
+
+    Each name's result is remembered for every name on its chain, so each alias is walked
+    once: a chain of n nodes read m times costs O(n + m), not O(n·m). Pack runs this on
+    untrusted models before check 7's node cap.
+    """
+    resolved: dict[str, str] = {}
+
+    def resolve(name: str) -> str:
+        chain: list[str] = []
+        while name in alias and name not in resolved:
+            if len(chain) > len(alias):
+                raise ValueError("identity_cycle: Identity nodes form a cycle")
+            chain.append(name)
+            name = alias[name]
+        target = resolved.get(name, name)
+        for step in chain:
+            resolved[step] = target
+        return target
+
+    return resolve
 
 
 def _opset(proto: onnx.ModelProto, pack: bool) -> int:
@@ -1055,9 +1074,11 @@ def _canonical_value_info(info: onnx.ValueInfoProto, name: str, pack: bool) -> o
 
 
 def _canonical_metadata(proto: onnx.ModelProto, pack: bool) -> list[tuple[str, str]]:
-    entries = [(_text(e.key), _text(e.value)) for e in proto.metadata_props]
-    if pack:
-        entries = [(k, v) for k, v in entries if k in METADATA_KEYS]
+    """The metadata entries, sorted by key. ``pack`` keeps only the 7 ``topple.*`` keys and
+    drops the rest unread (a key that is not valid UTF-8 is none of them), so only what is
+    kept must be valid UTF-8."""
+    kept = [e for e in proto.metadata_props if not pack or e.key in METADATA_KEYS]
+    entries = [(_text(e.key), _text(e.value)) for e in kept]
     return sorted(entries, key=lambda kv: kv[0])
 
 

@@ -11,8 +11,11 @@ algorithm the Phase 2 gates recompute from those arrays.
 
 The ``topple.compare/1`` file is read like contract §15's ``results.json``: a regular file of at
 most 16 MiB (``read_comparison``), strict JSON types, no NaN or infinity, every object closed,
-``format`` required, ids sanitized and every string bounded. Its numbers are as trustworthy as
-whoever ran the comparison: a ranked score never comes from one (contract §16).
+``format`` required, ids sanitized and every string bounded. Each episode's termination is a
+recorded reason or ``missing`` and agrees with its score and success: ``error``,
+``sim_unstable`` and ``missing`` score 0 with no success (contract §15), and only a ``timeout``
+can be a success (§12). Its numbers are as trustworthy as whoever ran the comparison: a ranked
+score never comes from one (contract §16).
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from collections.abc import Sequence
 from concurrent.futures import Future
 from pathlib import Path
 from statistics import median
-from typing import TYPE_CHECKING, Annotated, Final, Literal
+from typing import TYPE_CHECKING, Annotated, Final, Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -83,9 +86,14 @@ Score = Annotated[float, Field(ge=0.0, le=100.0)]
 Difference = Annotated[float, Field(ge=-100.0, le=100.0)]
 Fraction = Annotated[float, Field(ge=0.0, le=1.0)]
 Energy = Annotated[float, Field(ge=0.0)]
-Termination = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,31}$")]
+Termination = Literal["fell", "floor_contact", "sim_unstable", "timeout", "error", "missing"]
 """A recorded termination reason (contract §11: ``fell``, ``floor_contact``, ``sim_unstable``,
 ``timeout``, ``error``), or ``missing``."""
+SCORELESS: Final = frozenset({"error", "sim_unstable", MISSING})
+"""Reasons of an episode that scores 0 and is no success: an error (contract §15;
+``sim_unstable`` is one) or no episode at all."""
+SURVIVED: Final = "timeout"
+"""The only reason a success can have (contract §12: success implies survived)."""
 ExtraValue = (
     bool
     | int
@@ -129,8 +137,15 @@ class Entry(_Strict):
         if any(len(arr) != n for arr in (*arrays, *self.extras.values())):
             raise ValueError(f"entry {self.id!r}: every per-seed array must have {n} values")
         for k, reason in enumerate(self.termination):
-            if reason == MISSING and (self.scores[k] != 0.0 or self.success[k]):
-                raise ValueError(f"entry {self.id!r}: a missing episode scores 0, no success")
+            if reason in SCORELESS and (self.scores[k] != 0.0 or self.success[k]):
+                raise ValueError(
+                    f"entry {self.id!r}: seed {k} ({reason}) must score 0 with no success"
+                )
+            if self.success[k] and reason != SURVIVED:
+                raise ValueError(
+                    f"entry {self.id!r}: seed {k} ({reason}) cannot be a success, "
+                    f"only a {SURVIVED} can"
+                )
         return self
 
 
@@ -282,8 +297,9 @@ def _metric(e: EpisodeResult, name: str) -> float:
     return 0.0 if e.metrics is None else float(e.metrics[name])
 
 
-def _termination(e: EpisodeResult) -> str:
-    return MISSING if e.metrics is None else str(e.metrics["termination"])
+def _termination(e: EpisodeResult) -> Termination:
+    """The recorded reason (``Comparison`` refuses any other value), or ``missing``."""
+    return cast(Termination, MISSING if e.metrics is None else str(e.metrics["termination"]))
 
 
 def _paired(a: Entry, b: Entry) -> PairedRow:

@@ -610,8 +610,11 @@ videos (side-by-side ones from `topple video` included), the image `topple smoke
 (`smoke.png` in the current directory by default) and the `topple.compare/1` file of `topple
 compare --json` are written the same way. `topple policy pack` writes a whole directory this
 way: its files go into a new private sibling directory, which is renamed to `--out` once
-complete; `--out` must not exist (exit 2), so a pack never writes into or replaces an existing
-directory, and a failed pack leaves nothing behind.
+complete. `--out` must not exist (exit 2) and is checked again just before the rename, so a pack
+never writes into an existing directory: only an empty directory created at `--out` in the
+instant between that check and the rename can be replaced (POSIX `rename`), and a non-empty one
+is refused and kept. Missing parent directories are created; a failed pack removes its private
+directory and the parents it created (each only while empty), so it leaves nothing behind.
 
 A checkout can also commit a directory as a symlink (`out -> ~/project`), which would send the
 default `out/run` and `out/eval` elsewhere. So the commands' output paths (the `--out` of

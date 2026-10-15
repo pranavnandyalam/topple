@@ -169,6 +169,27 @@ def test_a_failed_block_leaves_nothing(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def test_a_failed_block_removes_the_parents_it_created(tmp_path: Path) -> None:
+    (tmp_path / "kept").mkdir()
+    with pytest.raises(RuntimeError, match="boom"):
+        _fill_then_fail(tmp_path / "kept" / "new" / "deeper" / "bot")
+    assert [p.name for p in tmp_path.iterdir()] == ["kept"]  # only what was there before
+    assert list((tmp_path / "kept").iterdir()) == []
+
+
+def _theirs_then_fail(out: Path, theirs: Path) -> None:
+    with new_directory(out):
+        theirs.write_text("keep")  # someone else writes into a parent created here
+        raise RuntimeError("boom")
+
+
+def test_a_created_parent_someone_wrote_into_is_kept(tmp_path: Path) -> None:
+    out = tmp_path / "new" / "deeper" / "bot"
+    with pytest.raises(RuntimeError, match="boom"):
+        _theirs_then_fail(out, tmp_path / "new" / "theirs")
+    assert sorted(p.name for p in (tmp_path / "new").iterdir()) == ["theirs"]
+
+
 @pytest.mark.parametrize("kind", ["directory", "file", "symlink"])
 def test_never_into_or_over_anything_already_there(tmp_path: Path, kind: str) -> None:
     out = tmp_path / "bot"
