@@ -50,9 +50,25 @@ Work branch: **`phase-2-learn`** (based on `main`). Its PR should be opened when
    merge. Then Phase 2b (waypoint-v1, `topple.traj/2`), then PLAN.md section 0's build order.
 
 Process notes from this session: each slice ran as one builder → 2–3 reviewers (max effort) → 2
-skeptics → fixer → re-review, then a docs agent synced the spec from the builder/fixer reports
-(verifying against code). That cost a lot of usage (/usage: ~87% from workflows); consider 2
-reviewers per slice and skipping the separate spec-sync agent for small slices.
+skeptics → fixer → re-review, then a docs agent synced the spec. See "Effort and cost settings"
+below for the leaner setup to use from now on.
+
+## Effort and cost settings (Pranav, 2026-10-15)
+
+The cloud session's usage was ~87% workflows, ~49% at max effort, mostly at >150k context. Use:
+
+| Work | Effort |
+|---|---|
+| Session default; builder agents; everyday coding | **high** |
+| Reviewers/skeptics on trust-boundary code (ONNX validator, loaders, runner sandbox, CI workflows, security reviews of Phases 3, 5, 6, 9, 14) | **max** |
+| Reviewers on ordinary code (stats, video, configs, docs) | **high** |
+| Design specs and critique rounds (e.g. revising the Phase 3 draft) | **xhigh** |
+| Spec syncs, HANDOFF updates, mechanical edits, re-running tests | **medium** |
+
+- Ultracode off by default; turn it on only for review gates and design work.
+- Fast mode off (`/fast`); Pranav turned it off on 2026-10-15.
+- 2 reviewers per slice (not 3); the fixer syncs the spec instead of a separate spec-sync agent.
+- Keep context small: a fresh session per slice, with this file carrying the state.
 
 ## Answers from Pranav (2026-10-15)
 
