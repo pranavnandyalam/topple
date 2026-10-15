@@ -8,12 +8,18 @@ What crosses the process boundary is a ``PolicyRef``, never a session, a ``Loade
 factory: the parent reads and validates a submission once and sends either the canonical ONNX
 bytes with their ``policy_sha256`` or a Python submission's path with its submission sha256. A
 worker rebuilds the controller (``worker_factory``) and re-checks the sha256 before its first
-episode, so a file changed after the parent's load is never what a worker scores: ONNX bytes
-travel with the reference, and a changed Python submission makes the worker raise before any of
-its code runs. Results come back by pickle, which is acceptable locally only (a local eval is
-not a security boundary).
+episode. ONNX bytes travel with the reference, so a policy changed on disk after the parent's
+load is never what a worker scores. A Python submission is read once by the worker and that
+read's hash is compared before its bytes are compiled, so a changed entry file (or any changed
+file of a directory) makes the worker raise before any of it runs. What a Python submission
+reads itself after loading (a sibling module it imports, an asset) is an ordinary read of
+whatever is on disk then: in-process Python cannot pin it, and Phase 3's runner isolates it.
+Results come back by pickle, which is acceptable locally only (a local eval is not a security
+boundary).
 
-Workers receive public protocols only: a private protocol's salt would reach every worker.
+Workers receive public protocols only: submitting a task pickles its protocol, salt included
+(only its ``repr`` is redacted), so ``submit_episodes`` refuses a private one in the parent,
+before anything is sent, and ``run_episodes`` checks again in the worker.
 """
 
 from __future__ import annotations
@@ -21,15 +27,15 @@ from __future__ import annotations
 import multiprocessing
 import os
 from collections.abc import Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import Executor, Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 from topple.envs.balance import BalanceEnv
 from topple.evaluate import ControllerFactory, EvalProtocol, run_episode
 from topple.ids import validate_challenge_id
-from topple.loader import LoadError, load_submission, submission_sha256
+from topple.loader import load_submission
 from topple.policy.manifest import HEX64
 from topple.policy.validate import MAX_ONNX_BYTES
 
@@ -39,7 +45,6 @@ if TYPE_CHECKING:
 
 POOL_MAX_WORKERS: Final = 4
 START_METHOD: Final = "spawn"  # a fresh interpreter: no inherited sessions, threads or locks
-_CHANGED: Final = "the submission {name!r} changed since the parent loaded it (sha256 mismatch)"
 
 
 @dataclass(frozen=True)
@@ -72,9 +77,9 @@ def policy_ref(sub: Path, *, challenge: Challenge) -> PolicyRef:
     """The parent's side: load ``sub`` once (``load_submission``: a policy is fully validated
     and smoke-tested for ``challenge``, a Python submission imported) and reference it."""
     loaded = load_submission(sub, challenge=challenge)
-    if loaded.policy is not None:
-        v = loaded.policy.validated
-        return PolicyRef("onnx", v.canonical, v.policy_sha256, challenge.id)
+    policy = loaded.policy  # set exactly when ``loaded.kind == "onnx"`` (Submission checks)
+    if policy is not None:
+        return PolicyRef("onnx", policy.validated.canonical, policy.policy_sha256, challenge.id)
     return PolicyRef("python", str(sub.resolve()), loaded.sha256, challenge.id)
 
 
@@ -83,32 +88,34 @@ def worker_factory(ref: PolicyRef) -> ControllerFactory:
     loaded is what the parent loaded (``LoadError`` otherwise, before any episode).
 
     ONNX: ``policy_from_bytes`` with ``expected_sha256`` (validation and smoke test again, in
-    this process). Python: the submission is re-hashed before it is imported (changed code never
-    runs), then the hash of the bytes the import actually ran is compared too.
+    this process). Python: ``load_submission`` with ``expected_sha256``, which compares the hash
+    of its single read before compiling it, so changed bytes are refused, never run.
     """
     from topple.challenge import load_challenge
 
     challenge = load_challenge(ref.challenge_id)
-    if isinstance(ref.payload, bytes):
+    if ref.kind == "onnx":
         from topple.controllers.onnx_policy import policy_factory
         from topple.policy.runtime import policy_from_bytes
 
-        loaded = policy_from_bytes(ref.payload, challenge=challenge, expected_sha256=ref.sha256)
+        data = cast(bytes, ref.payload)  # PolicyRef ties the payload's type to its kind
+        loaded = policy_from_bytes(data, challenge=challenge, expected_sha256=ref.sha256)
         return policy_factory(loaded)
-    path = Path(ref.payload)
-    if submission_sha256(path) != ref.sha256:
-        raise LoadError(_CHANGED.format(name=path.name))
-    sub = load_submission(path, challenge=challenge)
-    if sub.sha256 != ref.sha256 or sub.kind != "python":
-        raise LoadError(_CHANGED.format(name=path.name))
-    return sub.factory
+    path = Path(cast(str, ref.payload))
+    return load_submission(path, challenge=challenge, expected_sha256=ref.sha256).factory
 
 
-def run_episodes(
-    ref: PolicyRef, protocol: EvalProtocol, indices: Sequence[int]
-) -> list[EpisodeResult]:
-    """A pool task: episodes ``indices`` of the public ``protocol`` for ``ref``, in order,
-    on one env. The controller is rebuilt (and its sha256 re-checked) before the first one."""
+def submit_episodes(
+    pool: Executor, ref: PolicyRef, protocol: EvalProtocol, indices: Sequence[int]
+) -> Future[list[EpisodeResult]]:
+    """Submit ``run_episodes(ref, protocol, indices)`` to ``pool``, after checking its
+    arguments here in the parent: submitting pickles them to a worker, so a private protocol
+    (its salt) must be refused before ``submit``, not by the worker that already received it."""
+    _check_task(ref, protocol, indices)
+    return pool.submit(run_episodes, ref, protocol, tuple(indices))
+
+
+def _check_task(ref: PolicyRef, protocol: EvalProtocol, indices: Sequence[int]) -> None:
     if protocol.seed_set != "public":
         raise ValueError("pool workers run public protocols only: a private salt stays home")
     if protocol.challenge.id != ref.challenge_id:
@@ -118,6 +125,15 @@ def run_episodes(
     n = len(protocol.seeds)
     if not all(type(i) is int and 0 <= i < n for i in indices):
         raise ValueError(f"episode indices must be ints in [0, {n})")
+
+
+def run_episodes(
+    ref: PolicyRef, protocol: EvalProtocol, indices: Sequence[int]
+) -> list[EpisodeResult]:
+    """A pool task (submit it with ``submit_episodes``): episodes ``indices`` of the public
+    ``protocol`` for ``ref``, in order, on one env. The arguments are checked again here, and
+    the controller is rebuilt (its sha256 re-checked) before the first episode."""
+    _check_task(ref, protocol, indices)
     factory = worker_factory(ref)
     env = BalanceEnv(protocol.preset, challenge=protocol.challenge, record=True)
     try:

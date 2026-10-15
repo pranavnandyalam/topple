@@ -152,6 +152,8 @@ ALLOWED_FIELDS: Final[Mapping[str, frozenset[str]]] = {
 DEFAULT_DOMAINS: Final = ("", "ai.onnx")
 
 POLICY_FORMAT: Final = "topple.policy/1"
+ActionRule = Literal["clip(mean)", "tanh(mean)", "other"]
+"""A policy's head as ``structure_match`` finds it and ``policy.json`` states it."""
 METADATA_FIELDS: Final = (
     "format",
     "challenge",
@@ -1070,7 +1072,7 @@ _ONE: Final = struct.pack("<f", 1.0)
 _MINUS_ONE: Final = struct.pack("<f", -1.0)
 
 
-def structure_match(proto: onnx.ModelProto) -> Literal["clip(mean)", "tanh(mean)", "other"]:
+def structure_match(proto: onnx.ModelProto) -> ActionRule:
     """The §3.2 sequence ``proto`` (canonical) is, else ``"other"``.
 
     A match needs the op types, the wiring (each node reads the previous value and the next

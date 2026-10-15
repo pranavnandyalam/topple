@@ -32,7 +32,7 @@ import onnx
 import onnxruntime as ort
 
 from topple._inputs import read_regular_file
-from topple.loader import LoadError
+from topple.loader import ENTRY_FILE, LoadError
 from topple.policy.manifest import (
     MANIFEST_FILE,
     MAX_MANIFEST_BYTES,
@@ -68,7 +68,7 @@ POLICY_FILES: Final[Mapping[str, int]] = {
     README_FILE: MAX_README_BYTES,
 }
 REQUIRED_FILES: Final = (ONNX_FILE, MANIFEST_FILE)
-PYTHON_ENTRY: Final = "controller.py"
+PYTHON_ENTRY: Final = ENTRY_FILE
 AMBIGUOUS: Final = "ambiguous submission kind"
 
 
@@ -118,6 +118,13 @@ class LoadedPolicy:
     manifest: PolicyManifest | None
     validated: ValidatedPolicy
     session: ort.InferenceSession = field(repr=False, compare=False)
+
+    @property
+    def policy_sha256(self) -> str:
+        """sha256(policy.onnx), the policy's identity (§3.1): the manifest's ``onnx.sha256``,
+        the R2 key and the Phase 8 header hash. The bytes are canonical, so these are also
+        the bytes that run."""
+        return self.validated.policy_sha256
 
     def __reduce__(self) -> NoReturn:
         raise TypeError("a LoadedPolicy is never pickled: send a topple.pool.PolicyRef")

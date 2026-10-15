@@ -388,19 +388,20 @@ def _controller(name: str, sha256: str, policy_sha256: str | None = None) -> Con
 
 
 def _controller_info(submission: Path | None) -> ControllerInfo:
-    """The submission's hash (computed, never imported) and its id as ``topple eval`` records it,
-    or the ``unknown`` placeholder."""
-    from topple.loader import LoadError, submission_id, submission_sha256
+    """The submission's hashes (computed, never imported or validated) and its id as ``topple
+    eval`` records them, ``policy_sha256`` included for a policy directory; or the ``unknown``
+    placeholder."""
+    from topple.loader import LoadError, submission_hashes, submission_id
     from topple.results import ControllerInfo
 
     if submission is None:
         return ControllerInfo(id=UNKNOWN_CONTROLLER_ID, sha256=UNKNOWN_SHA256)
     try:
-        sha = submission_sha256(submission)  # refuses a symlink before anything is resolved
+        sha, policy_sha = submission_hashes(submission)  # refuses a symlink before resolving
         name = submission_id(submission)
     except (LoadError, OSError, ValueError, RuntimeError) as exc:
         _fail(f"cannot hash {submission}: {exc}")
-    return _controller(name, sha)
+    return _controller(name, sha, policy_sha)
 
 
 def _cannot_read(path: Path, exc: OSError) -> NoReturn:

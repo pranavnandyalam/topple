@@ -236,8 +236,69 @@ def test_scalars_are_strict(path: tuple[str, ...], value: object) -> None:
 def test_deep_nesting_is_a_fixed_error() -> None:
     data = manifest_bytes(good()).replace(b'"name": "tiny ppo"', b'"name": ' + b"[" * 8000)
     assert len(data) < MAX_MANIFEST_BYTES
+    assert rejected(data) == "policy.json: manifest_too_deep: policy.json nests too deeply"
+
+
+@pytest.mark.parametrize("opener", [b"[", b'{"a":'])
+def test_deep_nesting_never_reaches_a_parser(
+    monkeypatch: pytest.MonkeyPatch, opener: bytes
+) -> None:
+    """The standard library's JSON scanner recurses in C: 8,190 levels (what 16 KiB holds)
+    raise no ``RecursionError`` but need over 1 MiB of stack, which kills a thread with a
+    smaller one (musl, a low ``ulimit -s``). Nesting is bounded by a byte scan first."""
+    closer = b"]" if opener == b"[" else b"}"
+    depth = MAX_MANIFEST_BYTES // (len(opener) + 1)
+    data = opener * depth + closer * depth
+    assert len(data) <= MAX_MANIFEST_BYTES
+
+    def never(*args: object, **kwargs: object) -> object:
+        raise AssertionError("a parser saw the nesting")
+
+    monkeypatch.setattr(manifest_module.json, "loads", never)
+    monkeypatch.setattr(manifest_module.PolicyManifest, "model_validate_json", never)
+    assert "manifest_too_deep" in rejected(data)
+
+
+def test_brackets_inside_strings_do_not_count_as_nesting() -> None:
+    m = good()
+    m["claims"]["versions"] = {"a": "[" * 60, "b": "{" * 60, "c": '\\"[[[[' * 10}
+    assert read_manifest(manifest_bytes(m)).claims.versions == m["claims"]["versions"]
+
+
+@pytest.mark.parametrize("depth", [32, 33])
+def test_nesting_is_bounded_at_32_levels(depth: int) -> None:
+    data = b"[" * depth + b"]" * depth
     text = rejected(data)
-    assert "manifest_too_deep" in text or "manifest_invalid_json" in text
+    assert ("manifest_too_deep" in text) == (depth > 32), text
+
+
+def test_a_small_thread_stack_survives_the_deepest_manifest(tmp_path: Path) -> None:
+    """Before the byte scan, this child died of SIGSEGV (exit -11) instead of a LoadError."""
+    import subprocess
+    import sys
+
+    script = tmp_path / "deep.py"
+    script.write_text(
+        "import threading\n"
+        "from topple.loader import LoadError\n"
+        "from topple.policy.manifest import read_manifest\n"
+        "out = []\n"
+        "def run():\n"
+        "    try:\n"
+        "        read_manifest(b'[' * 8190 + b']' * 8190)\n"
+        "    except LoadError as exc:\n"
+        "        out.append(str(exc))\n"
+        "threading.stack_size(256 * 1024)\n"
+        "t = threading.Thread(target=run)\n"
+        "t.start()\n"
+        "t.join()\n"
+        "print(out[0])\n"
+    )
+    done = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert done.returncode == 0, (done.returncode, done.stderr[-2000:])
+    assert "manifest_too_deep" in done.stdout
 
 
 def test_not_json_at_all() -> None:

@@ -333,14 +333,20 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   that fails leaves no submission module behind in `sys.modules`.
 - Submission kinds: a `.py` file; a directory with `controller.py` plus assets located via
   `Path(__file__).parent`; or a `topple.policy/1` directory (§17), which is data only. The loader
-  checks a directory for `policy.json` before `controller.py`: a directory with a `policy.json`
-  is a policy, and one that also holds Python (`controller.py`, or any `.py` among the entries
-  its bounded listing reads) is refused with `ambiguous submission kind`. That is the one change
-  for Python submissions: a Python directory with a top-level `policy.json` asset, which loaded
-  before, is now refused (rename the asset). A policy is loaded for a challenge
-  (`load_submission(path, challenge=...)`, a `TypeError` without one), because its dimensions
-  and action bounds come from the challenge's `TaskSpec`, never from the submission; `topple
-  eval` and `topple run` pass their protocol's challenge. The entry file is named exactly
+  checks a directory for `policy.json` before `controller.py`: a directory with an entry named
+  exactly `policy.json` is a policy, and one that also holds Python (`controller.py`, or any
+  `.py` among the entries its bounded listing reads) is refused with `ambiguous submission
+  kind`. The name is matched exactly on every file system: a case-insensitive one (macOS,
+  Windows) also finds `POLICY.JSON` under that name, so the loader confirms it in a listing that
+  stops at `policy.json` or after 101 top-level entries, more than a Python directory may hold
+  (a directory that reaches the cap stays a policy and is refused by §17's entry rules). A
+  `policy.json` that cannot even be examined (a directory without search permission) does not
+  make a policy: the directory is decided as before, and its error names `controller.py`. That
+  is the one change for Python submissions: a Python directory with a top-level `policy.json`
+  asset, which loaded before, is now refused (rename the asset). A policy is loaded for a
+  challenge (`load_submission(path, challenge=...)`, a `TypeError` without one), because its
+  dimensions and action bounds come from the challenge's `TaskSpec`, never from the submission;
+  `topple eval` and `topple run` pass their protocol's challenge. The entry file is named exactly
   `controller.py` on every file system: a case-insensitive one (macOS, Windows) also finds
   `Controller.py` under that name, and such a directory is refused there as on Linux. A
   directory may hold at most 50 regular files in at most 50 subdirectories (at any depth) and
@@ -894,12 +900,15 @@ terminal nor start a GitHub Actions workflow command.
     always pass `--protocol`.
   - `--out` writes the trusted results (§15): for a directory the `rescore` results, for a file
     a one-episode result with `complete: false`. The controller is recorded as
-    `{id: <SUB's name>, sha256: <SUB's submission sha256>}`, computed without importing SUB (the
-    name is that of the resolved path, a directory's name or a file's stem, exactly the id
-    `topple eval SUB` records, so `.` names the current directory), or
-    `{id: "unknown", sha256: <64 zeros>}` without `--submission`. `--submission` is resolved
-    before anything is verified: one that cannot be hashed, or whose name is not valid UTF-8,
-    exits 2 before any verdict is printed. `--isolation` is recorded as given: a label that
+    `{id: <SUB's name>, sha256: <SUB's submission sha256>, policy_sha256}`, computed without
+    importing, validating or running SUB (the name is that of the resolved path, a directory's
+    name or a file's stem, exactly the id `topple eval SUB` records, so `.` names the current
+    directory; `policy_sha256` is sha256(`policy.onnx`) for a `topple.policy/1` directory, whose
+    files are read once under §17's entry rules, and null for a Python submission), or
+    `{id: "unknown", sha256: <64 zeros>, policy_sha256: null}` without `--submission`.
+    `--submission` is resolved before anything is verified: one that cannot be hashed (a policy
+    directory that §17's entry rules refuse included), or whose name is not valid UTF-8, exits 2
+    before any verdict is printed. `--isolation` is recorded as given: a label that
     nothing checks (§15). A relative `--out` that passes through a symlink exits 2 before
     anything is verified (§14).
 - `topple score FILE [--protocol P] [--index I | --seed S]` verifies first, then prints JSON:
@@ -925,7 +934,9 @@ submitter and a runtime rely on.
   never following a symlink and never blocking; a path that cannot be examined is a load error.
 - **Manifest** (`policy.json`, normative: ONNX Runtime Web cannot read model metadata): UTF-8
   JSON without a BOM, duplicate keys, `NaN`/`Infinity`, numbers beyond float range, integer
-  literals of more than 20 digits or lone surrogates; every object closed (`extra` keys are
+  literals of more than 20 digits, lone surrogates or nesting deeper than 32 levels (bounded by
+  a byte scan before any parser runs: a recursive JSON parser could exhaust a small thread
+  stack on the 8,190 levels 16 KiB can hold); every object closed (`extra` keys are
   refused); exact JSON types (an integer is accepted for a float, never the reverse). It names
   `format` (`topple.policy/1`), `kind` (`onnx`), the canonical `challenge`, `obs_schema`,
   `obs_features`, `action_spec`, `action_dim` and `control_dt` (all equal to the challenge's),

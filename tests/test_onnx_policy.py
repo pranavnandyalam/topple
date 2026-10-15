@@ -303,6 +303,31 @@ def test_policy_from_bytes_needs_the_rule_the_structure_has() -> None:
         policy_from_bytes(serialize(proto), challenge=BALANCE)
 
 
+def test_policy_from_bytes_takes_the_rule_from_the_structure() -> None:
+    """Without a manifest, ``topple.action_rule`` is held to what the graph's structure is: a
+    SAC graph (``tanh(mean)``) loads, and one whose metadata says ``clip(mean)`` does not."""
+    loaded = policy_from_bytes(SAC, challenge=BALANCE)
+    assert loaded.policy_sha256 == hashlib.sha256(SAC).hexdigest()
+    proto = parse(SAC)
+    for entry in proto.metadata_props:
+        if entry.key == "topple.action_rule":
+            entry.value = json.dumps("clip(mean)")
+    with pytest.raises(LoadError) as info:
+        policy_from_bytes(serialize(proto), challenge=BALANCE)
+    assert str(info.value) == (
+        "policy.onnx: metadata_mismatch: topple.action_rule differs from balance-v1"
+    )
+
+
+def test_a_loaded_policy_names_its_policy_sha256(tmp_path: Path) -> None:
+    """§3.1 Identity: ``LoadedPolicy.policy_sha256`` is sha256(policy.onnx)."""
+    expected = hashlib.sha256(PPO).hexdigest()
+    assert load_policy_dir(write_policy_dir(tmp_path / "bot"), challenge=BALANCE).policy_sha256 == (
+        expected
+    )
+    assert policy_from_bytes(PPO, challenge=BALANCE).policy_sha256 == expected
+
+
 @pytest.mark.parametrize("data", [bytearray(PPO), "policy"], ids=["bytearray", "str"])
 def test_policy_from_bytes_takes_exact_bytes(data: Any) -> None:
     with pytest.raises(LoadError, match=r"policy\.onnx must be bytes"):
@@ -433,6 +458,79 @@ def test_cli_run_evaluates_a_policy_directory(tmp_path: Path) -> None:
     results = read_results(out / "results.json")
     assert results.controller.id == "tiny_ppo"
     assert results.controller.policy_sha256 == hashlib.sha256(PPO).hexdigest()
+
+
+@pytest.mark.parametrize("target", ["directory", "file"])
+def test_cli_verify_records_a_policy_submission(tmp_path: Path, target: str) -> None:
+    """``topple verify --submission <policy dir> --out`` records what ``topple run`` recorded:
+    the submission sha256 and ``policy_sha256`` = sha256(policy.onnx), never null (§15, §16)."""
+    from typer.testing import CliRunner
+
+    from topple.cli import app
+    from topple.results import read_results
+
+    root = write_policy_dir(tmp_path / "tiny_ppo")
+    out = tmp_path / "out"
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", str(root), "-p", "balance-v1/ideal", "--out", str(out), "--no-video"]
+    )
+    assert result.exit_code == 0, result.output
+    ran = read_results(out / "results.json").controller
+    path = out if target == "directory" else next(out.glob("traj_*.npz"))
+    trusted = tmp_path / "trusted.json"
+    result = runner.invoke(
+        app,
+        [
+            "verify",
+            str(path),
+            "-p",
+            "balance-v1/ideal",
+            "--submission",
+            str(root),
+            "-o",
+            str(trusted),
+        ],
+    )
+    if target == "directory":  # a single-seed run lists one episode of the protocol's 20
+        assert result.exit_code == 1, result.output
+    else:
+        assert result.exit_code == 0, result.output
+    recorded = read_results(trusted).controller
+    assert recorded == ran
+    assert recorded.policy_sha256 == hashlib.sha256(PPO).hexdigest()
+
+
+def test_cli_verify_reads_a_policy_submission_under_its_own_rules(tmp_path: Path) -> None:
+    """A policy directory that ``topple eval`` refuses (an unexpected entry) is not recorded
+    as if it had run: ``--submission`` exits 2 before any verdict."""
+    from typer.testing import CliRunner
+
+    from topple.cli import app
+
+    root = write_policy_dir(tmp_path / "tiny_ppo")
+    out = tmp_path / "out"
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["run", str(root), "-p", "balance-v1/ideal", "--out", str(out), "--no-video"]
+    )
+    assert result.exit_code == 0, result.output
+    (root / ".DS_Store").write_bytes(b"x")
+    trusted = tmp_path / "trusted.json"
+    result = runner.invoke(
+        app,
+        [
+            "verify",
+            str(next(out.glob("traj_*.npz"))),
+            "--submission",
+            str(root),
+            "-o",
+            str(trusted),
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert "unexpected entry: '.DS_Store'" in result.output
+    assert not trusted.exists()
 
 
 def test_cli_eval_reports_a_bad_policy_in_one_line(tmp_path: Path) -> None:

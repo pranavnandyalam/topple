@@ -1,15 +1,16 @@
 """``policy.json``, the manifest of a ``topple.policy/1`` directory (docs/design/phase-2.md §3.1).
 
 The manifest is the normative description of a policy (ONNX Runtime Web cannot read
-``metadata_props``), so it is parsed as hostile input. Parsing is two passes over at most
-``MAX_MANIFEST_BYTES``: a rejection-only pass with the standard library (no BOM, valid UTF-8,
-no duplicate keys, which pydantic would silently resolve to the last one, no ``NaN`` or
-``Infinity`` tokens, no number beyond float range, no integer literal longer than
-``MAX_INT_DIGITS``, no lone surrogate in any key or string), then ``model_validate_json`` on
-strict, frozen models (JSON arrays become tuples, an ``int`` is accepted for a ``float``, never
-the reverse). Every failure is one ``LoadError`` with a fixed code: a message never quotes the
-input, only fixed words and ``safe`` field names (an ``UnicodeDecodeError`` holds the offending
-bytes, a pydantic message holds the offending value).
+``metadata_props``), so it is parsed as hostile input. Parsing is a byte scan and two passes
+over at most ``MAX_MANIFEST_BYTES``: the scan bounds nesting at ``MAX_DEPTH`` levels before any
+parser runs (the standard library's scanner recurses in C), then a rejection-only pass with the
+standard library (no BOM, valid UTF-8, no duplicate keys, which pydantic would silently resolve
+to the last one, no ``NaN`` or ``Infinity`` tokens, no number beyond float range, no integer
+literal longer than ``MAX_INT_DIGITS``, no lone surrogate in any key or string), then
+``model_validate_json`` on strict, frozen models (JSON arrays become tuples, an ``int`` is
+accepted for a ``float``, never the reverse). Every failure is one ``LoadError`` with a fixed
+code: a message never quotes the input, only fixed words and ``safe`` field names (an
+``UnicodeDecodeError`` holds the offending bytes, a pydantic message holds the offending value).
 
 ``claims`` are self-reported by whoever wrote the file: they are displayed as such and never
 used for ranking, divisions or anything called verified.
@@ -30,17 +31,25 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, ValidationErr
 
 from topple.contract import ActionSpec, validate_schema_id
 from topple.ids import validate_challenge_id
-from topple.loader import LoadError
-from topple.policy.validate import MAX_DIM, MAX_MESSAGES, POLICY_FORMAT, safe
+from topple.loader import POLICY_MANIFEST, POLICY_ONNX, LoadError
+from topple.policy.validate import (
+    MAX_DIM,
+    MAX_MESSAGES,
+    METADATA_FIELDS,
+    POLICY_FORMAT,
+    ActionRule,
+    safe,
+)
 from topple.rng import MAX_SEED
 
 if TYPE_CHECKING:
     from topple.challenge import Challenge
 
-MANIFEST_FILE: Final = "policy.json"
-ONNX_FILE: Final = "policy.onnx"
+MANIFEST_FILE: Final = POLICY_MANIFEST
+ONNX_FILE: Final = POLICY_ONNX
 MAX_MANIFEST_BYTES: Final = 16 * 1024
 MAX_INT_DIGITS: Final = 20  # far beyond 2**53 (16 digits); never reaches int()'s 4300-digit cap
+MAX_DEPTH: Final = 32  # a valid manifest nests 4 levels (policy.json > onnx > input > shape)
 MAX_ID_CHARS: Final = 64
 MAX_FEATURES: Final = MAX_DIM
 MAX_NET_ARCH: Final = 8
@@ -56,8 +65,6 @@ GIT_COMMIT: Final = re.compile(r"[0-9a-f]{40}")
 CLAIM_NAME: Final = re.compile(r"[A-Za-z0-9 _.-]{1,64}")
 VERSION_KEY: Final = re.compile(r"[a-z0-9_.-]{1,32}")
 FEATURE_NAME: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
-
-ActionRule = Literal["clip(mean)", "tanh(mean)", "other"]
 
 
 def _matching(pattern: re.Pattern[str]) -> AfterValidator:
@@ -236,7 +243,9 @@ def read_manifest(data: bytes) -> PolicyManifest:
 def _prepass(data: bytes) -> None:
     """Reject what ``model_validate_json`` would accept or resolve silently: duplicate keys,
     ``NaN``/``Infinity``, numbers beyond float range, huge integer literals and keys or strings
-    with no UTF-8 form (lone surrogates written as ``\\ud800`` escapes)."""
+    with no UTF-8 form (lone surrogates written as ``\\ud800`` escapes). Nesting is bounded
+    first (``_check_depth``)."""
+    _check_depth(data)
     value = json.loads(
         data.decode("utf-8"),
         object_pairs_hook=_reject_duplicates,
@@ -251,6 +260,40 @@ def _prepass(data: bytes) -> None:
             raise _RejectedError(
                 "manifest_invalid_string", "a key or string of policy.json has no UTF-8 form"
             ) from None
+
+
+_OPEN: Final = frozenset(b"[{")
+_CLOSE: Final = frozenset(b"]}")
+_QUOTE: Final = ord('"')
+_BACKSLASH: Final = ord("\\")
+
+
+def _check_depth(data: bytes) -> None:
+    """Reject nesting deeper than ``MAX_DEPTH`` with one iterative pass over the bytes.
+
+    The standard library's JSON scanner recurses in C: 16 KiB nest 8,190 levels, which raise no
+    ``RecursionError`` (Python's limit is about 10,000) but need over 1 MiB of stack, so a
+    thread with a smaller one (musl's default, a low ``ulimit -s``) would die of a segfault
+    instead of a ``LoadError``. Brackets inside strings do not count (a backslash escapes the
+    next byte); anything malformed is left to the parsers, which now see shallow input."""
+    depth = 0
+    in_string = escaped = False
+    for byte in data:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == _BACKSLASH:
+                escaped = True
+            elif byte == _QUOTE:
+                in_string = False
+        elif byte == _QUOTE:
+            in_string = True
+        elif byte in _OPEN:
+            depth += 1
+            if depth > MAX_DEPTH:
+                raise _RejectedError("manifest_too_deep", "policy.json nests too deeply")
+        elif byte in _CLOSE:
+            depth -= 1
 
 
 def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -418,21 +461,12 @@ def _signature(info: onnx.ValueInfoProto) -> tuple[str, int, tuple[tuple[str, st
     return name, elem_type, tuple(dims)
 
 
-# --- the 7 ``topple.*`` metadata values -------------------------------------------------------
-
-METADATA_SOURCE_FIELDS: Final = (
-    "format",
-    "challenge",
-    "obs_schema",
-    "obs_features",
-    "action_spec",
-    "control_dt",
-    "action_rule",
-)
+# --- the 7 ``topple.*`` metadata values (``METADATA_FIELDS``, from validate) ------------------
 
 
 def task_fields(task: PolicyTask, action_rule: str) -> dict[str, object]:
-    """The manifest fields the 7 metadata values restate, as the challenge fixes them."""
+    """The manifest fields the 7 metadata values restate, as the challenge fixes them. A field
+    added to ``METADATA_FIELDS`` but not here is a mismatch for every policy (fails closed)."""
     return {
         "format": POLICY_FORMAT,
         "challenge": task.challenge,
@@ -456,7 +490,7 @@ def metadata_mismatches(proto: onnx.ModelProto, expected: dict[str, object]) -> 
     at most 1024 bytes); one that is not strict JSON (``NaN``, a duplicate key) mismatches."""
     metadata = {entry.key: entry.value for entry in proto.metadata_props}
     mismatched: list[str] = []
-    for field in METADATA_SOURCE_FIELDS:
+    for field in METADATA_FIELDS:
         key = f"topple.{field}"
         try:
             value = _strict_json(metadata[key])
@@ -469,6 +503,9 @@ def metadata_mismatches(proto: onnx.ModelProto, expected: dict[str, object]) -> 
 
 
 def _strict_json(text: str) -> object:
+    """A metadata value (ASCII, at most 1024 bytes after check 4) parsed as ``policy.json`` is:
+    nesting bounded first, then strict JSON."""
+    _check_depth(text.encode("ascii"))
     return json.loads(
         text,
         object_pairs_hook=_reject_duplicates,

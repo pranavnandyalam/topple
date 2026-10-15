@@ -10,17 +10,20 @@ bytes that are validated and run. Nothing here ever blocks on a FIFO.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import sys
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import topple._inputs as inputs_module
+import topple.loader as loader_module
 import topple.policy.runtime as runtime
 from policy_support import (
     first_party_manifest,
@@ -33,7 +36,13 @@ from policy_support import (
 from topple.challenge import load_challenge
 from topple.contract import Controller
 from topple.envs.balance import BalanceEnv
-from topple.loader import LoadError, load_submission, submission_sha256
+from topple.loader import (
+    LoadError,
+    Submission,
+    load_submission,
+    submission_hashes,
+    submission_sha256,
+)
 from topple.policy.runtime import load_policy_dir, read_policy_dir
 from topple.policy.validate import safe
 
@@ -106,6 +115,29 @@ def test_python_submissions_have_no_policy(tmp_path: Path) -> None:
     assert sub.policy_sha256 is None
 
 
+def test_a_submission_kind_always_matches_its_policy(tmp_path: Path) -> None:
+    sub = load(write_policy_dir(tmp_path / "bot"))
+    with pytest.raises(ValueError, match="kind"):
+        replace(sub, kind="python")
+    with pytest.raises(ValueError, match="kind"):
+        Submission(id="x", sha256="0" * 64, entry=tmp_path / "x", factory=sub.factory, kind="onnx")
+
+
+def test_submission_hashes_reads_without_running(tmp_path: Path) -> None:
+    """What ``topple verify --submission`` records: a policy's sha256 pair from one read under
+    its own entry rules, a Python submission's sha256 alone, nothing imported or validated."""
+    root = write_policy_dir(tmp_path / "bot", readme=b"# hi\n")
+    assert submission_hashes(root) == (submission_sha256(root), hashlib.sha256(PPO).hexdigest())
+    (root / "notes.txt").write_text("x")
+    with pytest.raises(LoadError, match=r"unexpected entry: 'notes\.txt'"):
+        submission_hashes(root)
+    marker = tmp_path / "ran"
+    sub = tmp_path / "bot.py"
+    sub.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n" + CONTROLLER)
+    assert submission_hashes(sub) == (submission_sha256(sub), None)
+    assert not marker.exists()
+
+
 def test_readme_is_optional_and_hashed(tmp_path: Path) -> None:
     plain = load(write_policy_dir(tmp_path / "a"))
     documented = load(write_policy_dir(tmp_path / "b", readme=b"# tiny ppo\n"))
@@ -122,10 +154,183 @@ def test_missing_challenge_is_a_type_error(tmp_path: Path) -> None:
 def test_both_files_are_required(tmp_path: Path, missing: str) -> None:
     root = write_policy_dir(tmp_path / "bot")
     (root / missing).unlink()
-    if missing == "policy.json":  # without its manifest the directory is a Python one
-        assert "controller.py" in refused(root)
+    if missing == "policy.json":  # without its manifest the directory is no policy at all
+        assert refused(root) == NO_ENTRY
     else:
         assert refused(root) == "missing 'policy.onnx'"
+
+
+# --- kind detection (§3.1: exact names; Python submissions unchanged but for one case) -------
+
+
+NO_ENTRY = (
+    "expected a .py file, a directory containing controller.py, "
+    "or a topple.policy/1 directory (policy.onnx and policy.json)"
+)
+
+
+def test_the_no_entry_error_names_both_kinds(tmp_path: Path) -> None:
+    (tmp_path / "policy.onnx").write_bytes(PPO)
+    assert refused(tmp_path / "policy.onnx") == NO_ENTRY
+
+
+def test_a_python_directory_whose_manifest_probe_fails_reports_controller_py(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory that can be listed but not searched (mode 0444 for a user without
+    CAP_DAC_OVERRIDE, as on CI's runner): every probe inside it fails with EACCES. The error
+    names ``controller.py``, as it did before policies existed, never a ``policy.json`` the
+    submission does not have. Faked so that it also runs as root."""
+    root = tmp_path / "bot"
+    root.mkdir()
+    (root / "controller.py").write_text(CONTROLLER)
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def denied(real: Callable[..., os.stat_result]) -> Callable[..., os.stat_result]:
+        def probe(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if Path(os.fsdecode(path)).parent == root:
+                raise PermissionError(13, "Permission denied", os.fsdecode(path))
+            return real(path, *args, **kwargs)
+
+        return probe
+
+    monkeypatch.setattr(os, "lstat", denied(real_lstat))
+    monkeypatch.setattr(os, "stat", denied(real_stat))
+    with pytest.raises(LoadError) as info:
+        load_submission(root)
+    assert str(info.value) == "cannot read 'bot/controller.py': Permission denied"
+
+
+def _case_insensitive(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Make ``os.lstat`` of a name in ``root`` find any entry of that name in another letter
+    case, as macOS and Windows file systems do (the listing keeps the names as stored)."""
+    real = os.lstat
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        p = Path(os.fsdecode(path))
+        if p.parent == root:
+            for name in os.listdir(root):
+                if name.casefold() == p.name.casefold():
+                    return real(root / name, *args, **kwargs)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+def test_a_capitalized_manifest_asset_leaves_a_python_directory_python_on_every_os(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``POLICY.JSON`` is not ``policy.json`` on any file system (contract §17): a Python
+    directory with such an asset loads on a case-insensitive file system as it does on Linux."""
+    root = tmp_path / "bot"
+    root.mkdir()
+    (root / "controller.py").write_text(CONTROLLER)
+    (root / "POLICY.JSON").write_text('{"gain": 1}')
+    expected = load(root).sha256
+    _case_insensitive(monkeypatch, root)
+    sub = load(root)
+    assert sub.kind == "python"
+    assert sub.sha256 == expected
+
+
+def test_a_capitalized_manifest_is_refused_alike_on_every_os(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "bot"
+    root.mkdir()
+    (root / "POLICY.JSON").write_bytes(manifest_bytes(first_party_manifest(PPO)))
+    (root / "policy.onnx").write_bytes(PPO)
+    case_sensitive = refused(root)
+    _case_insensitive(monkeypatch, root)
+    assert refused(root) == case_sensitive == NO_ENTRY
+
+
+def _list_in_order(
+    monkeypatch: pytest.MonkeyPatch, key: Callable[[str], tuple[int, str]]
+) -> list[list[str]]:
+    """Make ``os.scandir`` yield the real entries sorted by ``key`` (a listing order some file
+    system could return, chosen by the test instead of by ext4's hash order); returns the names
+    each listing handed out, one list per listing."""
+    real = os.scandir
+    listings: list[list[str]] = []
+
+    class Ordered:
+        def __init__(self, path: Any) -> None:
+            with real(path) as listing:
+                self._entries = sorted(listing, key=lambda entry: key(entry.name))
+            self.listed: list[str] = []
+            listings.append(self.listed)
+
+        def __enter__(self) -> Ordered:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            pass
+
+        def __iter__(self) -> Iterator[os.DirEntry[str]]:
+            for entry in self._entries:
+                self.listed.append(entry.name)
+                yield entry
+
+    monkeypatch.setattr(os, "scandir", Ordered)
+    return listings
+
+
+def test_controller_py_listed_after_four_entries_is_still_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The listing stops at the fourth entry, so ``controller.py`` is found by its own probe,
+    whatever the order a file system lists it in."""
+    root = tmp_path / "bot"
+    root.mkdir()
+    (root / "controller.py").write_text(CONTROLLER)
+    (root / "policy.json").write_text('{"gain": 1}')
+    for k in range(4):
+        (root / f"asset_{k}.txt").write_text("x")
+    listings = _list_in_order(monkeypatch, lambda name: (name == "controller.py", name))
+    assert refused(root) == "ambiguous submission kind"
+    assert all("controller.py" not in names for names in listings)  # found by its own probe
+
+
+def test_python_listed_after_another_unexpected_entry_is_still_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = write_policy_dir(tmp_path / "bot")
+    (root / "notes.txt").write_text("x")
+    (root / "helper.py").write_text(CONTROLLER)
+    rank = {"notes.txt": 0, "helper.py": 1}
+    _list_in_order(monkeypatch, lambda name: (rank.get(name, 2), name))
+    assert refused(root) == "ambiguous submission kind"
+
+
+# --- the expected sha256 (a pool worker's re-check) ------------------------------------------
+
+
+def test_an_expected_sha_is_checked_before_a_python_submission_runs(tmp_path: Path) -> None:
+    marker = tmp_path / "ran"
+    sub = tmp_path / "bot.py"
+    sub.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n" + CONTROLLER)
+    with pytest.raises(LoadError) as info:
+        load_submission(sub, expected_sha256="0" * 64)
+    assert str(info.value) == (
+        "the submission 'bot.py' changed since it was hashed (sha256 mismatch)"
+    )
+    assert not marker.exists()
+    sha = submission_sha256(sub)
+    assert load_submission(sub, expected_sha256=sha).sha256 == sha
+    assert marker.exists()
+
+
+def test_an_expected_sha_is_checked_before_a_policy_is_validated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = write_policy_dir(tmp_path / "bot")
+    monkeypatch.setattr(runtime, "load_policy_files", None)  # never reached
+    with pytest.raises(LoadError, match=r"'bot' changed since it was hashed"):
+        load_submission(root, challenge=BALANCE, expected_sha256="0" * 64)
+    monkeypatch.undo()
+    sha = submission_sha256(root)
+    assert load_submission(root, challenge=BALANCE, expected_sha256=sha).sha256 == sha
 
 
 # --- ambiguity and unexpected entries ---------------------------------------------------------
@@ -263,15 +468,21 @@ def test_a_non_utf8_name_is_refused_on_every_os(
 def test_a_directory_of_10000_entries_is_refused_after_at_most_4(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The policy listing reads at most 4 entries. Kind detection's listing, which confirms
+    the exact name ``policy.json`` (a case-insensitive file system also finds ``POLICY.JSON``),
+    stops at that name or at ``KIND_LISTING_CAP`` entries, one more than a Python directory may
+    hold: bounded too."""
     root = write_policy_dir(tmp_path / "big")
     for k in range(10_000):
         (root / f"f{k:05d}").touch()
-    seen: list[str] = []
+    listings: list[list[str]] = []
     real = os.scandir
 
     class Counting:
         def __init__(self, path: Any) -> None:
             self._it = real(path)
+            self.seen: list[str] = []
+            listings.append(self.seen)
 
         def __enter__(self) -> Counting:
             return self
@@ -281,12 +492,14 @@ def test_a_directory_of_10000_entries_is_refused_after_at_most_4(
 
         def __iter__(self) -> Iterator[os.DirEntry[str]]:
             for entry in self._it:
-                seen.append(entry.name)
+                self.seen.append(entry.name)
                 yield entry
 
     monkeypatch.setattr(runtime.os, "scandir", Counting)
     assert refused(root).startswith("unexpected entry: 'f")
-    assert 1 <= len(seen) <= 4
+    kind, policy = listings
+    assert 1 <= len(kind) <= loader_module.KIND_LISTING_CAP == 101
+    assert 1 <= len(policy) <= 4
 
 
 # --- links, sizes, swaps ----------------------------------------------------------------------

@@ -3,9 +3,10 @@
 
 The parent reads and validates a submission once and sends a ``PolicyRef``: canonical ONNX
 bytes with their sha256, or a Python submission's path with its submission sha256. A worker
-rebuilds the controller from that and re-checks the sha256 before its first episode, so files
-changed after the parent's load can never be what a worker scores. Sessions and factories never
-cross a process boundary. Pools are spawn-based and clamped to ``min(workers, 4, cpus)``.
+rebuilds the controller from that and re-checks the sha256 before its first episode: ONNX
+bytes travel with the reference, and a changed Python submission is refused before any of it
+runs. Sessions and factories never cross a process boundary, a private protocol never reaches
+a worker, and pools are spawn-based and clamped to ``min(workers, 4, cpus)``.
 """
 
 from __future__ import annotations
@@ -14,8 +15,10 @@ import hashlib
 import multiprocessing
 import pickle
 import shutil
+from concurrent.futures import Executor, Future
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -33,6 +36,7 @@ from topple.pool import (
     policy_ref,
     pool_size,
     run_episodes,
+    submit_episodes,
     worker_factory,
 )
 
@@ -143,26 +147,31 @@ def test_a_worker_given_a_wrong_python_sha_raises_before_running_it(tmp_path: Pa
     assert not marker.exists()  # the changed code never ran
 
 
-def test_worker_factory_checks_the_python_sha_of_what_it_ran(
+def test_a_python_file_swapped_while_the_worker_loads_it_never_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The file can change between the pre-check and the import: the hash of the bytes that
-    ran is compared too."""
+    """The file is swapped just before the worker reads it: the worker compares the hash of
+    its single read with the reference before compiling those bytes, so the swapped code never
+    runs (there is no separate pre-hash whose window a swap could hit)."""
+    marker = tmp_path / "ran"
     sub = tmp_path / "pid.py"
     shutil.copyfile(PID, sub)
     ref = policy_ref(sub, challenge=BALANCE)
     real = load_submission
 
     def swapped(path: Path, **kwargs: object) -> object:
-        sub.write_text(PID.read_text() + "\n# swapped\n")
+        sub.write_text(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n" + CONTROLLER)
         return real(path, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(pool_module, "load_submission", swapped)
     with pytest.raises(LoadError, match="changed since"):
         worker_factory(ref)
+    assert not marker.exists()  # the swapped code never ran
 
 
-def test_a_python_ref_that_now_holds_a_policy_raises(tmp_path: Path) -> None:
+def test_a_python_ref_whose_directory_became_a_policy_fails_the_sha_check(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "bot"
     root.mkdir()
     shutil.copyfile(PID, root / "controller.py")
@@ -181,6 +190,38 @@ def test_run_episodes_refuses_a_private_protocol(tmp_path: Path) -> None:
     private = replace(ideal(), seed_set="private", salt=2**64 + 5)
     with pytest.raises(ValueError, match="public"):
         run_episodes(ref, private, [0])
+
+
+class _RecordingPool(Executor):
+    """An executor that records what would be pickled to a worker, and runs nothing."""
+
+    def __init__(self) -> None:
+        self.submitted: list[tuple[object, ...]] = []
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
+        self.submitted.append((fn, *args))
+        future: Future[Any] = Future()
+        future.set_result([])
+        return future
+
+
+def test_submit_episodes_refuses_a_private_protocol_before_anything_is_pickled(
+    tmp_path: Path,
+) -> None:
+    """Submitting pickles the protocol to a worker, salt included (only its repr is redacted),
+    so the parent refuses a private protocol before ``submit``, not the worker after it."""
+    ref = policy_ref(write_policy_dir(tmp_path / "bot"), challenge=BALANCE)
+    private = replace(ideal(), seed_set="private", salt=2**64 + 5)
+    pool = _RecordingPool()
+    with pytest.raises(ValueError, match="public"):
+        submit_episodes(pool, ref, private, [0])
+    with pytest.raises(ValueError, match="other-v1"):
+        submit_episodes(pool, replace(ref, challenge_id="other-v1"), ideal(), [0])
+    with pytest.raises(ValueError, match="indices"):
+        submit_episodes(pool, ref, ideal(1), [1])
+    assert pool.submitted == []
+    submit_episodes(pool, ref, ideal(1), [0])
+    assert pool.submitted == [(run_episodes, ref, ideal(1), (0,))]
 
 
 def test_run_episodes_refuses_another_challenge(tmp_path: Path) -> None:
@@ -231,8 +272,8 @@ def test_a_spawn_pool_scores_the_bytes_the_parent_loaded(tmp_path: Path) -> None
     sub.write_text(PID.read_text() + "\n# changed\n")
 
     with eval_pool(2) as pool:
-        onnx_future = pool.submit(run_episodes, onnx_ref, ideal(), [0])
-        py_future = pool.submit(run_episodes, py_ref, ideal(), [0])
+        onnx_future = submit_episodes(pool, onnx_ref, ideal(), [0])
+        py_future = submit_episodes(pool, py_ref, ideal(), [0])
         assert onnx_future.result(timeout=120) == expected
         with pytest.raises(LoadError, match="changed since"):
             py_future.result(timeout=120)

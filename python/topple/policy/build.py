@@ -41,14 +41,15 @@ from topple.policy.validate import (
     PRODUCER,
 )
 
-ActionRule = Literal["clip(mean)", "tanh(mean)"]
+BuildRule = Literal["clip(mean)", "tanh(mean)"]
+"""The heads ``build_policy_onnx`` builds: ``validate.ActionRule`` but ``"other"``."""
 Activation = Literal["tanh", "relu"]
-ACTION_RULES: tuple[str, ...] = get_args(ActionRule)
+ACTION_RULES: tuple[str, ...] = get_args(BuildRule)
 OPSET = 17
 TINY_STD = 1e-6  # warn when sqrt(var + eps) < TINY_STD * max(1, |mean|)
 _HIDDEN_OP: Mapping[str, str] = {"tanh": "Tanh", "relu": "Relu"}
 # The two §3.2 graphs: PPO (Tanh hidden layers, clip(mean) head), SAC (Relu, tanh(mean)).
-_RULE_OF_ACTIVATION: Mapping[str, ActionRule] = {"tanh": "clip(mean)", "relu": "tanh(mean)"}
+_RULE_OF_ACTIVATION: Mapping[str, BuildRule] = {"tanh": "clip(mean)", "relu": "tanh(mean)"}
 
 F32 = npt.NDArray[np.float32]
 F64 = npt.NDArray[np.float64]
@@ -125,7 +126,7 @@ def build_policy_onnx(
     w: MlpWeights,
     norm: ObsNorm,
     *,
-    action_rule: ActionRule,
+    action_rule: BuildRule,
     metadata: Mapping[str, str],
     action: ActionSpec,
 ) -> bytes:
@@ -214,7 +215,7 @@ def _activate(activation: str, x: F64) -> F64:
     return out
 
 
-def _checked_rule(action_rule: str, activation: str) -> ActionRule:
+def _checked_rule(action_rule: str, activation: str) -> BuildRule:
     """``action_rule`` if it is the head §3.2 pairs with ``activation`` (which
     ``_checked_layers`` has checked), else ``ValueError``: any other pairing builds a graph
     whose structure match is ``"other"``, contradicting the ``topple.action_rule`` it would
