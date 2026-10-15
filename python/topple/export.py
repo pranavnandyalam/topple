@@ -613,13 +613,16 @@ def _step_dir(run_dir: Path, step: int) -> Path:
     path = run_dir / "ckpt" / f"step_{step}"
     try:
         info = os.lstat(path)
-        inside = path.resolve(strict=True).is_relative_to(run_dir.resolve(strict=True))
     except OSError as exc:
         _fail(f"ckpt/step_{step}: {exc.strerror or type(exc).__name__}")
     if stat.S_ISLNK(info.st_mode):
         _fail(f"ckpt/step_{step} is a symlink")
     if not stat.S_ISDIR(info.st_mode):
         _fail(f"ckpt/step_{step} is not a directory")
+    try:
+        inside = path.resolve(strict=True).is_relative_to(run_dir.resolve(strict=True))
+    except (OSError, RuntimeError) as exc:  # Python 3.12 raises RuntimeError on a symlink loop
+        _fail(f"ckpt/step_{step}: {_resolve_failure(exc)}")
     if not inside:
         _fail(f"ckpt/step_{step} resolves outside the run directory")
     return path
@@ -650,6 +653,14 @@ def _history_row(train_meta: dict[str, Any], step: int) -> dict[str, Any]:
     return found
 
 
+def _resolve_failure(exc: OSError | RuntimeError) -> str:
+    """A fixed description of a failed ``Path.resolve``: the OS error's text, or "symlink
+    loop" for the ``RuntimeError`` Python 3.12 raises (its message quotes the untrusted path)."""
+    if isinstance(exc, RuntimeError):
+        return "symlink loop"
+    return exc.strerror or type(exc).__name__
+
+
 def _check_output(out_dir: Path, run_dir: Path, *, report_only: bool) -> None:
     """Without ``--report-only``: not under ``runs/`` (the working directory's, the checkout's
     gitignored run folder, or the one the run lives in) nor inside the run; a directory called
@@ -659,15 +670,18 @@ def _check_output(out_dir: Path, run_dir: Path, *, report_only: bool) -> None:
         check_output_directory(out_dir)
         run_root = run_dir.resolve(strict=True)
         out_parent = out_dir.parent.resolve()
-        runs_dirs = [(Path.cwd() / RUNS_DIR).resolve()]
     except SymlinkedOutputError as exc:
         _fail(str(exc))
-    except OSError as exc:
-        _fail(f"cannot resolve the output: {exc.strerror or type(exc).__name__}")
+    except (OSError, RuntimeError) as exc:  # Python 3.12 raises RuntimeError on a symlink loop
+        _fail(f"cannot resolve the output: {_resolve_failure(exc)}")
     if report_only:
         if out_parent != run_root or out_dir.name != REPORT_DIR:
             _fail(f"--report-only writes the run's {REPORT_DIR}/ only (--out RUN_DIR/{REPORT_DIR})")
         return
+    try:
+        runs_dirs = [(Path.cwd() / RUNS_DIR).resolve()]
+    except (OSError, RuntimeError) as exc:
+        _fail(f"cannot resolve the output: {RUNS_DIR}/: {_resolve_failure(exc)}")
     if run_root.parent.name == RUNS_DIR:
         runs_dirs.append(run_root.parent)
     resolved = out_parent / out_dir.name

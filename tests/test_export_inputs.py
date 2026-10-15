@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import struct
 import zipfile
 from pathlib import Path
@@ -176,6 +177,38 @@ def test_a_symlinked_step_dir_is_refused(ppo: Run, tmp_path: Path) -> None:
     ppo.step_dir.rename(real)
     ppo.step_dir.symlink_to(real)
     refused(ppo, tmp_path / "p", "is a symlink")
+
+
+def test_a_step_dir_that_is_a_symlink_loop_is_refused(ppo: Run, tmp_path: Path) -> None:
+    """``ckpt/step_N -> step_N``: refused as a symlink, never a ``RuntimeError`` traceback
+    (``Path.resolve`` raises one on a loop in Python 3.12)."""
+    shutil.rmtree(ppo.step_dir)
+    ppo.step_dir.symlink_to(ppo.step_dir.name)
+    refused(ppo, tmp_path / "p", "is a symlink")
+
+
+def test_a_ckpt_symlink_loop_is_refused(ppo: Run, tmp_path: Path) -> None:
+    ckpt = ppo.path / "ckpt"
+    shutil.rmtree(ckpt)
+    ckpt.symlink_to("ckpt")
+    refused(ppo, tmp_path / "p", "ckpt/step_")
+
+
+@pytest.mark.parametrize("report_only", [False, True])
+def test_a_runs_symlink_loop_in_the_working_directory_is_refused(
+    ppo: Run, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, report_only: bool
+) -> None:
+    """``./runs -> runs`` must not crash the 'not under runs/' check with a traceback; a
+    report-only export never looks at ``./runs``."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "runs").symlink_to("runs")
+    monkeypatch.chdir(checkout)
+    if report_only:  # the report goes inside the run, so ./runs never matters
+        assert export_policy(ppo.path, ppo.path / "report_policy", report_only=True)
+        return
+    with pytest.raises(ExportError, match="cannot resolve the output: runs/: symlink loop"):
+        export_policy(ppo.path, tmp_path / "p")
 
 
 def test_an_escaping_step_dir_is_refused(ppo: Run, tmp_path: Path) -> None:
