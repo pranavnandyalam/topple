@@ -970,7 +970,8 @@ def run_episodes_with_rows(ref: PolicyRef, protocol: EvalProtocol, indices: Iter
 separate torch-free environment, so the developer's `.venv` is never modified):
 
 ```bash
-test -z "$(git status --porcelain -- submissions docs/results tests/data configs scripts python)"
+dirty=$(git status --porcelain -- submissions docs/results tests/data configs scripts python)
+test -z "$dirty"
 export UV_PROJECT_ENVIRONMENT=.venv-eval            # gitignored
 uv sync --locked --no-dev
 uv run --no-sync python -c 'import importlib.util,sys; sys.exit(importlib.util.find_spec("torch") is not None)'
@@ -981,8 +982,10 @@ uv run --no-sync topple compare $S -p eval_v1 --workers 4 --json out/cmp_eval_v1
 unset UV_PROJECT_ENVIRONMENT
 K=$(uv run python -c 'import json;print(json.load(open("docs/results/phase2.json"))["shipped"]["run"])')
 D=$(mktemp -d)/p2x
-uv run topple export "runs/$K" --out "$D" && cmp "$D/policy.onnx" submissions/ppo_balance/policy.onnx
-uv run python scripts/phase2_ci_check.py --head "$(git rev-parse HEAD)" --workflow ci.yml   # G9
+uv run topple export "runs/$K" --out "$D"
+cmp "$D/policy.onnx" submissions/ppo_balance/policy.onnx
+head=$(git rev-parse HEAD)
+uv run python scripts/phase2_ci_check.py --head "$head" --workflow ci.yml   # G9
 uv run python scripts/phase2_gate.py out/cmp_cal.json out/cmp_eval_v1.json out/ppo_eval_v1/results.json \
     docs/results/phase2.json --ci-dir docs/results/phase2/ci_ubuntu \
     --submission submissions/ppo_balance --results-dir docs/results/phase2

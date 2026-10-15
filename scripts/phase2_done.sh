@@ -8,13 +8,16 @@
 # docs/results/ are committed. Run it from anywhere in the checkout.
 # Every line below is a simple command, so errexit stops on any failure: the re-export and its
 # cmp are two lines, never `export ... && cmp ...` (bash ignores a failure left of `&&`, so a
-# failing re-export, e.g. with no runs/ in this checkout, would skip the cmp and carry on).
+# failing re-export, e.g. with no runs/ in this checkout, would skip the cmp and carry on), and
+# command output is taken only by an assignment (`x=$(cmd)` fails when cmd does; `test -z
+# "$(cmd)"` would pass when cmd fails and prints nothing).
 # The shellcheck directive above applies file-wide (it must follow the shebang directly).
 set -euo pipefail
 top=$(git rev-parse --show-toplevel)   # an assignment, so errexit sees a failure
 cd "$top"
 # docs/design/phase-2.md section 4 (test_phase2_gate checks these lines):
-test -z "$(git status --porcelain -- submissions docs/results tests/data configs scripts python)"
+dirty=$(git status --porcelain -- submissions docs/results tests/data configs scripts python)
+test -z "$dirty"
 export UV_PROJECT_ENVIRONMENT=.venv-eval            # gitignored
 uv sync --locked --no-dev
 uv run --no-sync python -c 'import importlib.util,sys; sys.exit(importlib.util.find_spec("torch") is not None)'
@@ -27,7 +30,8 @@ K=$(uv run python -c 'import json;print(json.load(open("docs/results/phase2.json
 D=$(mktemp -d)/p2x
 uv run topple export "runs/$K" --out "$D"
 cmp "$D/policy.onnx" submissions/ppo_balance/policy.onnx
-uv run python scripts/phase2_ci_check.py --head "$(git rev-parse HEAD)" --workflow ci.yml   # G9
+head=$(git rev-parse HEAD)
+uv run python scripts/phase2_ci_check.py --head "$head" --workflow ci.yml   # G9
 uv run python scripts/phase2_gate.py out/cmp_cal.json out/cmp_eval_v1.json out/ppo_eval_v1/results.json \
     docs/results/phase2.json --ci-dir docs/results/phase2/ci_ubuntu \
     --submission submissions/ppo_balance --results-dir docs/results/phase2

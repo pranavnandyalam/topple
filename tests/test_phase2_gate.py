@@ -1868,16 +1868,8 @@ def spec_block() -> list[str]:
 
 
 def section_4_commands() -> list[str]:
-    """§4's block, with its ``export ... && cmp ...`` line as two commands: errexit ignores a
-    failure on the left of ``&&``, so a failing re-export would skip the ``cmp`` and the script
-    would carry on (the spec block is being changed to two lines; then this is the identity)."""
-    commands: list[str] = []
-    for line in spec_block():
-        if line == f"{REEXPORT} && {REBUILD_CMP}":
-            commands += [REEXPORT, REBUILD_CMP]
-        elif line.strip():
-            commands.append(line)
-    return commands
+    """§4's block without its blank lines."""
+    return [line for line in spec_block() if line.strip()]
 
 
 def done_sh_body() -> list[str]:
@@ -1904,12 +1896,22 @@ def test_phase2_done_runs_exactly_the_section_4_commands() -> None:
         assert needed in commands
 
 
+ASSIGNED_SUBSTITUTION = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=\$\(")
+
+
 def test_phase2_done_never_hides_a_failure_from_errexit() -> None:
     """``set -e`` does not stop on a failing command left of ``&&`` or ``||``, nor (without
-    ``pipefail``) inside a pipeline, so the done-when runs only simple commands."""
-    for line in done_sh_body():
+    ``pipefail``) inside a pipeline, nor on a command substitution used as an argument (``test
+    -z "$(git status ...)"`` passes when git fails), so the done-when runs only simple commands
+    and takes command output only in assignments (``x=$(...)`` fails when the command does)."""
+    lines = DONE_SH.read_text().splitlines()
+    code = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    for line in code:
         assert "&&" not in line, line
         assert "||" not in line, line
+        if "$(" in line:
+            assert ASSIGNED_SUBSTITUTION.match(line), line
+            assert line.count("$(") == 1, line
     assert done_sh_body().index(REEXPORT) + 1 == done_sh_body().index(REBUILD_CMP)
 
 
@@ -1949,7 +1951,10 @@ esac
 exit 0
 """
 STUB_GIT = """#!/bin/sh
-# A stand-in git: the checkout is $STUB_TOP, clean, at a fixed HEAD.
+# A stand-in git: the checkout is $STUB_TOP, clean, at a fixed HEAD. $STUB_GIT_FAILS names a
+# subcommand that fails as git does outside a checkout or with a bad config (exit 128, no
+# output).
+case "$1" in "$STUB_GIT_FAILS") echo "fatal: $1 failed" >&2; exit 128 ;; esac
 case "$*" in
   "rev-parse --show-toplevel") echo "$STUB_TOP" ;;
   "rev-parse HEAD") echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
@@ -1958,18 +1963,9 @@ exit 0
 """
 
 
-@needs_posix_sh
-@pytest.mark.parametrize(
-    ("export", "passes"),
-    [("same", True), ("fail", False), ("other", False)],
-    ids=["rebuilds_the_shipped_bytes", "export_fails", "export_rebuilds_other_bytes"],
-)
-def test_phase2_done_stops_unless_the_re_export_rebuilds_the_shipped_bytes(
-    export: str, passes: bool, tmp_path: Path
-) -> None:
-    """With stand-in ``uv`` and ``git`` on ``PATH`` (nothing is installed or evaluated): a
-    re-export that fails (``runs/`` is gitignored, so another checkout has none) or rebuilds
-    other bytes stops the script before G9 and the gates; the same bytes let it through."""
+def run_done(tmp_path: Path, **stub_env: str) -> tuple[subprocess.CompletedProcess[str], str]:
+    """``phase2_done.sh`` with stand-in ``uv`` and ``git`` first on ``PATH``: its result and
+    every ``uv`` call (nothing is installed or evaluated)."""
     bash, cmp = shutil.which("bash"), shutil.which("cmp")
     if bash is None or cmp is None:
         pytest.skip("needs bash and cmp")
@@ -1987,18 +1983,53 @@ def test_phase2_done_stops_unless_the_re_export_rebuilds_the_shipped_bytes(
         "TMPDIR": str(scratch),
         "STUB_LOG": str(log),
         "STUB_TOP": str(top),
-        "STUB_EXPORT": export,
+        "STUB_EXPORT": "same",
+        "STUB_GIT_FAILS": "",
+        **stub_env,
     }
     result = subprocess.run(
-        [bash, str(DONE_SH)], capture_output=True, text=True, timeout=60, env=env, check=False
+        [bash, str(DONE_SH)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=scratch,
+        check=False,
     )
-    calls = log.read_text()
+    return result, log.read_text() if log.exists() else ""
+
+
+@needs_posix_sh
+@pytest.mark.parametrize(
+    ("export", "passes"),
+    [("same", True), ("fail", False), ("other", False)],
+    ids=["rebuilds_the_shipped_bytes", "export_fails", "export_rebuilds_other_bytes"],
+)
+def test_phase2_done_stops_unless_the_re_export_rebuilds_the_shipped_bytes(
+    export: str, passes: bool, tmp_path: Path
+) -> None:
+    """With stand-in ``uv`` and ``git`` on ``PATH`` (nothing is installed or evaluated): a
+    re-export that fails (``runs/`` is gitignored, so another checkout has none) or rebuilds
+    other bytes stops the script before G9 and the gates; the same bytes let it through."""
+    result, calls = run_done(tmp_path, STUB_EXPORT=export)
     assert "run topple export runs/ppo_s0 --out " in calls
     if passes:
         assert result.returncode == 0, result.stderr
-        assert "scripts/phase2_ci_check.py" in calls
+        assert "scripts/phase2_ci_check.py --head aaaaaaaaaa" in calls
         assert "scripts/phase2_gate.py" in calls
     else:
         assert result.returncode != 0
         assert "phase2_ci_check.py" not in calls
         assert "phase2_gate.py" not in calls
+
+
+@needs_posix_sh
+@pytest.mark.parametrize("subcommand", ["rev-parse", "status"])
+def test_phase2_done_stops_when_git_fails(subcommand: str, tmp_path: Path) -> None:
+    """Started outside a checkout (``rev-parse --show-toplevel`` fails: bash runs ``cd ""`` as a
+    no-op, so the done-when would go on in the caller's directory) or with a ``git status``
+    that fails and prints nothing (an invalid ``status.showUntrackedFiles``: the clean-tree
+    check would pass on a dirty tree), the script stops before any ``uv`` call."""
+    result, calls = run_done(tmp_path, STUB_GIT_FAILS=subcommand)
+    assert result.returncode != 0
+    assert calls == ""
