@@ -191,3 +191,26 @@ def test_subproc_forkserver_with_the_pid_gate_is_deterministic(tmp_path: Path) -
     baseline = _meta(a)["gate_baseline"]
     assert baseline["rule"] == "pid"  # type: ignore[index]
     assert baseline["reference"] is not None  # type: ignore[index]
+
+
+def test_the_train_meta_is_a_valid_phase2_summary(twice: tuple) -> None:
+    """Every §5.1 summary field comes from train_meta.json and validates as phase2.json's
+    RunSummary, so phase2_results.py never has to invent a value."""
+    import sys
+
+    sys.path.insert(0, str(REPO / "scripts"))
+    from phase2_common import RunSummary
+
+    _, run, _ = twice
+    meta = _meta(run)
+    cfg = meta["config"]
+    summary = {
+        "run": "smoke",
+        "algo": cfg["algo"],  # type: ignore[index]
+        "seed": cfg["seed"],  # type: ignore[index]
+        "total_timesteps": cfg["total_timesteps"],  # type: ignore[index]
+        "attempts": [],
+        **{k: meta[k] for k in RunSummary.model_fields if k in meta},
+        "best": {**meta["best"], "rule": cfg["selection"]["gate"]},  # type: ignore[dict-item,index]
+    }
+    RunSummary.model_validate_json(json.dumps(summary), strict=True)

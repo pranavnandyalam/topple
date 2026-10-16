@@ -85,7 +85,7 @@ def train(cfg: Config, out: Path, *, config_file_sha256: str) -> Path:
     torch.set_num_threads(1)
     started = time.monotonic()
     git_state = _git()  # the code that runs: read before training, never after
-    load_start = os.getloadavg()[0]
+    load_start = os.getloadavg()  # the 1, 5 and 15 minute averages (§2.3, phase2.json)
     challenge = load_challenge(cfg.env.challenge)
     e_ref_j = float(challenge.config.score.e_ref_j)
     protocol = selection_protocol(cfg.selection)
@@ -265,7 +265,7 @@ def _write_outputs(
     num_timesteps: int,
     wall_clock_s: float,
     baseline_s: float,
-    load_avg_start: float,
+    load_avg_start: tuple[float, float, float],
     config_file_sha256: str,
     git_state: tuple[str | None, bool | None],
     protocol_hash: str,
@@ -298,8 +298,8 @@ def _write_outputs(
         "selection_protocol_hash": protocol_hash,
         "env_algo_version": ENV_ALGO_VERSION,
         "bundle_hash": bundle_hash,
-        "load_avg_start": load_avg_start,
-        "load_avg_end": os.getloadavg()[0],
+        "load_avg_start": list(load_avg_start),
+        "load_avg_end": list(os.getloadavg()),
         "wall_clock_s": wall_clock_s,
         "train_s": train_s,
         "selection_s": selection_s,
