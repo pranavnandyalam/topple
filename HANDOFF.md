@@ -4,8 +4,8 @@ This file moves work between Claude Code sessions (local Mac ⇄ cloud at claude
 **Whoever stops working must update it, commit it and push before stopping.** Nothing else
 carries over: local memory, scratch files and workflow scripts stay on the machine that made them.
 
-Last updated: 2026-10-15 (evening) by the local Mac session, which is continuing Phase 2a. Branch
-`phase-2-learn` is pushed; CI is green at 677efeb.
+Last updated: 2026-10-15 21:40 by the local Mac session. Branch `phase-2-learn` is pushed and clean at
+the commit that adds this text. The training runs live only on the Mac, in `runs/` (gitignored).
 
 ## Where things stand
 
@@ -26,20 +26,38 @@ Last updated: 2026-10-15 (evening) by the local Mac session, which is continuing
 
 Work branch: **`phase-2-learn`** (based on `main`). Its PR should be opened when Phase 2 is built.
 
-## Next steps, in order (for the local Mac session)
+## Next steps, in order
 
-1. **PPO confirmation probe** (Q4: yes): ~7 min of the §0 recipe on the recalibrated env.
-2. **Torch half of slice 2:** `topple/train/{learn,snapshot,callbacks,resources}.py` per spec §1–§2.5
-   and decision row **B36** (what they must call: `snapshot_files`/`write_snapshot`, `EvalTrigger`
-   with `final_due`/`resumed`, `evaluate_policy_bytes(..., step=)`, `measure_gate_baseline`,
-   `run_flags`); train-marked tests (`test_train_smoke` twice-run determinism,
-   `test_snapshot_reference`, `test_resources`, `test_pack_torch_legacy`); the torch-generated
-   third-party fixtures (`scripts/make_thirdparty_fixtures.py`, B26).
-3. **Slice 3b:** train PPO seeds 0–2, SAC 0–2 and the ablation (one run at a time), then
-   `scripts/phase2_results.py` (results package, §5) and `scripts/phase2_done.sh`; push, get CI
-   green, fetch the ubuntu evidence (G9), shipped `submissions/ppo_balance`, hero video.
-4. Phase 2a review gate (fresh-clone done-when verifier + reviewers + skeptics), fix, open the PR,
-   merge. Then Phase 2b (waypoint-v1, `topple.traj/2`), then PLAN.md section 0's build order.
+**Done since the last handoff (local Mac, 2026-10-15):**
+- Torch half of slice 2 built (`03ae4e3`, fixtures `6f298e2`, docs B46–B51 `87524d7`).
+- Reviewed by one agent; 1 HIGH, 3 MEDIUM and 2 LOW fixed (`f9109fe`, B52).
+- All slice 3b training runs done on `f9109fe` with a clean tree (`git_dirty: false`). They are in `runs/` on the Mac. Selection seeds 2000..2199, PID measured in the same run: 70.65 / 0.655.
+
+  | Run | Best step | Score / success / energy | Eligible | Flags |
+  |---|---|---|---|---|
+  | ppo_s0 | 3,506,176 | 86.63 / 0.955 / 2.16 J | yes | none |
+  | ppo_s1 | 1,753,088 | 80.62 / 0.815 / 4.12 J | yes | high_energy (early evals only) |
+  | ppo_s2 | 5,013,504 | **87.66 / 0.955 / 2.51 J** | yes | high_energy (early evals only) |
+  | sac_s0..2 | — | 67–74 / 0.43–0.62 | no | no_eligible (as §0 predicts) |
+  | ablate_nopenalty | — | 71.47 / 0.525 / 23.3 J | no | high_energy, no_eligible |
+
+  - ppo_s1's later checkpoints reach 86.3 / 0.905 but saturate above the 0.08 selection cap, so selection kept its 1.75M checkpoint.
+  - ppo_s0 reproduced bit-for-bit an earlier (discarded, dirty-tree) run of the same seed.
+  - Expected shipping order by rank_key: ppo_s2, then ppo_s0, then ppo_s1.
+
+**Next:**
+1. **Build `scripts/phase2_results.py`** (spec §5, and §2.5 "Shipping"). It does not exist yet. It must:
+   - export candidates in rank order with `topple export`;
+   - run fresh evaluations on eval_v1 and 0..199;
+   - call `choose_shipped` and the `SHIP_GATES` (G1–G6) from `scripts/phase2_common.py`;
+   - write `docs/results/phase2/phase2.json` (`topple.phase2/1`), `phase2.md`, the learning curves, the shove test and the side-by-side PID vs PPO hero video;
+   - commit `submissions/ppo_balance`;
+   - support `--fetch-ci` (B40: push runs of HEAD's own code, `ci_ubuntu/source.json`).
+
+   Build it in the main session with TDD, then one reviewer at max effort (it feeds the gates).
+2. Push. Get CI green, including the ubuntu compare of the shipped policy. Run `phase2_results.py --fetch-ci`, then `scripts/phase2_gate.py` / `phase2_done.sh` (G1–G11).
+3. Phase 2a review gate: fresh-clone done-when verifier, 2–3 reviewers, batch skeptics. Then fix, open the PR and merge.
+4. Then Phase 2b (waypoint-v1, `topple.traj/2`). In 2b, pass the challenge kind to `choose_best` (B52 note). Then PLAN.md section 0's build order.
 
 Process notes from this session: each slice ran as one builder → 2–3 reviewers (max effort) → 2
 skeptics → fixer → re-review, then a docs agent synced the spec. See "Effort and cost settings"
