@@ -119,11 +119,13 @@ class FakeLearn:
     def __init__(self, flags: list[str]) -> None:
         self.flags = flags
         self.calls: list[tuple[Any, Path, str]] = []
+        self.history: list[dict[str, Any]] = []  # selection_history the fake run writes
 
     def train(self, cfg: Any, out: Path, *, config_file_sha256: str) -> Path:
         self.calls.append((cfg, out, config_file_sha256))
         out.mkdir(parents=True, exist_ok=True)
-        (out / "train_meta.json").write_text(json.dumps({"flags": self.flags}))
+        meta = {"flags": self.flags, "selection_history": self.history}
+        (out / "train_meta.json").write_text(json.dumps(meta))
         return out
 
 
@@ -140,9 +142,14 @@ SMOKE = str(CONFIGS / "smoke_ppo.yaml")
 SMOKE_SHA = config_sha256(load_train_config(Path(SMOKE)))  # the effective config, seed 0
 
 
-def aborted_run(path: Path, flags: list[str], config_sha: str = SMOKE_SHA) -> Path:
+def aborted_run(
+    path: Path,
+    flags: list[str],
+    config_sha: str = SMOKE_SHA,
+    history: list[dict[str, Any]] | None = None,
+) -> Path:
     path.mkdir(parents=True)
-    meta = {"flags": flags, "config_sha256": config_sha}
+    meta = {"flags": flags, "config_sha256": config_sha, "selection_history": history or []}
     (path / "train_meta.json").write_text(json.dumps(meta))
     (path / "ckpt").mkdir()
     return path
@@ -316,3 +323,37 @@ def test_without_the_train_extra_train_exits_2_with_one_line(
         "error: topple train needs the train extra (torch is not installed): uv sync --extra train"
     ]
     assert not (tmp_path / "run").exists()
+
+
+def rows(*pairs: tuple[int, str]) -> list[dict[str, Any]]:
+    return [{"step": step, "onnx_sha256": sha} for step, sha in pairs]
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "flagged"),
+    [
+        (rows((1024, "a" * 64)), rows((1024, "a" * 64), (2048, "b" * 64)), False),
+        (rows((1024, "a" * 64), (1500, "c" * 64)), rows((1024, "a" * 64), (2048, "b" * 64)), False),
+        (rows((1024, "a" * 64)), rows((1024, "f" * 64), (2048, "b" * 64)), True),
+        ([{"step": "1024", "onnx_sha256": "a" * 64}], rows((1024, "a" * 64)), True),
+    ],
+    ids=["reproduces", "abort-label-not-shared", "differs", "malformed"],
+)
+def test_a_retry_that_does_not_reproduce_is_flagged(
+    learn: FakeLearn,
+    tmp_path: Path,
+    old: list[dict[str, Any]],
+    new: list[dict[str, Any]],
+    flagged: bool,
+) -> None:
+    """§1: the re-run must give the aborted attempt's onnx_sha256 at every label both reached."""
+    out = tmp_path / "ppo_s0"
+    aborted_run(out, ["wall_clock_abort"], history=old)
+    learn.history = new
+    learn.flags = ["high_energy"]
+    result = runner.invoke(app, ["train", SMOKE, "--out", str(out), "--retry"])
+    assert result.exit_code == 0, result.output
+    flags = json.loads((out / "train_meta.json").read_text())["flags"]
+    expected = ["high_energy", "nondeterministic"] if flagged else ["high_energy"]
+    assert flags == expected
+    assert ("nondeterministic" in result.output) is flagged

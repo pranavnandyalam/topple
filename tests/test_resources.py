@@ -462,3 +462,46 @@ def test_abort_flag_reads_the_latest_rss_not_the_peak() -> None:
         cpu_s=0.0, tree_rss_mib=10.0, peak_tree_rss_mib=1e6, peak_tree_rss_at_step=3, peak_procs=2
     )
     assert abort_flag(r, LIMITS, 0.0) is None
+
+
+# A wrapper whose only child is ROOT, so ROOT's workers are the sampler root's grandchildren, as
+# the forkserver env workers are the learner's (they descend from its forkserver child).
+WRAPPER = """
+import subprocess, sys
+p = subprocess.Popen([sys.executable, "-c", *sys.argv[1:]], stdin=sys.stdin, stdout=sys.stdout)
+sys.exit(p.wait())
+"""
+
+
+@pytest.mark.parametrize("mode", ["burn", "alloc"])
+def test_grandchildren_are_counted(mode: str) -> None:
+    """``children(recursive=True)``: a non-recursive walk would miss every env worker."""
+    env = {**os.environ, "BURN_S": str(BURN_S), "ALLOC_MIB": str(ALLOC_MIB)}
+    wrapper = subprocess.Popen(
+        [sys.executable, "-c", WRAPPER, ROOT, CHILD, mode, "1"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    assert wrapper.stdin is not None
+    assert wrapper.stdout is not None
+    try:
+        with ResourceSampler(interval_s=FAST, root_pid=wrapper.pid) as sampler:
+            assert wrapper.stdout.readline().strip() == "up"
+            reading = sampler.reading()
+            assert reading.peak_procs >= 3  # wrapper, ROOT, and ROOT's worker
+            if mode == "burn":
+                assert reading.cpu_s >= 0.9 * BURN_S
+            else:
+                assert reading.tree_rss_mib >= 0.9 * ALLOC_MIB
+            wrapper.stdin.write("\n")
+            wrapper.stdin.flush()
+            assert wrapper.stdout.readline().strip() == "down"
+            after = sampler.reading()
+            if mode == "burn":  # the exited grandchild keeps counting
+                assert after.cpu_s >= reading.cpu_s
+    finally:
+        with contextlib.suppress(OSError):
+            wrapper.stdin.close()
+        wrapper.wait(timeout=30)

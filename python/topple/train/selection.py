@@ -378,6 +378,28 @@ def run_flags(
     return tuple(flag for flag in FLAGS if raised.get(flag, False))
 
 
+def reproduces(new_rows: Sequence[object], old_rows: Sequence[object]) -> bool:
+    """§1: a ``--retry`` re-run reproduces the aborted attempt when both ``selection_history``
+    lists (rows as written to ``train_meta.json``) give the same ``onnx_sha256`` at every label
+    both reached. A row without an integer step or a string sha never matches."""
+
+    def by_step(rows: Sequence[object]) -> dict[int, object] | None:
+        found: dict[int, object] = {}
+        for row in rows:
+            if not isinstance(row, Mapping) or type(row.get("step")) is not int:
+                return None
+            sha = row.get("onnx_sha256")
+            if not isinstance(sha, str):
+                return None
+            found[row["step"]] = sha
+        return found
+
+    new, old = by_step(new_rows), by_step(old_rows)
+    if new is None or old is None:
+        return False
+    return all(new[step] == old[step] for step in new.keys() & old.keys())
+
+
 def _check_unique(history: Sequence[HistoryRow]) -> None:
     steps = [row.step for row in history]
     if any(b <= a for a, b in itertools.pairwise(steps)):

@@ -162,3 +162,32 @@ def test_a_hard_limit_stops_with_a_final_snapshot_and_exit_4(
     assert meta["num_timesteps"] < 1_000_000  # type: ignore[operator]
     final = out / "ckpt" / f"step_{meta['num_timesteps']}"
     assert (final / "actor.npz").is_file()
+
+
+def test_subproc_forkserver_with_the_pid_gate_is_deterministic(tmp_path: Path) -> None:
+    """The shipped runs' path: SubprocVecEnv with forkserver workers and the PID gate (baseline
+    measured, eligibility applied in the loop). Two runs with the same seed give the same
+    arrays and history (what --retry and G10 rely on)."""
+    import yaml
+
+    from topple.train.config import parse_train_config
+
+    doc = yaml.safe_load((CONFIGS / "smoke_ppo.yaml").read_text())
+    doc["vec_env"] = "subproc"
+    doc["start_method"] = "forkserver"
+    doc["n_envs"] = 2
+    doc["selection"]["gate"] = "pid"
+    doc["selection"]["max_saturation"] = 0.08
+    data = yaml.safe_dump(doc).encode()
+    cfg = parse_train_config(data)
+    file_sha = hashlib.sha256(data).hexdigest()
+    a = train(cfg, tmp_path / "a", config_file_sha256=file_sha)
+    b = train(cfg, tmp_path / "b", config_file_sha256=file_sha)
+    assert _digests(a) == _digests(b)
+    strip = ("cpu_s", "wall_s")
+    hist_a = [{k: v for k, v in r.items() if k not in strip} for r in _meta(a)["selection_history"]]  # type: ignore[union-attr]
+    hist_b = [{k: v for k, v in r.items() if k not in strip} for r in _meta(b)["selection_history"]]  # type: ignore[union-attr]
+    assert hist_a == hist_b
+    baseline = _meta(a)["gate_baseline"]
+    assert baseline["rule"] == "pid"  # type: ignore[index]
+    assert baseline["reference"] is not None  # type: ignore[index]

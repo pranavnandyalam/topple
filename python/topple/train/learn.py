@@ -84,6 +84,7 @@ def train(cfg: Config, out: Path, *, config_file_sha256: str) -> Path:
         os.environ[name] = "1"
     torch.set_num_threads(1)
     started = time.monotonic()
+    git_state = _git()  # the code that runs: read before training, never after
     load_start = os.getloadavg()[0]
     challenge = load_challenge(cfg.env.challenge)
     e_ref_j = float(challenge.config.score.e_ref_j)
@@ -144,6 +145,7 @@ def train(cfg: Config, out: Path, *, config_file_sha256: str) -> Path:
         baseline_s=baseline_s,
         load_avg_start=load_start,
         config_file_sha256=config_file_sha256,
+        git_state=git_state,
         protocol_hash=protocol.protocol_hash(),
         bundle_hash=challenge.bundle_hash(),
         e_ref_j=e_ref_j,
@@ -265,6 +267,7 @@ def _write_outputs(
     baseline_s: float,
     load_avg_start: float,
     config_file_sha256: str,
+    git_state: tuple[str | None, bool | None],
     protocol_hash: str,
     bundle_hash: str,
     e_ref_j: float,
@@ -279,7 +282,7 @@ def _write_outputs(
     reading = ctx.final_reading or ctx.sampler.reading()
     selection_s = ctx.selection_s + baseline_s
     train_s = max(wall_clock_s - selection_s, 0.0)
-    commit, dirty = _git()
+    commit, dirty = git_state
     meta: dict[str, Any] = {
         "config_sha256": config_sha256(cfg),
         "config_file_sha256": config_file_sha256,
@@ -332,6 +335,14 @@ def _owned_file(path: Path) -> Path:
     return path
 
 
+def _owned_directory(path: Path) -> None:
+    st = os.lstat(path)
+    if os.path.islink(path) or not os.path.isdir(path):
+        raise PermissionError(f"{path.name} is not a plain directory")
+    if st.st_uid != os.getuid():
+        raise PermissionError(f"{path.name} is not owned by this user")
+
+
 def resume_from(run_dir: Path, step: int | None = None) -> tuple[Any, VecNormalize]:
     """Reload a snapshot's SB3 model and ``VecNormalize`` (``training=False``) from
     ``model.zip`` and ``vecnormalize.pkl``: the only place pickles are loaded, and only files
@@ -347,6 +358,8 @@ def resume_from(run_dir: Path, step: int | None = None) -> tuple[Any, VecNormali
             raise ValueError("best.json has no integer step")
         step = int(best["step"])
     step_dir = run_dir / "ckpt" / f"step_{step}"
+    for directory in (run_dir / "ckpt", step_dir):  # a swapped parent would redirect the loads
+        _owned_directory(directory)
     model_zip = _owned_file(step_dir / "model.zip")
     pkl = _owned_file(step_dir / "vecnormalize.pkl")
     fns: list[Any] = [partial(make_train_env, cfg, 0)]

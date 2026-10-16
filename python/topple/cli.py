@@ -863,8 +863,40 @@ def train(
             _fail(f"cannot move {out} to {attempt}: {exc.strerror or type(exc).__name__}")
         typer.echo(f"retry: moved the aborted run to {attempt}")
     run_dir = learn.train(loaded.config, out, config_file_sha256=loaded.file_sha256)
+    if attempt is not None:
+        _flag_if_not_reproduced(Path(run_dir), attempt)
     if _hard_limit_flags(Path(run_dir)):
         raise typer.Exit(code=EXIT_HARD_LIMIT)
+
+
+def _flag_if_not_reproduced(run_dir: Path, attempt: Path) -> None:
+    """§1: a retry must reproduce the aborted attempt's ``onnx_sha256`` at every label both
+    reached; otherwise its ``train_meta.json`` gains ``nondeterministic`` (in ``FLAGS`` order)
+    and the run is never shipped or reported (G10)."""
+    import json
+
+    from topple._atomic import replacement
+    from topple.export import ExportError, read_run_json
+    from topple.train.selection import FLAGS, NONDETERMINISTIC, reproduces
+
+    try:
+        new = read_run_json(run_dir / "train_meta.json")
+        old = read_run_json(attempt / "train_meta.json")
+    except ExportError as exc:
+        _fail(f"--retry: cannot compare with {attempt.name}: {exc}")
+    if not isinstance(new, dict) or not isinstance(old, dict):
+        _fail(f"--retry: train_meta.json of {run_dir} or {attempt.name} is not an object")
+    new_rows, old_rows = new.get("selection_history"), old.get("selection_history")
+    same = (
+        isinstance(new_rows, list) and isinstance(old_rows, list) and reproduces(new_rows, old_rows)
+    )
+    if same:
+        return
+    raised = {*new.get("flags", []), NONDETERMINISTIC}
+    new["flags"] = [f for f in FLAGS if f in raised]
+    with replacement(run_dir / "train_meta.json", suffix=".tmp") as tmp:
+        tmp.write_text(json.dumps(new, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    typer.echo(f"retry: the run does not reproduce {attempt.name}: flagged {NONDETERMINISTIC}")
 
 
 def _retry_target(out: Path, *, retry: bool, config_sha256: str) -> Path | None:
