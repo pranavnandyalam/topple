@@ -9,12 +9,12 @@ replaces the 7 ``topple.*`` metadata keys with the challenge's, runs checks 1-9 
 test, and writes ``policy.onnx`` + ``policy.json`` (``action_rule`` from the structure match,
 every claim null) into a directory that did not exist, atomically.
 
-The models here are built with ``onnx.helper`` the way the two torch exporters write them
+Most models here are built with ``onnx.helper`` the way the two torch exporters write them
 (the legacy exporter's interleaved rank-0 ``Constant`` nodes; the dynamo exporter's
-``value_info`` and rank-0 initializers). The committed torch-generated fixtures
-``tests/data/thirdparty_{legacy,dynamo}.onnx`` and ``scripts/make_thirdparty_fixtures.py``
-need torch and are DEFERRED until it installs (see
-``test_committed_torch_fixtures_pack_and_load``).
+``value_info`` and rank-0 initializers). The committed ``tests/data/thirdparty_legacy.onnx``
+and ``tests/data/thirdparty_dynamo.onnx`` are the real thing: written once by torch 2.14.1
+(and onnxscript 0.7.2) through ``scripts/make_thirdparty_fixtures.py`` (decision log B26),
+read here as bytes, so this file stays torch-free.
 """
 
 from __future__ import annotations
@@ -655,27 +655,68 @@ def test_cli_pack_unknown_challenge_exits_2(tmp_path: Path) -> None:
         assert not (tmp_path / "bot").exists()
 
 
-# --- deferred: the committed torch-generated fixtures (§3.3) ----------------------------------
+# --- the committed torch-generated fixtures (§3.3, decision log B26) --------------------------
 
 TORCH_FIXTURES = ("thirdparty_legacy.onnx", "thirdparty_dynamo.onnx")
+PPO_SEQUENCE = ["Sub", "Mul", "Clip", "Gemm", "Tanh", "Gemm", "Tanh", "Gemm", "Clip"]
+
+
+def test_the_committed_torch_fixtures_are_what_the_exporters_write() -> None:
+    """The fixtures prove what §3.3 says they do: the legacy export is IR 9 / opset 20 with
+    five rank-0 ``Constant`` nodes interleaved and a static batch of 1; the dynamo export is
+    IR 10 / opset 20 with ``value_info`` for every value and rank-0 initializers. Neither
+    carries an absolute path (``make_thirdparty_fixtures.relative_paths``)."""
+    legacy = parse((DATA / "thirdparty_legacy.onnx").read_bytes())
+    ops = [n.op_type for n in legacy.graph.node]
+    assert (legacy.ir_version, [o.version for o in legacy.opset_import]) == (9, [20])
+    assert [op for op in ops if op != "Constant"] == PPO_SEQUENCE
+    assert ops.count("Constant") == 5
+    assert ops[0] != "Constant"
+    assert ops[-1] != "Constant"
+    assert all(not n.attribute[0].t.dims for n in legacy.graph.node if n.op_type == "Constant")
+    dims = legacy.graph.input[0].type.tensor_type.shape.dim
+    assert [d.dim_value for d in dims] == [1, D]
+    dynamo = parse((DATA / "thirdparty_dynamo.onnx").read_bytes())
+    assert (dynamo.ir_version, [o.version for o in dynamo.opset_import]) == (10, [20])
+    assert [n.op_type for n in dynamo.graph.node] == PPO_SEQUENCE
+    assert len(dynamo.graph.value_info) == 20
+    assert sum(1 for t in dynamo.graph.initializer if not t.dims) == 5
+    for name in TORCH_FIXTURES:
+        data = (DATA / name).read_bytes()
+        assert b"/Users/" not in data
+        assert b"/home/" not in data
 
 
 @pytest.mark.parametrize("name", TORCH_FIXTURES)
 def test_committed_torch_fixtures_pack_and_load(name: str, tmp_path: Path) -> None:
     """§3.3: ``tests/data/thirdparty_legacy.onnx`` (IR 9 / opset 20, interleaved Constants)
     and ``tests/data/thirdparty_dynamo.onnx`` (IR 10 / opset 20, value_info, rank-0
-    initializers) pack to IR 9 / opset 20 and load. DEFERRED: they are generated once by
-    ``scripts/make_thirdparty_fixtures.py`` (``uv run --extra train --with onnxscript``), which
-    needs torch; this test runs as soon as they are committed."""
+    initializers) pack to IR 9 / opset 20 and load, through ``pack_policy`` and the CLI.
+    Regenerate with ``uv run --extra train --with onnxscript python
+    scripts/make_thirdparty_fixtures.py`` (``--check`` compares without writing)."""
     path = DATA / name
-    if not path.exists():
-        pytest.skip(
-            f"deferred until torch installs: tests/data/{name} comes from "
-            "scripts/make_thirdparty_fixtures.py (decision log B12 blocks torch here)"
-        )
     files = pack(path.read_bytes())
     proto = parse(files["policy.onnx"])
     assert (proto.ir_version, proto.opset_import[0].version) == (9, 20)
+    assert [n.op_type for n in proto.graph.node] == PPO_SEQUENCE  # Constants folded
+    assert not proto.graph.value_info
+    assert manifest_of(files)["action_rule"] == "other"  # the scale is rank 0, not [D]
+    assert pack(files["policy.onnx"]) == files  # a fixed point
     result = invoke(path, tmp_path / "bot")
     assert result.exit_code == 0, result.output
-    load_policy_dir(tmp_path / "bot", challenge=BALANCE)
+    loaded = load_policy_dir(tmp_path / "bot", challenge=BALANCE)
+    assert loaded.policy_sha256 == hashlib.sha256(files["policy.onnx"]).hexdigest()
+
+
+def test_the_committed_dynamo_fixture_with_its_scale_broadcast_to_d_is_clip_mean() -> None:
+    """§6: the dynamo fixture with its rank-0 scale gets ``other``; the same fixture with the
+    scale broadcast to ``[D]`` (same value per feature) gets ``clip(mean)``."""
+    proto = parse((DATA / "thirdparty_dynamo.onnx").read_bytes())
+    mul = next(n for n in proto.graph.node if n.op_type == "Mul")
+    scale = next(t for t in proto.graph.initializer if t.name == mul.input[1])
+    assert (list(scale.dims), len(scale.raw_data)) == ([], 4)
+    scale.raw_data = scale.raw_data * D
+    scale.dims[:] = [D]
+    files = pack(serialize(proto))
+    assert manifest_of(files)["action_rule"] == "clip(mean)"
+    assert structure_match(parse(files["policy.onnx"])) == "clip(mean)"
