@@ -30,12 +30,13 @@ pilot table (``PILOT``).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
 import sys
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -51,6 +52,7 @@ from phase2_common import (
     REPO,
     SHIP_GATES,
     SHIPPED_SUBMISSION,
+    UBUNTU_GATES,
     CommandError,
     Fresh,
     FreshRow,
@@ -185,7 +187,9 @@ def topple(*args: str) -> None:
     """Run the ``topple`` CLI of this environment; ``ResultsError`` with its last line if it
     fails."""
     exe = Path(sys.executable).with_name("topple")
-    result = run_command([str(exe), *args], timeout_s=3600.0)
+    result = run_command(
+        [str(exe), *args], timeout_s=3600.0, cwd=REPO
+    )  # fixtures are repo-relative
     if result.returncode != 0:
         tail = (result.stderr or result.stdout.decode("utf-8", "replace")).strip()[-400:]
         raise ResultsError(f"topple {args[0]} failed (exit {result.returncode}): {tail}")
@@ -253,7 +257,9 @@ def ship_failures(run_dir: Path, first: Fresh, copy: Path, work: Path) -> tuple[
         raise ResultsError(f"{run_dir.name}: {problems[0]}")
     try:
         export_shipped(run_dir)
-    except ResultsError:
+    except ResultsError as exc:
+        if "parity" not in str(exc):  # only a parity or coverage refusal is a G5 failure
+            raise
         return tuple(g for g in SHIP_GATES if g in (*local, "G5"))
     out = work / f"eval_{run_dir.name}"
     if out.exists():
@@ -280,15 +286,33 @@ def ship_failures(run_dir: Path, first: Fresh, copy: Path, work: Path) -> tuple[
 
 
 def ship(
-    ppo_cores: Sequence[RunCore], failures: Callable[[str], Sequence[str]]
+    ppo_cores: Sequence[RunCore],
+    failures: Callable[[str], Sequence[str]],
+    ubuntu_failed: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[str, tuple[ShipAttempt, ...]]:
-    """§2.5's choice and its attempts (every local failure is ``failed_on: "local"``)."""
-    choice = choose_shipped(candidates(ppo_cores), failures)
+    """§2.5's choice and its attempts. ``failures(run)`` is a candidate's local verdict
+    (``failed_on: "local"``). A candidate that passes locally but is listed in
+    ``ubuntu_failed`` (G2-G4 measured by CI after an earlier push, ``--ubuntu-failed``) fails
+    those gates ``failed_on: "ubuntu"``, and the next candidate is tried."""
+    ubuntu = dict(ubuntu_failed or {})
+    where: dict[str, str] = {}
+
+    def judged(run: str) -> Sequence[str]:
+        local = tuple(failures(run))
+        if any(g in SHIP_GATES for g in local):
+            where[run] = "local"
+            return local
+        if run in ubuntu:
+            where[run] = "ubuntu"
+            return tuple(ubuntu[run])
+        return local
+
+    choice = choose_shipped(candidates(ppo_cores), judged)
     attempts_ = tuple(
         ShipAttempt(
             run=run,
             failed_gates=tuple(g for g in SHIP_GATES if g in failed),  # typed as ShipGate
-            failed_on="local" if failed else None,
+            failed_on=where[run] if failed else None,  # type: ignore[arg-type]
         )
         for run, failed in choice.attempts
     )
@@ -319,6 +343,50 @@ def g11_table(
 
 
 # --- writing ------------------------------------------------------------------------------------
+
+
+SHIPPED_FILES: Final = (
+    SHIPPED_SUBMISSION,
+    FIXTURE_DIR / "ppo_balance_parity.npz",
+    FIXTURE_DIR / "ppo_balance_parity.bin",
+    FIXTURE_DIR / "ppo_balance_parity.json",
+)
+
+
+@contextlib.contextmanager
+def restored_on_failure(backup: Path) -> Iterator[None]:
+    """Keep a copy of the shipped submission and its fixtures; put them back if shipping
+    fails, so a failed build never leaves another candidate in their place."""
+    if backup.exists():
+        shutil.rmtree(backup)
+    backup.mkdir(parents=True)
+    for rel in SHIPPED_FILES:
+        src = REPO / rel
+        if src.is_dir():
+            shutil.copytree(src, backup / rel)
+        elif src.is_file():
+            (backup / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, backup / rel)
+    try:
+        yield
+    except BaseException:
+        for rel in SHIPPED_FILES:
+            dst, saved = REPO / rel, backup / rel
+            if dst.is_dir():
+                shutil.rmtree(dst)
+            elif dst.exists():
+                dst.unlink()
+            if saved.is_dir():
+                shutil.copytree(saved, dst)
+            elif saved.is_file():
+                shutil.copy2(saved, dst)
+        raise
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
 
 
 def write_compare(path: Path, cmp: Comparison) -> None:
@@ -362,10 +430,14 @@ def render(report: Phase2Report, results_dir: Path, work: Path, workers: int) ->
     return merged
 
 
-def ci_render(results_dir: Path) -> dict[str, Any]:
-    """``render.ci`` from committed ubuntu evidence, if present."""
+def ci_render(results_dir: Path, shipped_policy: str) -> dict[str, Any]:
+    """``render.ci`` from committed ubuntu evidence, only if it is the shipped policy's (older
+    evidence is ignored here and replaced by the next ``--fetch-ci``)."""
     ci = results_dir / CI_DIR
     if not (ci / CI_SOURCE_FILE).is_file():
+        return {}
+    if read_results(ci / "results.json").controller.policy_sha256 != shipped_policy:
+        print("note: ci_ubuntu/ holds another policy's evidence; run --fetch-ci after pushing")
         return {}
     source = parse_ci_source((ci / CI_SOURCE_FILE).read_bytes())
     return {
@@ -397,9 +469,12 @@ def build(args: argparse.Namespace) -> int:
     copies = {d.name: export_report_copy(d, policies) for d in reported}
     first_eval, first_cal = fresh_compares([copies[d.name] for d in reported], args.workers)
     first = Fresh(eval_v1=first_eval, calibration=first_cal, rows=())
-    shipped_run, ship_attempts = ship(
-        ppo_cores, lambda run: ship_failures(run_dirs[run], first, copies[run], work)
-    )
+    with restored_on_failure(work / "previous_submission"):
+        shipped_run, ship_attempts = ship(
+            ppo_cores,
+            lambda run: ship_failures(run_dirs[run], first, copies[run], work),
+            args.ubuntu_failed,
+        )
     # §2.5 stops at the first passing candidate, so its export is the one left in
     # submissions/ppo_balance (with its parity fixture)
     entries = {d.name: copies[d.name] for d in reported}
@@ -439,10 +514,12 @@ def build(args: argparse.Namespace) -> int:
     )
     results_dir = Path(args.out) / RESULTS_SUBDIR
     results_dir.mkdir(parents=True, exist_ok=True)
-    report = report.model_copy(update={"render": {**report.render, **ci_render(results_dir)}})
+    ci = ci_render(results_dir, subject.policy_sha256)
+    report = report.model_copy(update={"render": {**report.render, **ci}})
+    report_json(report)  # validate before anything is rendered
     if not args.skip_media:
         report = render(report, results_dir, work / "media", args.workers)
-    (Path(args.out) / PHASE2_JSON).write_bytes(report_json(report))
+    write_atomic(Path(args.out) / PHASE2_JSON, report_json(report))
     print(f"shipped {shipped_run} after {[(a.run, list(a.failed_gates)) for a in ship_attempts]}")
     print(f"wrote {Path(args.out) / PHASE2_JSON}")
     return 0
@@ -504,27 +581,38 @@ def fetch_ci(args: argparse.Namespace) -> int:
                 continue
             if cmp.protocol_hash != protocol_hash:
                 continue
+            # Everything is built and validated before anything is written.
+            source = {
+                "format": "topple.ci_source/1",
+                "run_id": run["databaseId"],
+                "head_sha": run["headSha"],
+                "event": "push",
+                "branch": branch,
+            }
+            source_bytes = (json.dumps(source, indent=2) + "\n").encode()
+            parse_ci_source(source_bytes)
+            results_bytes = found["results.json"].read_bytes()
+            cmp_bytes = found["cmp_cal_ci.json"].read_bytes()
+            ci_values = {
+                "ci": {
+                    "run_id": run["databaseId"],
+                    "head_sha": run["headSha"],
+                    "results": json.loads(results_bytes),
+                    "cmp_cal": json.loads(cmp_bytes),
+                }
+            }
+            updated = report.model_copy(update={"render": {**report.render, **ci_values}})
+            import phase2_render
+
+            markdown = phase2_render.render_markdown(updated)
+            report_bytes = report_json(updated)
             ci = results_dir / CI_DIR
             ci.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(found["results.json"], ci / "results.json")
-            shutil.copyfile(found["cmp_cal_ci.json"], ci / "cmp_cal.json")
-        source = {
-            "format": "topple.ci_source/1",
-            "run_id": run["databaseId"],
-            "head_sha": run["headSha"],
-            "event": "push",
-            "branch": branch,
-        }
-        data = (json.dumps(source, indent=2) + "\n").encode()
-        parse_ci_source(data)
-        (ci / CI_SOURCE_FILE).write_bytes(data)
-        report = report.model_copy(update={"render": {**report.render, **ci_render(results_dir)}})
-        import phase2_render
-
-        (Path(args.out) / PHASE2_MD).write_text(
-            phase2_render.render_markdown(report), encoding="utf-8"
-        )
-        (Path(args.out) / PHASE2_JSON).write_bytes(report_json(report))
+            write_atomic(ci / "results.json", results_bytes)
+            write_atomic(ci / "cmp_cal.json", cmp_bytes)
+            write_atomic(ci / CI_SOURCE_FILE, source_bytes)
+            write_atomic(Path(args.out) / PHASE2_MD, markdown.encode("utf-8"))
+            write_atomic(Path(args.out) / PHASE2_JSON, report_bytes)
         print(f"ubuntu evidence from CI run {run['databaseId']} ({run['headSha'][:12]})")
         return 0
     raise ResultsError(
@@ -547,11 +635,28 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     p.add_argument("--skip-media", action="store_true", help="phase2.json only (tests)")
     p.add_argument("--fetch-ci", action="store_true")
     p.add_argument("--branch")
+    p.add_argument(
+        "--ubuntu-failed",
+        type=_ubuntu_failure,
+        action="append",
+        default=[],
+        metavar="RUN=G2,G2b",
+        help="a candidate whose pushed CI evidence failed these of G2-G4 (§2.5): ship the next",
+    )
     return p.parse_args(argv)
+
+
+def _ubuntu_failure(text: str) -> tuple[str, tuple[str, ...]]:
+    run, sep, gates = text.partition("=")
+    found = tuple(g for g in gates.split(",") if g)
+    if not sep or not run or not found or not set(found) <= set(UBUNTU_GATES):
+        raise argparse.ArgumentTypeError(f"expected RUN=G2,G2b,G3,G4 (a subset), not {text!r}")
+    return run, found
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    args.ubuntu_failed = dict(args.ubuntu_failed)
     try:
         if args.fetch_ci:
             return fetch_ci(args)

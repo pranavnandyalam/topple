@@ -161,3 +161,75 @@ def test_a_summary_missing_a_field_is_refused(tmp_path: Path) -> None:
     (run / "train_meta.json").write_text(json.dumps({"config": cfg, "best": best}))
     with pytest.raises(ResultsError, match="lacks"):
         run_summary(run)
+
+
+# --- review fixes: the ubuntu fallback, restoring, stale evidence ------------------------------
+
+
+def test_an_ubuntu_failure_ships_the_next_candidate() -> None:
+    cores = [_core("ppo_s0", 86.0), _core("ppo_s2", 87.0)]
+    run, tried = ship(cores, lambda _r: (), {"ppo_s2": ("G2b",)})
+    assert run == "ppo_s0"
+    assert tried == (
+        ShipAttempt(run="ppo_s2", failed_gates=("G2b",), failed_on="ubuntu"),
+        ShipAttempt(run="ppo_s0", failed_gates=(), failed_on=None),
+    )
+
+
+def test_a_local_failure_wins_over_a_listed_ubuntu_one() -> None:
+    cores = [_core("ppo_s2", 87.0), _core("ppo_s0", 86.0)]
+    run, tried = ship(cores, lambda r: ("G5",) if r == "ppo_s2" else (), {"ppo_s2": ("G2",)})
+    assert run == "ppo_s0"
+    assert tried[0] == ShipAttempt(run="ppo_s2", failed_gates=("G5",), failed_on="local")
+
+
+@pytest.mark.parametrize("text", ["ppo_s2", "ppo_s2=", "=G2", "ppo_s2=G5", "ppo_s2=G2,G9"])
+def test_ubuntu_failed_takes_only_g2_to_g4(text: str) -> None:
+    import argparse
+
+    from phase2_results import _ubuntu_failure
+
+    with pytest.raises(argparse.ArgumentTypeError):
+        _ubuntu_failure(text)
+    assert _ubuntu_failure("ppo_s2=G2b,G4") == ("ppo_s2", ("G2b", "G4"))
+
+
+def test_a_failed_ship_restores_the_previous_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import phase2_results
+
+    monkeypatch.setattr(phase2_results, "REPO", tmp_path)
+    sub = tmp_path / "submissions" / "ppo_balance"
+    sub.mkdir(parents=True)
+    (sub / "policy.onnx").write_bytes(b"old")
+    fixture = tmp_path / "tests" / "data" / "ppo_balance_parity.npz"
+    fixture.parent.mkdir(parents=True)
+    fixture.write_bytes(b"old fixture")
+
+    def failing_ship() -> None:
+        with phase2_results.restored_on_failure(tmp_path / "bak"):
+            (sub / "policy.onnx").write_bytes(b"candidate")
+            fixture.write_bytes(b"candidate fixture")
+            (tmp_path / "tests" / "data" / "ppo_balance_parity.bin").write_bytes(b"new")
+            raise ResultsError("no candidate")
+
+    with pytest.raises(ResultsError):
+        failing_ship()
+    assert (sub / "policy.onnx").read_bytes() == b"old"
+    assert fixture.read_bytes() == b"old fixture"
+    assert not (tmp_path / "tests" / "data" / "ppo_balance_parity.bin").exists()
+
+
+def test_stale_ci_evidence_is_not_rendered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import phase2_results
+
+    class Stub:
+        class controller:  # noqa: N801
+            policy_sha256 = "c" * 64
+
+    ci = tmp_path / "ci_ubuntu"
+    ci.mkdir()
+    (ci / "source.json").write_text("{}")
+    monkeypatch.setattr(phase2_results, "read_results", lambda _p: Stub())
+    assert phase2_results.ci_render(tmp_path, "d" * 64) == {}

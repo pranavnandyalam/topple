@@ -1096,7 +1096,8 @@ from `runs/`.
   `flags`, `e_ref_j`, `attempts`, `init_source` (fine-tune only); `shipped` (with every attempt:
   its run, the ship gates it failed and `failed_on`, §2.5);
   the G11 table; and `pilot` constants (energy-cost variant 64.9 / 0.505; log_std −0.5/−1
-  results), each with `source: "<workflow run id>"`, rendered as "pilot measurement";
+  results), each with `source` naming where it was measured (the spec section holding the pilot
+  table; the pilot workflow runs are not kept, B53), rendered as "pilot measurement";
 - renders `phase2.md` and `docs/results/phase2/*` from it.
 
 Nothing is hand-edited; prose with numbers is a template filled from `phase2.json`, and the script
@@ -1138,7 +1139,7 @@ covering width/panes, and the composed frame is resampled (LANCZOS) to width × 
    "SAC (1.0M steps, UTD 0.25)"); "k of 3 PPO seeds reached the PID gate" and "j of 3 at LQR level
    (G2b)"; blocks eval_v1, 0..199 (Mac) and 0..199 (ubuntu CI); columns score [95% CI], falls,
    survival, success, median energy, mean saturation, median drift, parameter count, env steps,
-   train CPU-minutes. Paired PPO − PID and PPO − LQR. Rows below the gate are marked "below PID
+   train CPU-minutes (median drift and parameter count are not in `phase2.json`; B53). Paired PPO − PID and PPO − LQR. Rows below the gate are marked "below PID
    gate".
 3. **Shove test.** Preset `clean`, seeds 0..99, one push at 2.0 s (0.1 s pulse, lateral 0;
    injected with the trusted `reset(options={"pushes": …})` hook, contract §9),
