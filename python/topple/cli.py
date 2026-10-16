@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -864,15 +864,21 @@ def train(
         typer.echo(f"retry: moved the aborted run to {attempt}")
     run_dir = learn.train(loaded.config, out, config_file_sha256=loaded.file_sha256)
     if attempt is not None:
-        _flag_if_not_reproduced(Path(run_dir), attempt)
+        earlier = [
+            out.with_name(f"{out.name}.attempt{k}")
+            for k in range(1, MAX_RETRIES + 1)
+            if os.path.isdir(out.with_name(f"{out.name}.attempt{k}"))
+        ]
+        _flag_if_not_reproduced(Path(run_dir), earlier)
     if _hard_limit_flags(Path(run_dir)):
         raise typer.Exit(code=EXIT_HARD_LIMIT)
 
 
-def _flag_if_not_reproduced(run_dir: Path, attempt: Path) -> None:
-    """§1: a retry must reproduce the aborted attempt's ``onnx_sha256`` at every label both
-    reached; otherwise its ``train_meta.json`` gains ``nondeterministic`` (in ``FLAGS`` order)
-    and the run is never shipped or reported (G10)."""
+def _flag_if_not_reproduced(run_dir: Path, attempts: Sequence[Path]) -> None:
+    """§1: a retry must reproduce every earlier attempt's ``onnx_sha256`` at every label it
+    shares with each (not just the latest, which may itself have diverged), and inherits a
+    ``nondeterministic`` flag from any of them; otherwise its ``train_meta.json`` gains
+    ``nondeterministic`` (in ``FLAGS`` order) and the run is never shipped or reported (G10)."""
     import json
 
     from topple._atomic import replacement
@@ -881,22 +887,37 @@ def _flag_if_not_reproduced(run_dir: Path, attempt: Path) -> None:
 
     try:
         new = read_run_json(run_dir / "train_meta.json")
-        old = read_run_json(attempt / "train_meta.json")
     except ExportError as exc:
-        _fail(f"--retry: cannot compare with {attempt.name}: {exc}")
-    if not isinstance(new, dict) or not isinstance(old, dict):
-        _fail(f"--retry: train_meta.json of {run_dir} or {attempt.name} is not an object")
-    new_rows, old_rows = new.get("selection_history"), old.get("selection_history")
-    same = (
-        isinstance(new_rows, list) and isinstance(old_rows, list) and reproduces(new_rows, old_rows)
-    )
-    if same:
+        _fail(f"--retry: cannot read {run_dir}/train_meta.json: {exc}")
+    if not isinstance(new, dict):
+        _fail(f"--retry: train_meta.json of {run_dir} is not an object")
+    new_rows = new.get("selection_history")
+    diverged: list[str] = []
+    for attempt in attempts:
+        try:
+            old = read_run_json(attempt / "train_meta.json")
+        except ExportError as exc:
+            _fail(f"--retry: cannot compare with {attempt.name}: {exc}")
+        if not isinstance(old, dict):
+            _fail(f"--retry: train_meta.json of {attempt.name} is not an object")
+        old_rows, old_flags = old.get("selection_history"), old.get("flags")
+        same = (
+            isinstance(new_rows, list)
+            and isinstance(old_rows, list)
+            and reproduces(new_rows, old_rows)
+            and not (isinstance(old_flags, list) and NONDETERMINISTIC in old_flags)
+        )
+        if not same:
+            diverged.append(attempt.name)
+    if not diverged:
         return
     raised = {*new.get("flags", []), NONDETERMINISTIC}
     new["flags"] = [f for f in FLAGS if f in raised]
     with replacement(run_dir / "train_meta.json", suffix=".tmp") as tmp:
         tmp.write_text(json.dumps(new, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    typer.echo(f"retry: the run does not reproduce {attempt.name}: flagged {NONDETERMINISTIC}")
+    typer.echo(
+        f"retry: the run does not reproduce {', '.join(diverged)}: flagged {NONDETERMINISTIC}"
+    )
 
 
 def _retry_target(out: Path, *, retry: bool, config_sha256: str) -> Path | None:

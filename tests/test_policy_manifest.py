@@ -10,11 +10,14 @@ claims are held to a printable charset.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import onnx
 import pytest
 
 import topple.policy.manifest as manifest_module
@@ -29,7 +32,7 @@ from policy_support import (
 )
 from topple._inputs import read_regular_file
 from topple.challenge import load_challenge
-from topple.loader import LoadError
+from topple.loader import LoadError, load_submission
 from topple.policy.manifest import (
     HEX64,
     MAX_MANIFEST_BYTES,
@@ -41,6 +44,7 @@ from topple.policy.manifest import (
     policy_task,
     read_manifest,
 )
+from topple.policy.runtime import load_policy_dir
 
 PPO = ppo_bytes()
 BALANCE = load_challenge("balance-v1")
@@ -565,3 +569,72 @@ def test_manifest_copies_compare_by_value() -> None:
     a = read_manifest(manifest_bytes(good()))
     b = read_manifest(manifest_bytes(copy.deepcopy(good())))
     assert a == b
+
+
+# --- the metadata text is exactly what export writes (``json.dumps``) -----------------------------
+
+SHIPPED = Path(__file__).resolve().parents[1] / "submissions" / "ppo_balance"
+
+
+def shipped_proto() -> tuple[bytes, onnx.ModelProto]:
+    data = (SHIPPED / "policy.onnx").read_bytes()
+    return data, onnx.ModelProto.FromString(data)
+
+
+def rebound_policy_dir(root: Path, data: bytes) -> Path:
+    """``submissions/ppo_balance`` at ``root`` with ``policy.onnx`` = ``data`` and
+    ``policy.json``'s ``onnx.sha256`` rebound to it (nothing else changed)."""
+    manifest = json.loads((SHIPPED / "policy.json").read_text(encoding="utf-8"))
+    manifest["onnx"]["sha256"] = hashlib.sha256(data).hexdigest()
+    root.mkdir()
+    (root / "policy.onnx").write_bytes(data)
+    (root / "policy.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return root
+
+
+RESPELLINGS: dict[str, tuple[str, Callable[[str], str]]] = {
+    "trailing_space": ("topple.challenge", lambda text: text + " "),
+    "exponent": ("topple.control_dt", lambda _text: "1e-2"),
+    "compact_list": (
+        "topple.obs_features",
+        lambda text: json.dumps(json.loads(text), separators=(",", ":")),
+    ),
+    "unicode_escape": ("topple.action_spec", lambda text: text.replace("d", "\\u0064", 1)),
+}
+
+
+@pytest.mark.parametrize("name", RESPELLINGS)
+def test_another_spelling_of_a_metadata_value_is_refused(name: str, tmp_path: Path) -> None:
+    """The same JSON value spelled otherwise (whitespace, ``1e-2`` for ``0.01``, a compact list,
+    a ``\\u`` escape) would give one policy many ``policy_sha256`` values: refused, though the
+    manifest is rebound to the new bytes and nothing else changed."""
+    key, respell = RESPELLINGS[name]
+    _, proto = shipped_proto()
+    (entry,) = (e for e in proto.metadata_props if e.key == key)
+    text = respell(entry.value)
+    assert text != entry.value
+    assert text.isascii()
+    assert json.loads(text) == json.loads(entry.value)
+    assert type(json.loads(text)) is type(json.loads(entry.value))
+    entry.value = text
+    sub = rebound_policy_dir(tmp_path / "bot", proto.SerializeToString(deterministic=True))
+    refusal = re.escape(f"metadata_mismatch: {key} differs from policy.json")
+    with pytest.raises(LoadError, match=refusal):
+        load_policy_dir(sub, challenge=BALANCE)
+    with pytest.raises(LoadError, match=refusal):
+        load_submission(sub, challenge=BALANCE)
+
+
+def test_the_unmodified_shipped_policy_loads_through_the_same_route(tmp_path: Path) -> None:
+    """The refusals above are the spelling's alone: re-serialized and rebound the same way, the
+    shipped metadata loads, and its text is ``json.dumps`` of each value."""
+    data, proto = shipped_proto()
+    again = proto.SerializeToString(deterministic=True)
+    assert again == data
+    for entry in proto.metadata_props:
+        if entry.key.startswith("topple."):
+            assert entry.value == json.dumps(json.loads(entry.value))
+    sub = rebound_policy_dir(tmp_path / "bot", again)
+    loaded = load_policy_dir(sub, challenge=BALANCE)
+    assert loaded.policy_sha256 == hashlib.sha256(data).hexdigest()
+    load_submission(sub, challenge=BALANCE)

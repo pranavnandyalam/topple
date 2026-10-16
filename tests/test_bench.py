@@ -21,8 +21,9 @@ from typer.testing import CliRunner
 
 import topple.bench as bench_module
 from policy_support import write_policy_dir
-from pool_support import InlinePool
+from pool_support import InlinePool, guarded
 from topple.bench import (
+    MAX_IMPULSES,
     PULSE_S,
     PUSH_TIME_S,
     SHOVE_PROTOCOL,
@@ -38,6 +39,7 @@ from topple.disturbances import Push
 from topple.evaluate import EvalProtocol
 from topple.loader import LoadError, submission_sha256
 from topple.pool import run_episodes
+from topple.results import MAX_EPISODES
 
 REPO = Path(__file__).resolve().parents[1]
 PID = REPO / "submissions" / "pid_example.py"
@@ -318,12 +320,14 @@ def test_shove_curve_refuses(
 def test_an_endless_iterable_is_refused_after_a_bounded_read(
     pid: Path, inline: list[InlinePool]
 ) -> None:
+    """Each is read at most one past its cap (``guarded`` raises on the read after that)."""
     import itertools
 
     with pytest.raises(ValueError, match="seed"):
-        shove_curve(pid, [CALM], itertools.count())
+        shove_curve(pid, [CALM], guarded(itertools.count(), MAX_EPISODES))
     with pytest.raises(ValueError, match="impulse"):
-        shove_curve(pid, itertools.count(), [0])
+        shove_curve(pid, guarded(itertools.count(), MAX_IMPULSES), [0])
+    assert inline == []  # refused before any pool exists
 
 
 def test_shove_curve_propagates_a_load_error(tmp_path: Path, inline: list[InlinePool]) -> None:

@@ -485,16 +485,21 @@ def _normalized(value: object) -> str:
 
 
 def metadata_mismatches(proto: onnx.ModelProto, expected: dict[str, object]) -> list[str]:
-    """The ``topple.<field>`` metadata keys of ``proto`` whose JSON value is not
-    ``expected[field]`` (both sides normalized, type-exact). The values passed check 4 (ASCII,
-    at most 1024 bytes); one that is not strict JSON (``NaN``, a duplicate key) mismatches."""
+    """The ``topple.<field>`` metadata keys of ``proto`` whose value is not exactly
+    ``json.dumps(expected[field])``, the text ``export`` and ``policy pack`` write. The text is
+    part of the hashed model, so another spelling of the same JSON value (whitespace, escapes,
+    ``1e-2`` for ``0.01``) would let one policy load under many ``policy_sha256`` values. The
+    JSON value must also match, normalized and type-exact. The values passed check 4 (ASCII, at
+    most 1024 bytes); one that is not strict JSON (``NaN``, a duplicate key) mismatches."""
     metadata = {entry.key: entry.value for entry in proto.metadata_props}
     mismatched: list[str] = []
     for field in METADATA_FIELDS:
         key = f"topple.{field}"
         try:
             value = _strict_json(metadata[key])
-            same = _normalized(value) == _normalized(expected[field])
+            same = _normalized(value) == _normalized(expected[field]) and metadata[
+                key
+            ] == json.dumps(expected[field])
         except Exception:  # a missing key, bad JSON, NaN: all simply "differs"
             same = False
         if not same:

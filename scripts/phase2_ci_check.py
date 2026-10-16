@@ -97,6 +97,10 @@ def list_runs(branch: str, workflow: str) -> list[GhRun]:
             branch,
             "--workflow",
             workflow,
+            # push runs only: a pull_request run of the same commit skips the push-only
+            # ubuntu-evidence steps, so it never stands in for HEAD's run (review, B54)
+            "--event",
+            "push",
             "--json",
             "databaseId,status,conclusion,headSha",
             "--limit",

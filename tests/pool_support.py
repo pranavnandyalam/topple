@@ -7,7 +7,7 @@ process instead, and one test per command uses a real pool.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import Executor, Future
 from typing import Any
 
@@ -37,3 +37,14 @@ class InlinePool(Executor):
 
     def __exit__(self, *exc: object) -> None:
         self.shutdown()
+
+
+def guarded[T](items: Iterable[T], cap: int) -> Iterator[T]:
+    """``items`` (an endless iterable, say), but at most ``cap + 1`` of them: a bounded read
+    (``islice(items, cap + 1)``) takes exactly that many, and asking for one more raises
+    ``AssertionError``. Unguarded, a regression that materializes the whole iterable would
+    allocate until the machine falls over instead of failing fast."""
+    for k, item in enumerate(items):
+        if k > cap:
+            raise AssertionError(f"read more than {cap + 1} items from an endless iterable")
+        yield item

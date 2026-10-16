@@ -1005,9 +1005,9 @@ uv run python scripts/phase2_gate.py out/cmp_cal.json out/cmp_eval_v1.json out/p
 - **CI trigger.** `ci.yml` runs on `pull_request` and on `push` to `main` and `phase-*`, so a
   branch without a PR is still checked.
 - **`phase2_ci_check.py`** (`--head` a full sha; `--branch` overrides the current branch)
-  queries `gh run list --branch <branch> --workflow ci.yml --limit 100 --json
-  databaseId,status,conclusion,headSha` and judges the newest run for HEAD (largest
-  `databaseId`). It fails (exit 1) with distinct messages: no run for HEAD, in progress,
+  queries `gh run list --branch <branch> --workflow ci.yml --event push --limit 100 --json
+  databaseId,status,conclusion,headSha` and judges the newest **push** run for HEAD (largest
+  `databaseId`; a `pull_request` run of the same commit skips the push-only evidence steps, B54). It fails (exit 1) with distinct messages: no run for HEAD, in progress,
   cancelled (concurrency cancel-in-progress), failure. After a completed `success` run with
   `headSha == HEAD` it calls `gh run view <id> --json jobs` and passes only if `python`,
   `python-slow` and `python-train` each completed with `success` (otherwise the failure message

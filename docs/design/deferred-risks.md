@@ -108,3 +108,9 @@ platform.
   re-simulation, hardware in the loop), replace the noise draw with a portable one (integer
   arithmetic on raw bits, as contract §9 does for uniforms) under a new `ENV_ALGO_VERSION` or
   challenge version, with a cross-platform golden of the SENSOR stream.
+
+## From the Phase 2a review gate (2026-10-16)
+
+- **Ubuntu evidence is taken on trust once committed.** G8 checks that `ci_ubuntu/source.json` names a push run whose commit is an ancestor of HEAD with no evidence path changed, but nothing ties the committed bytes to that run's artifact. Owner: **Phase 3** (CI-produced evidence for public scores must be bound to the artifact, e.g. its digest recorded by the trusted job, or re-downloaded by the gate).
+- **`scripts/phase2_results.py` writes through symlinks planted in the checkout.** It is a maintainer tool run on a trusted tree. Owner: **Phase 3** if any part of the results pipeline runs on contributor-controlled trees (use `_atomic.replacement` and `_check_output`).
+

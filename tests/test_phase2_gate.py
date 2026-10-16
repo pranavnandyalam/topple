@@ -44,7 +44,13 @@ from run_support import make_run
 from topple.challenge import ENV_ALGO_VERSION, load_challenge
 from topple.compare import Comparison, Entry, PairedRow, ordered_pairs, to_json
 from topple.evaluate import EvalProtocol
-from topple.export import export_policy
+from topple.export import (
+    MIN_SATURATED,
+    MIN_UNSATURATED,
+    PARITY_TOLERANCE,
+    coverage_counts,
+    export_policy,
+)
 from topple.loader import submission_hashes, submission_sha256
 from topple.policy.runtime import load_policy_dir
 from topple.results import (
@@ -936,6 +942,50 @@ def test_g6_needs_the_eval_v1_protocol(good: GoodSet) -> None:
     assert set(failing(good.inputs(results=results))) == {"G6"}
 
 
+def fixture_members(good: GoodSet) -> dict[str, np.ndarray]:
+    with np.load(io.BytesIO(good.shipped["fixture"])) as npz:
+        return {k: npz[k] for k in npz.files}
+
+
+def npz_bytes(members: Mapping[str, np.ndarray]) -> bytes:
+    buf = io.BytesIO()
+    np.savez(buf, **members)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("delta", [2e-5, math.nan], ids=["off_by_2e-5", "nan"])
+def test_g5_needs_batch_1_parity_in_every_row(delta: float, good: GoodSet) -> None:
+    """One well-unsaturated row's reference action moved by more than 1e-5 (or made NaN), the
+    fixture's ``onnx_sha256`` and coverage kept: G5 fails on parity alone."""
+    members = fixture_members(good)
+    action = members["action_ref"].copy()
+    row = int(np.flatnonzero(np.abs(action).max(axis=1) < 0.5)[0])
+    action[row, 0] += delta
+    assert math.isnan(delta) or abs(delta) > PARITY_TOLERANCE
+    unsaturated, saturated = coverage_counts(action)
+    assert unsaturated >= MIN_UNSATURATED
+    assert saturated >= MIN_SATURATED
+    if not math.isnan(delta):
+        assert (unsaturated, saturated) == coverage_counts(members["action_ref"])
+    failed = failing(good.inputs(fixture=npz_bytes({**members, "action_ref": action})))
+    assert set(failed) == {"G5"}, failed
+    (problem,) = failed["G5"]
+    assert "batch-1 parity" in problem
+    assert "above 1e-05" in problem
+    assert ("nan" in problem) is math.isnan(delta)
+
+
+def test_g6_needs_the_loaded_policy_to_be_the_hashed_one(good: GoodSet) -> None:
+    """The policy loaded is another export (with its own fixture, so G5 holds for it), not the
+    submission the subject hashed: G6 fails alone."""
+    other_dir = good.shipped["fixture_path"].parents[1] / "sac_sub"
+    other = load_policy_dir(other_dir, challenge=load_challenge("balance-v1"))
+    assert other.policy_sha256 != good.subject.policy_sha256
+    failed = failing(good.inputs(policy=other, fixture=good.shipped["other_fixture"]))
+    assert set(failed) == {"G6"}, failed
+    assert failed["G6"] == ("the loaded policy is not the one hashed (did the submission change?)",)
+
+
 # --- G7 -------------------------------------------------------------------------------------------
 
 
@@ -994,7 +1044,60 @@ def no_ablation(doc: dict[str, Any]) -> None:
     doc["runs"] = [r for r in doc["runs"] if r["role"] != "ablation"]
 
 
+def row_of(doc: dict[str, Any], run: str) -> dict[str, Any]:
+    (row,) = (r for r in doc["fresh"]["rows"] if r["run"] == run)
+    return row  # type: ignore[no-any-return]
+
+
+def reframe(doc: dict[str, Any], run: str, policy_sha256: str) -> None:
+    """``run``'s entry in both fresh comparisons is now of ``policy_sha256`` (same episodes)."""
+    for name, protocol in (("eval_v1", EVAL), ("calibration", CAL)):
+        cmp = Comparison.model_validate_json(json.dumps(doc["fresh"][name]), strict=True)
+        entries = [
+            e.model_copy(update={"policy_sha256": policy_sha256}) if e.id == run else e
+            for e in cmp.entries
+        ]
+        doc["fresh"][name] = json.loads(to_json(comparison(protocol, entries)))
+
+
+def another_checkpoints_policy(doc: dict[str, Any]) -> None:
+    """ppo_s1's fresh row (and its entries in both compares) are its early checkpoint's policy,
+    not its best's: the evaluation is of something else than the run reports."""
+    early = runs_of(doc)["ppo_s1"]["selection_history"][0]["onnx_sha256"]
+    row_of(doc, "ppo_s1")["policy_sha256"] = early
+    reframe(doc, "ppo_s1", early)
+
+
+def shipped_report_only(doc: dict[str, Any]) -> None:
+    row_of(doc, "ppo_s0")["report_only"] = True
+
+
+def shipped_row_is_another_policy(doc: dict[str, Any]) -> None:
+    """ppo_s0's best, its fresh row and its entries all agree on a policy that is not
+    ``shipped.policy_sha256`` (the submission's): only the shipped record is inconsistent."""
+    other = fake_sha("policy ppo_s0, re-exported")
+    summary = runs_of(doc)["ppo_s0"]
+    summary["selection_history"][-1]["onnx_sha256"] = other
+    summary["best"]["onnx_sha256"] = other
+    row_of(doc, "ppo_s0")["policy_sha256"] = other
+    reframe(doc, "ppo_s0", other)
+
+
+def unreported_fresh_row(doc: dict[str, Any]) -> None:
+    doc["fresh"]["rows"].append({**row_of(doc, "ppo_s2"), "run": "ppo_s9"})
+
+
 G7_EDITS = {
+    "fresh_row_is_another_checkpoint": (another_checkpoints_policy, "not its best checkpoint's"),
+    "shipped_row_report_only": (shipped_report_only, "'ppo_s0' was exported report-only"),
+    "shipped_row_is_another_policy": (
+        shipped_row_is_another_policy,
+        "shipped.policy_sha256 is not its fresh row's policy",
+    ),
+    "fresh_row_for_an_unreported_run": (
+        unreported_fresh_row,
+        "fresh-eval rows for runs that are not reported: ['ppo_s9']",
+    ),
     "two_sac_runs": (drop_sac, "SAC"),
     "below_pid_gate_unmarked": (unmarked, "below_pid_gate"),
     "no_fresh_row": (no_fresh_row, "fresh"),
@@ -1320,6 +1423,64 @@ def test_g11_g2b_is_reported_not_gating(good: GoodSet) -> None:
         like_lqr(doc, "ppo_s2")
 
     assert failing(with_doc(good, lqr_level)) == {}
+
+
+def refresh_calibration(doc: dict[str, Any], plays: Mapping[str, Arrays]) -> None:
+    """The fresh calibration with each entry named in ``plays`` playing those episodes."""
+    cal = Comparison.model_validate_json(json.dumps(doc["fresh"]["calibration"]), strict=True)
+    entries = [replace_arrays(e, plays[e.id]) if e.id in plays else e for e in cal.entries]
+    doc["fresh"]["calibration"] = json.loads(to_json(comparison(CAL, entries)))
+
+
+G11_SINGLE_FAILURES = {
+    # PID survives 185 of 200; the two runs 180 (still within LQR's 175 - 6) at far higher
+    # scores: they fail G3 alone
+    "g3": (Perf(70.0, 45.0, 185, 6.5, 0.074), Perf(97.0, 92.0, 180, 3.0, 0.03)),
+    # median energy about 14 J, above E_ref 13.1 J; everything else as the shipped run
+    "g4": (PID_CAL, Perf(87.0, 60.0, 188, 14.0, 0.03)),
+}
+
+
+@pytest.mark.parametrize("field", G11_SINGLE_FAILURES)
+def test_g11_fails_when_two_runs_fail_g3_or_g4_alone(field: str, good: GoodSet) -> None:
+    """ppo_s1 and ppo_s2 fail only G3 (or only G4) in the fresh calibration: they do not count,
+    so 1 of 3 passes; the recorded G11 rows must say so."""
+    pid, weak = G11_SINGLE_FAILURES[field]
+    weak_runs = ("ppo_s1", "ppo_s2")
+
+    def edit(doc: dict[str, Any], *, record: bool) -> None:
+        refresh_calibration(
+            doc,
+            {
+                "pid_example": arrays(pid, 200, 1),
+                "ppo_s1": arrays(weak, 200, 11),
+                "ppo_s2": arrays(weak, 200, 12),
+            },
+        )
+        for row in doc["g11"]:
+            if record and row["run"] in weak_runs:
+                row[field] = False
+
+    doc = good.doc()
+    edit(doc, record=True)
+    cal = report_of(doc).fresh.calibration
+    for k, e in enumerate(cal.entries):
+        if e.id in (*weak_runs, "ppo_s0"):
+            checks = gate.calibration_checks(cal, k, e.id)
+            expected = {field.upper()} if e.id in weak_runs else set()
+            assert {g for g, problems in checks.items() if problems} == expected, checks
+    failed = failing(good.inputs(report=report_of(doc)))
+    assert set(failed) == {"G11"}, failed
+    (problem,) = failed["G11"]
+    assert "1 of 3" in problem
+    rows = {r.run: r for r in report_of(doc).g11}
+    assert all(getattr(rows[run], field) is False for run in weak_runs)
+
+    failed = failing(with_doc(good, functools.partial(edit, record=False)))
+    assert set(failed) == {"G11"}, failed
+    assert "1 of 3" in failed["G11"][0]
+    for run in weak_runs:
+        assert f"g11 row {run!r}: [{field!r}] differ from the recomputation" in failed["G11"]
 
 
 # --- §2.5: candidates and the fallback ------------------------------------------------------------
@@ -1765,10 +1926,51 @@ def test_the_ci_check_passes_a_successful_run_for_head(
     assert "run 9" in result.stdout
     calls = (tmp_path / "gh.log").read_text().splitlines()
     assert (
-        calls[0] == "run list --branch phase-2-learn --workflow ci.yml "
+        calls[0] == "run list --branch phase-2-learn --workflow ci.yml --event push "
         "--json databaseId,status,conclusion,headSha --limit 100"
     )
     assert calls[1] == "run view 9 --json jobs"
+
+
+FAKE_GH_EVENTS = """#!/bin/sh
+# A fake gh that filters run list by --event as GitHub does: $FAKE_GH_RUNS.push holds the
+# push runs, $FAKE_GH_RUNS every run.
+printf '%s\\n' "$*" >> "$FAKE_GH_LOG"
+case "$1 $2" in
+  "run list")
+    case " $* " in
+      *" --event push "*) cat "$FAKE_GH_RUNS.push" ;;
+      *) cat "$FAKE_GH_RUNS" ;;
+    esac
+    exit 0 ;;
+  "run view") cat "$FAKE_GH_JOBS"; exit 0 ;;
+esac
+exit 64
+"""
+
+
+@needs_posix_sh
+@pytest.mark.parametrize(
+    ("pr", "push", "code"),
+    [("failure", "success", 0), ("success", "failure", 1)],
+    ids=["failing_pr_run", "passing_pr_run"],
+)
+def test_the_ci_check_never_judges_a_pull_request_run(
+    pr: str, push: str, code: int, fake_gh: Callable[..., Any], tmp_path: Path
+) -> None:
+    """A newer pull_request run of HEAD (it skips the push-only ubuntu-evidence steps) is
+    never the run judged: HEAD's push run (9) decides, whatever the PR run (10) concluded."""
+    (tmp_path / "bin" / "gh").write_text(FAKE_GH_EVENTS)
+    push_run, pr_run = ci_run(9, conclusion=push), ci_run(10, conclusion=pr)
+    (tmp_path / "runs.json.push").write_text(json.dumps([push_run]))
+    result = fake_gh([push_run, pr_run])
+    assert result.returncode == code, result.stderr
+    output = result.stdout + result.stderr
+    assert "run 9" in output
+    assert "run 10" not in output
+    calls = (tmp_path / "gh.log").read_text().splitlines()
+    assert " --event push " in calls[0]
+    assert calls[1:] == (["run view 9 --json jobs"] if code == 0 else [])
 
 
 CI_FAILURES = {

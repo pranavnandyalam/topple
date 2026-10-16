@@ -25,6 +25,7 @@ import pytest
 
 import topple.pool as pool_module
 from policy_support import first_party_manifest, sac_bytes, write_policy_dir
+from pool_support import guarded
 from topple.challenge import load_challenge
 from topple.contract import Controller
 from topple.disturbances import Push
@@ -32,6 +33,8 @@ from topple.envs.balance import BalanceEnv
 from topple.evaluate import EvalProtocol, run_episode
 from topple.loader import LoadError, load_submission, submission_sha256
 from topple.pool import (
+    MAX_TASK_EPISODES,
+    MAX_TASK_PUSHES,
     POOL_MAX_WORKERS,
     PolicyRef,
     eval_pool,
@@ -338,11 +341,21 @@ def test_an_endless_iterable_of_indices_is_refused_after_a_bounded_read(tmp_path
     """Materializing reads at most one more index than a task may run, so an endless iterator
     is refused instead of being read until memory runs out."""
     ref = policy_ref(write_policy_dir(tmp_path / "bot"), challenge=BALANCE)
-    endless = itertools.repeat(0)
     with pytest.raises(ValueError, match="at most"):
-        submit_episodes(_RecordingPool(), ref, ideal(1), endless)
+        submit_episodes(
+            _RecordingPool(), ref, ideal(1), guarded(itertools.repeat(0), MAX_TASK_EPISODES)
+        )
     with pytest.raises(ValueError, match="at most"):
-        run_episodes(ref, ideal(1), itertools.repeat(0))
+        run_episodes(ref, ideal(1), guarded(itertools.repeat(0), MAX_TASK_EPISODES))
+
+
+def test_the_endless_guard_fails_fast() -> None:
+    """``guarded`` serves exactly one past the cap, then raises: a regression that reads the
+    whole iterable fails at once instead of allocating without bound."""
+    items = guarded(itertools.repeat(0), 3)
+    assert list(itertools.islice(items, 4)) == [0, 0, 0, 0]
+    with pytest.raises(AssertionError, match="more than 4"):
+        next(items)
 
 
 def test_run_episodes_runs_a_generator_of_indices(tmp_path: Path) -> None:
@@ -375,7 +388,7 @@ def test_pushes_reach_the_worker_as_a_tuple(tmp_path: Path) -> None:
         [{"start_step": 100}],
         [replace(SHOVE, start_step=300), SHOVE],  # unsorted
         [SHOVE, SHOVE],  # two at one step
-        itertools.repeat(SHOVE),
+        guarded(itertools.repeat(SHOVE), MAX_TASK_PUSHES),
         [replace(SHOVE, magnitude_n=float("nan"))],
         [replace(SHOVE, lateral_ratio=float("inf"))],
         # pushes that could never fire, or fire as NaN (quality-F6)

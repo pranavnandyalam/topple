@@ -124,7 +124,11 @@ class FakeLearn:
     def train(self, cfg: Any, out: Path, *, config_file_sha256: str) -> Path:
         self.calls.append((cfg, out, config_file_sha256))
         out.mkdir(parents=True, exist_ok=True)
-        meta = {"flags": self.flags, "selection_history": self.history}
+        meta = {
+            "flags": self.flags,
+            "config_sha256": config_sha256(cfg),  # as learn writes it: a retry re-runs only it
+            "selection_history": self.history,
+        }
         (out / "train_meta.json").write_text(json.dumps(meta))
         return out
 
@@ -357,3 +361,83 @@ def test_a_retry_that_does_not_reproduce_is_flagged(
     expected = ["high_energy", "nondeterministic"] if flagged else ["high_energy"]
     assert flags == expected
     assert ("nondeterministic" in result.output) is flagged
+
+
+A, B, C, F = ("a" * 64, "b" * 64, "c" * 64, "f" * 64)
+
+
+def retry(out: Path) -> Any:
+    return runner.invoke(app, ["train", SMOKE, "--out", str(out), "--retry"])
+
+
+def test_a_retry_chain_compares_with_every_earlier_attempt(
+    learn: FakeLearn, tmp_path: Path
+) -> None:
+    """§1: attempt 1 gave b at 2048; its retry (attempt 2) gave f there and was flagged. A
+    second retry that reproduces attempt 2 still diverges from attempt 1, and inherits attempt
+    2's flag: comparing with the latest attempt alone would ship a nondeterministic run."""
+    out = tmp_path / "ppo_s0"
+    aborted_run(out, ["wall_clock_abort"], history=rows((1024, A), (2048, B)))
+    learn.history, learn.flags = rows((1024, A), (2048, F)), ["wall_clock_abort"]
+    result = retry(out)
+    assert result.exit_code == 4, result.output  # it stopped on its wall-clock limit again
+    meta = json.loads((out / "train_meta.json").read_text())
+    assert meta["flags"] == ["wall_clock_abort", "nondeterministic"]
+    learn.history, learn.flags = rows((1024, A), (2048, F), (3072, C)), ["high_energy"]
+    result = retry(out)
+    assert result.exit_code == 0, result.output
+    assert len(learn.calls) == 2
+    assert json.loads((tmp_path / "ppo_s0.attempt2" / "train_meta.json").read_text()) == meta
+    flags = json.loads((out / "train_meta.json").read_text())["flags"]
+    assert flags == ["high_energy", "nondeterministic"]
+    assert "ppo_s0.attempt1, ppo_s0.attempt2: flagged nondeterministic" in result.output
+
+
+def test_a_retry_chain_that_reproduces_every_attempt_is_not_flagged(
+    learn: FakeLearn, tmp_path: Path
+) -> None:
+    out = tmp_path / "ppo_s0"
+    aborted_run(out, ["wall_clock_abort"], history=rows((1024, A)))
+    learn.history, learn.flags = rows((1024, A), (2048, B)), ["wall_clock_abort"]
+    assert retry(out).exit_code == 4
+    learn.history, learn.flags = rows((1024, A), (2048, B), (3072, C)), ["high_energy"]
+    result = retry(out)
+    assert result.exit_code == 0, result.output
+    assert json.loads((out / "train_meta.json").read_text())["flags"] == ["high_energy"]
+    assert "nondeterministic" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "second_flags", "diverged"),
+    [
+        # reproduces attempt 2 (clean), not attempt 1: only attempt 1 is named
+        (rows((1024, A), (2048, B)), rows((1024, A), (2048, F)), [], ["ppo_s0.attempt1"]),
+        # reproduces both, but attempt 2 was flagged: the flag is inherited
+        (rows((1024, A)), rows((1024, A), (2048, F)), ["nondeterministic"], ["ppo_s0.attempt2"]),
+        # reproduces both clean attempts
+        (rows((1024, A)), rows((1024, A), (2048, F)), [], []),
+    ],
+    ids=["diverges-from-the-first", "inherits-the-flag", "reproduces-both"],
+)
+def test_each_earlier_attempt_counts_on_its_own(
+    learn: FakeLearn,
+    tmp_path: Path,
+    first: list[dict[str, Any]],
+    second: list[dict[str, Any]],
+    second_flags: list[str],
+    diverged: list[str],
+) -> None:
+    """Attempt 1 is already aside; the aborted run in ``--out`` becomes attempt 2."""
+    out = tmp_path / "ppo_s0"
+    aborted_run(tmp_path / "ppo_s0.attempt1", ["wall_clock_abort"], history=first)
+    aborted_run(out, ["wall_clock_abort", *second_flags], history=second)
+    learn.history, learn.flags = rows((1024, A), (2048, F), (3072, C)), []
+    result = retry(out)
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "ppo_s0.attempt2" / "ckpt").is_dir()
+    flags = json.loads((out / "train_meta.json").read_text())["flags"]
+    assert flags == (["nondeterministic"] if diverged else [])
+    if diverged:
+        assert f"does not reproduce {', '.join(diverged)}: flagged" in result.output
+    else:
+        assert "nondeterministic" not in result.output
