@@ -47,11 +47,11 @@ eval_v1 seed 1005: PID 29.66 (fell), PPO 88.80 (timeout), gap +59.14. [MP4 960x4
 | SAC (1.0M steps, UTD 0.25) seed 1 (below PID gate) | 72.71 [69.34, 75.94] | 57 | 0.715 | 0.665 | 3.68 | 0.017 | 750,000 | 20.0 |  |  |
 | SAC (1.0M steps, UTD 0.25) seed 2 (below PID gate) | 65.64 [62.12, 69.12] | 84 | 0.580 | 0.495 | 3.68 | 0.010 | 850,000 | 18.3 |  |  |
 
-Measured on darwin-arm64 arm64-sme, onnxruntime 1.31.0. CI's ubuntu numbers differ per episode (§3.5) and are shown in the second block, from `docs/results/phase2/ci_ubuntu/` (CI run 38881773267, policy 72b92aa744bf).
+Measured on darwin-arm64 arm64-sme, onnxruntime 1.31.0. CI's ubuntu numbers differ per episode (§3.5) and are shown in the second block, from `docs/results/phase2/ci_ubuntu/` (CI run 38891130614, policy 72b92aa744bf).
 
 ### Seeds 0..199 (ubuntu CI)
 
-CI run 38881773267, policy 72b92aa744bf; linux-x86_64 avx2, onnxruntime 1.31.0.
+CI run 38891130614, policy 72b92aa744bf; linux-x86_64 avx2, onnxruntime 1.31.0.
 
 | Controller | Score [95% CI] | Falls | Survival | Success | Median energy (J) | Mean saturation | Env steps (best) | Train CPU-min | PPO − PID [95% CI] | PPO − LQR [95% CI] |
 |---|---|---|---|---|---|---|---|---|---|---|
