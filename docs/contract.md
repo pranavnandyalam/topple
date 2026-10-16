@@ -3,8 +3,10 @@
 This document defines what a Topple controller sees, what it returns, how an episode runs and how it
 is scored. Python (`topple/`), the browser arena, the GitHub Action and robot firmware all implement
 exactly this. Anything that could change a fixed controller's score on a fixed seed is versioned
-(see §13). Values marked **[calibrated]** are frozen at the end of Phase 1 and never edited
-afterwards. `E_ref` (§12) lives in `challenges/balance-v1/challenge.yaml`, which `bundle_hash`
+(see §13). Values marked **[calibrated]** are frozen once their challenge is published (balance-v1:
+at the Phase 3 release) and never edited afterwards; before that, a recalibration is a reviewed
+re-pin of the bundle and protocol hashes and the golden scores (balance-v1's E_ref moved 13.0 → 13.1
+J this way on 2026-10-15, when it was re-measured on the ranked platform, §12). `E_ref` (§12) lives in `challenges/balance-v1/challenge.yaml`, which `bundle_hash`
 covers. The push impulse band (§10) lives in the `standard` preset's push config
 (`topple.disturbances.PRESETS`, shared env code), which `protocol_hash` covers as part of the full
 preset definition. So an edit to `E_ref` moves every balance-v1 protocol hash, and an edit to the
@@ -209,7 +211,8 @@ robot at rest reads +g. The first filter update (step 3) then pulls the estimate
 of noise, an error of at most `(1 − a)·(π + |pitch|)` ≈ 12.8 mrad that decays with `tau`.
 Measured on darwin-arm64: std 7.1 mrad after control step 1 over 300 `clean` seeds (0.55 mrad
 with the tires 0.1 mm into the floor), and no effect on the calibration (§10, §12: on `standard`
-seeds 0..199, LQR 86.5% and PID 64.5% survival and E_ref 13.0 either way). Whether a contact at
+seeds 0..199, LQR 86.5% and PID 64.5% survival and PID's median energy 6.49 J either way, on
+darwin-arm64). Whether a contact at
 exactly zero distance counts rests on rounding, so this first sample can differ by platform, as
 physics may (§14). It is part of balance-v1; changing the spawn changes every score, so it needs
 a new major version (§13).
@@ -328,8 +331,22 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   `KeyboardInterrupt`, including `SystemExit`), `load_submission` raises `LoadError` with the
   same `Type: message` detail, and the CLI exits 2 with that message, never a traceback. A load
   that fails leaves no submission module behind in `sys.modules`.
-- Submission kinds: a `.py` file, or a directory with `controller.py` plus assets located via
-  `Path(__file__).parent` (ONNX policies arrive in Phase 2). The entry file is named exactly
+- Submission kinds: a `.py` file; a directory with `controller.py` plus assets located via
+  `Path(__file__).parent`; or a `topple.policy/1` directory (§17), which is data only. The loader
+  checks a directory for `policy.json` before `controller.py`: a directory with an entry named
+  exactly `policy.json` is a policy, and one that also holds Python (`controller.py`, or any
+  `.py` among the entries its bounded listing reads) is refused with `ambiguous submission
+  kind`. The name is matched exactly on every file system: a case-insensitive one (macOS,
+  Windows) also finds `POLICY.JSON` under that name, so the loader confirms it in a listing that
+  stops at `policy.json` or after 101 top-level entries, more than a Python directory may hold
+  (a directory that reaches the cap stays a policy and is refused by §17's entry rules). A
+  `policy.json` that cannot even be examined (a directory without search permission) does not
+  make a policy: the directory is decided as before, and its error names `controller.py`. That
+  is the one change for Python submissions: a Python directory with a top-level `policy.json`
+  asset, which loaded before, is now refused (rename the asset). A policy is loaded for a
+  challenge (`load_submission(path, challenge=...)`, a `TypeError` without one), because its
+  dimensions and action bounds come from the challenge's `TaskSpec`, never from the submission;
+  `topple eval` and `topple run` pass their protocol's challenge. The entry file is named exactly
   `controller.py` on every file system: a case-insensitive one (macOS, Windows) also finds
   `Controller.py` under that name, and such a directory is refused there as on Linux. A
   directory may hold at most 50 regular files in at most 50 subdirectories (at any depth) and
@@ -350,6 +367,9 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   for every file in POSIX-path string order, `len(path)‖path‖len(bytes)‖bytes` (8-byte
   big-endian lengths; `path` is the UTF-8 POSIX path relative to the submission directory, or
   the file's name for a single-file submission; `bytes` exactly as on disk, never normalized).
+  A policy directory follows its own, stricter entry rules (§17), and its sha256 is this same
+  recipe over the bytes its files were read as, once: the bytes hashed are the bytes validated
+  and run.
 - **The sha256 covers the code that runs.** The entry file (the `.py` file, or `controller.py`)
   is read once: those bytes are hashed, and those bytes are compiled (as Python compiles a
   module, inheriting no `__future__` flags from the loader) and run as the submission's module.
@@ -402,7 +422,8 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
   well inside these bounds; `reset(options={"scenario": dict})` goes through this check with the
   env's clock. In-process `Scenario` objects and the `pushes`/`init_pitch_rad`/`init_pitch_rate`
   reset options are trusted test hooks and skip the other bounds (robustness tests use absurd
-  pushes), but every reset path still requires the initial pitch and rate inside theirs and
+  pushes; `topple shove` injects its one calibrated push through `pushes`, in place of the
+  seed's own), but every reset path still requires the initial pitch and rate inside theirs and
   pushes sorted by `start_step` that never overlap. From about 1e84 rad/s MuJoCo cannot compute
   the reset (its accelerations come out NaN), and the float32 records cannot hold a rate beyond
   3.4e38 rad/s; the env runs one push at a time, so two at one step, or one starting while
@@ -440,8 +461,10 @@ MuJoCo's data of the previous substep, so like contacts and the IMU (§5, §11) 
 by one substep (2 ms);
 impulse magnitude **[calibrated]** U(0.25, 0.45) N·s, the `standard` preset's
 `PushConfig.impulse_ns` (target: the reference LQR survives ≥ 80%
-and the shipped PID 40–90% of `standard` episodes; measured on seeds 0..199 (darwin-arm64):
-LQR 86.5%, PID 64.5%, both 100% on `clean`). Force is capped at 50 N.
+and the shipped PID 40–90% of `standard` episodes; measured on seeds 0..199 on `linux-x86_64`,
+the calibration platform (the one ranked scores come from, §13): LQR 87.5%, PID 65.0%; on
+darwin-arm64: LQR 86.5%, PID 64.5%; both 100% on `clean` on both platforms). Force is capped at
+50 N.
 
 ## 11. Termination, stability
 
@@ -502,8 +525,13 @@ Episode score (0–100):
 
 `success = survived ∧ drift_m < 1 ∧ energy_j ≤ 5·E_ref`. `E_ref` **[calibrated]** = 2× the PID
 baseline's median energy on `balance-v1/standard` (seeds 0..199, all episodes), rounded to 0.1 J,
-frozen: 2 × 6.49 J → `E_ref = 13.0` J (measured on darwin-arm64; physics, unlike scenarios, is
-only reproducible per platform, §14).
+frozen: 2 × 6.5655 J → `E_ref = 13.1` J, measured on `linux-x86_64`, the calibration platform
+because ranked scores come from it (§13). Physics, unlike scenarios, is only reproducible per
+platform (§14): darwin-arm64 measures 6.49 J, which would round to 13.0 J. 2 × 6.5655 J sits
+0.019 J below the 13.15 rounding boundary (the median averages two seeds' energies 0.093 J apart),
+so a later re-measurement after a physics or dependency change could round elsewhere: a
+re-measurement alone never changes E_ref. Changing it is a deliberate recalibration: a reviewed
+re-pin before publication, a new challenge version after (§13).
 
 Protocol score = `fsum` of episode scores in seed order / N, and success rate = successes / N,
 where N is the number of episodes the protocol expects: a missing or errored episode counts as 0.
@@ -512,9 +540,11 @@ Mean time upright is averaged over the episodes present (those with metrics). Ra
 
 ## 13. Bump rule and hashes
 
-Anything that can change a fixed controller's score on a fixed seed requires a new challenge
-major version (`balance-v2`): MJCF, robot params, physics options, presets, scorer, E_ref, seeds,
-episode length, control rate, observation semantics. Reward shaping and training configs never bump.
+Once a challenge is published, anything that can change a fixed controller's score on a fixed
+seed requires a new challenge major version (`balance-v2`): MJCF, robot params, physics options,
+presets, scorer, E_ref, seeds, episode length, control rate, observation semantics. Before
+publication such a change is a reviewed re-pin of the hashes and golden scores instead (balance-v1's
+E_ref recalibration, §12). Reward shaping and training configs never bump.
 
 Env code is shared by all challenges. A code change that can change a fixed controller's results
 on a fixed seed (sensing, estimation, termination, pushes, model overrides) must bump
@@ -539,7 +569,7 @@ change.
   directory do not count; a listed file outside the bundle directory is an error.
 - `protocol_hash(preset, seeds, salt)` = sha256 of the canonical JSON (UTF-8; keys sorted at
   every level; separators `,` and `:` with no whitespace; floats in Python's shortest round-trip
-  form, so `13.0` is written `13.0`, never `13`: Python's
+  form, so `5.0` is written `5.0`, never `5`: Python's
   `json.dumps(…, sort_keys=True, separators=(",", ":"), allow_nan=False)`; the standard
   protocol's text is pinned in `tests/test_challenge.py`) of
   `{format: "topple.protocol/1", env_algo_version, bundle: bundle_hash,
@@ -576,13 +606,21 @@ verifies and re-scores it by replay (§16).
 in the target directory (created exclusively, under a random name), mode 0644 whatever the umask,
 then renamed over `path`. An output directory can come from someone else's checkout, so a symlink
 at `path` is replaced, never written through; a failed write leaves `path` as it was. Replay
-videos, and the image `topple smoke` writes (`smoke.png` in the current directory by default),
-are written the same way.
+videos (side-by-side ones from `topple video` included), the image `topple smoke` writes
+(`smoke.png` in the current directory by default) and the `topple.compare/1` file of `topple
+compare --json` are written the same way. `topple policy pack` writes a whole directory this
+way: its files go into a new private sibling directory, which is renamed to `--out` once
+complete. `--out` must not exist (exit 2) and is checked again just before the rename, so a pack
+never writes into an existing directory: only an empty directory created at `--out` in the
+instant between that check and the rename can be replaced (POSIX `rename`), and a non-empty one
+is refused and kept. Missing parent directories are created; a failed pack removes its private
+directory and the parents it created (each only while empty), so it leaves nothing behind.
 
 A checkout can also commit a directory as a symlink (`out -> ~/project`), which would send the
 default `out/run` and `out/eval` elsewhere. So the commands' output paths (the `--out` of
-`topple run`, `eval`, `verify` and `smoke`, and of `python -m topple.smoke`) are checked before
-anything runs: a **relative** path never passes through a symlink. Each of its directories that
+`topple run`, `eval`, `verify`, `smoke`, `video` and `policy pack`, the `--json` of `topple
+compare`, and the `--out` of `python -m topple.smoke`) are checked before anything runs: a
+**relative** path never passes through a symlink. Each of its directories that
 exists, the output directory itself included (for a file, the directory it goes in), is
 examined without following links (`lstat`), and a symlink among them exits 2 with `refusing to
 write through the symlink '<prefix>'`; one that cannot be examined (a component that is a file)
@@ -649,9 +687,18 @@ else, including unreadable, truncated or missing files and corrupted members:
 
 `results.json` (pydantic, `extra="forbid"`, no NaN/Inf): format, challenge, protocol,
 protocol_hash, seed_set (`public`/`private`), versions (topple, mujoco, numpy, obs schema, action
-spec), platform, robot_hash, controller {id, sha256}, isolation, complete,
+spec; optional onnxruntime, onnx, cpu_isa), platform, robot_hash, controller {id, sha256,
+optional policy_sha256}, isolation, complete,
 episodes [{index, seed, success, score, metrics, error {code, step, detail}}],
 aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
+
+- **Optional fields.** `versions.onnxruntime` and `versions.onnx` are the installed
+  distributions' versions and `versions.cpu_isa` the widest vector extension of the machine
+  (`avx512f`, `avx2` or `sse4` from `/proc/cpuinfo` on Linux; `arm64-sme` or `arm64-neon` from
+  `sysctl hw.optional` on macOS), each null when unknown; `topple` records them for every run.
+  `controller.policy_sha256` is sha256(`policy.onnx`) for a `topple.policy/1` submission (§17)
+  and null for a Python one. Each may be absent: a file written before they existed reads as
+  before.
 
 - **Error codes.** A run records `exception`, `invalid_action`, `timeout`, `crash`, `protocol`,
   `output_limit`, `load_error` or `sim_unstable`. Only trusted verification (§16) assigns
@@ -668,9 +715,10 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
 - **`isolation`** (`inprocess`/`subprocess`/`container`) records how the controller ran. It does
   not make a run rankable: Phase 3 ranks only results produced by its trusted CI jobs.
 - **Bounds.** `controller.id`, `challenge` and `protocol`: 1–200 characters; `platform` and each
-  version string ≤ 64; `controller.sha256`, `protocol_hash` and `robot_hash`: 64 lowercase hex
-  digits; at most 10,000 episodes, each `index` below 10,000 and each `seed` an integer in
-  `[0, 2**53)` (§9); an error's `step` at most 10⁷ (far beyond any episode);
+  version string (`cpu_isa` included) ≤ 64; `controller.sha256`, `controller.policy_sha256`,
+  `protocol_hash` and `robot_hash`: 64 lowercase hex digits; at most 10,000 episodes, each
+  `index` below 10,000 and each `seed` an integer in `[0, 2**53)` (§9); an error's `step` at
+  most 10⁷ (far beyond any episode);
   `aggregate.episodes` and `aggregate.errors` at most 10,000, with `errors ≤ episodes`; at most
   32 metrics per episode, each name 1–64 characters and each string value ≤ 64.
 - **Untrusted text.** Every string in an uploaded file is chosen by whoever wrote it.
@@ -861,12 +909,15 @@ terminal nor start a GitHub Actions workflow command.
     always pass `--protocol`.
   - `--out` writes the trusted results (§15): for a directory the `rescore` results, for a file
     a one-episode result with `complete: false`. The controller is recorded as
-    `{id: <SUB's name>, sha256: <SUB's submission sha256>}`, computed without importing SUB (the
-    name is that of the resolved path, a directory's name or a file's stem, exactly the id
-    `topple eval SUB` records, so `.` names the current directory), or
-    `{id: "unknown", sha256: <64 zeros>}` without `--submission`. `--submission` is resolved
-    before anything is verified: one that cannot be hashed, or whose name is not valid UTF-8,
-    exits 2 before any verdict is printed. `--isolation` is recorded as given: a label that
+    `{id: <SUB's name>, sha256: <SUB's submission sha256>, policy_sha256}`, computed without
+    importing, validating or running SUB (the name is that of the resolved path, a directory's
+    name or a file's stem, exactly the id `topple eval SUB` records, so `.` names the current
+    directory; `policy_sha256` is sha256(`policy.onnx`) for a `topple.policy/1` directory, whose
+    files are read once under §17's entry rules, and null for a Python submission), or
+    `{id: "unknown", sha256: <64 zeros>, policy_sha256: null}` without `--submission`.
+    `--submission` is resolved before anything is verified: one that cannot be hashed (a policy
+    directory that §17's entry rules refuse included), or whose name is not valid UTF-8, exits 2
+    before any verdict is printed. `--isolation` is recorded as given: a label that
     nothing checks (§15). A relative `--out` that passes through a symlink exits 2 before
     anything is verified (§14).
 - `topple score FILE [--protocol P] [--index I | --seed S]` verifies first, then prints JSON:
@@ -874,3 +925,58 @@ terminal nor start a GitHub Actions workflow command.
   verdict (so `seed` is null for a private protocol). Exit 1 if not ok (the score is then 0); an
   errored episode prints score 0.
 - `--seed` (here and in `topple run`) must be an integer in `[0, 2**53)`; `--index` ≥ 0.
+
+## 17. Policies `topple.policy/1`
+
+A policy submission is a trained network as data: an ONNX graph and its manifest, no code. The
+normative definition is `docs/design/phase-2.md` §3.1–§3.5 (layout, manifest, graph
+construction, acceptance policy, canonical form and runtime); this section states what a
+submitter and a runtime rely on.
+
+- **Layout.** A real directory (not a symlink) holding exactly `policy.onnx`, `policy.json` and
+  optionally `README.md` (≤ 64 KiB, untrusted, never printed by the CLI), all regular files with
+  one link each: `policy.onnx` ≤ 1 MiB, `policy.json` ≤ 16 KiB. Names match exactly as the
+  directory lists them (`POLICY.JSON` is not `policy.json`, on any file system), names that are
+  not UTF-8 are refused, and the listing stops at the fourth entry. Anything else (a hidden
+  file, a subdirectory, a FIFO, a pickle, external tensor data) is `unexpected entry: '<name>'`,
+  and Python beside `policy.json` is `ambiguous submission kind` (§8). Each file is read once,
+  never following a symlink and never blocking; a path that cannot be examined is a load error.
+- **Manifest** (`policy.json`, normative: ONNX Runtime Web cannot read model metadata): UTF-8
+  JSON without a BOM, duplicate keys, `NaN`/`Infinity`, numbers beyond float range, integer
+  literals of more than 20 digits, lone surrogates or nesting deeper than 32 levels (bounded by
+  a byte scan before any parser runs: a recursive JSON parser could exhaust a small thread
+  stack on the 8,190 levels 16 KiB can hold); every object closed (`extra` keys are
+  refused); exact JSON types (an integer is accepted for a float, never the reverse). It names
+  `format` (`topple.policy/1`), `kind` (`onnx`), the canonical `challenge`, `obs_schema`,
+  `obs_features`, `action_spec`, `action_dim` and `control_dt` (all equal to the challenge's),
+  the head `action_rule` (`clip(mean)`, `tanh(mean)` or `other`, equal to what the graph's
+  structure is), the graph (`onnx`: file, sha256, IR version, opset, input `obs` and output
+  `action`, float32 `["batch", dim]`, equal to the model's) and `claims`, which are
+  **self-reported**: shown as such, never used for ranking, divisions or "verified". The graph's
+  seven `topple.*` metadata values restate the manifest and must agree with it, type for type.
+- **Identity.** `policy_sha256 = sha256(policy.onnx)` (= `onnx.sha256`). The loader accepts only
+  canonical bytes (a model rebuilt from allow-listed parts, run through `topple policy pack`
+  first), so the hash identifies the bytes that run; two functionally equal graphs can still
+  differ. `submission_sha256` (§8) records the whole directory.
+- **Acceptance.** Only a small allow-list of ops, attributes, tensor types and fields is
+  accepted, within size, element, node and static-cost bounds, and every message is a fixed code
+  plus sanitized names: a load error never echoes the submission's bytes. Dimensions and the
+  action bounds come from the challenge, never from the submission or a training action space.
+  A loaded policy has passed a 32-call smoke test.
+- **Runtime.** ONNX Runtime on the CPU provider only, one thread, sequential, no graph
+  optimizations, deterministic compute, from bytes (never a path). `act` feeds the observation's
+  float32 feature row at batch 1 and returns the float32 `(1, action_dim)` output as floats; the
+  harness validates them like any action (§7). Results are bit-exact per (OS, architecture,
+  `cpu_isa`, onnxruntime version) and agree across runtimes only within about 1e-5, which the
+  closed loop amplifies, so replays play stored trajectories (§14, §16) and results record
+  `versions.onnxruntime` and `versions.cpu_isa` (§15).
+- **Non-finite observations are outside the policy domain.** Runtimes disagree on NaN inputs
+  (ONNX Runtime 1.31 on arm64 maps an all-NaN observation to finite actions; ONNX Runtime Web
+  returns NaN). The env never emits one (`sim_unstable` rolls the bad substep back and ends the
+  episode; a non-finite reset raises, §9, §11), and the harness checks every observation, as the
+  controller would receive it, before every `act` call: a non-finite one raises `RuntimeError`,
+  a harness bug like an episode that outlasts `max_steps` (§8), checked even under `python -O`.
+  Mapping a non-finite action to `invalid_action` therefore matters only for runtimes that
+  propagate NaN.
+- **Versioning.** Loosening a rule is additive; tightening one is a new format,
+  `topple.policy/2`.

@@ -371,10 +371,12 @@ def test_the_entry_file_must_be_named_exactly_controller_py(tmp_path: Path) -> N
     ``controller.py``; the submission is refused there as on Linux, with the same message."""
     root = tmp_path / "bot"
     write(root, "Controller.py", GOOD)
-    with pytest.raises(
-        LoadError, match=r"^expected a \.py file or a directory containing controller\.py$"
-    ):
+    with pytest.raises(LoadError) as info:
         load_submission(root)
+    assert str(info.value) == (
+        "expected a .py file, a directory containing controller.py, "
+        "or a topple.policy/1 directory (policy.onnx and policy.json)"
+    )
 
 
 def test_too_many_files(tmp_path: Path) -> None:
@@ -619,6 +621,42 @@ def test_special_files_are_refused_without_blocking(tmp_path: Path) -> None:
     assert len(outcome) == 1
     assert isinstance(outcome[0], LoadError)
     assert "regular file" in str(outcome[0])
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs named pipes")
+@pytest.mark.parametrize("hash_only", [True, False], ids=["submission_sha256", "load"])
+def test_a_file_swapped_for_a_fifo_after_the_walk_is_refused_without_blocking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, make_fifo: Any, hash_only: bool
+) -> None:
+    """The walk checks each entry's type, but a path can be swapped between the walk and the
+    read: the read never blocks on a FIFO and checks the type of what it opened. (The fixture
+    keeps opening the FIFO for writing, so a reader that wrongly opens it reads EOF.)"""
+    root = tmp_path / "bot"
+    write(root, "controller.py", GOOD)
+    asset = write(root, "asset.bin", "x")
+    real_walk = loader_module._walk
+
+    def walk_then_swap(path: Path) -> list[Path]:
+        files = real_walk(path)
+        asset.unlink()
+        make_fifo(asset)
+        return files
+
+    monkeypatch.setattr(loader_module, "_walk", walk_then_swap)
+    outcome: list[BaseException | str | None] = []
+
+    def target() -> None:
+        try:
+            outcome.append(submission_sha256(root) if hash_only else load_submission(root).sha256)
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "the read blocked on a FIFO"
+    assert isinstance(outcome[0], LoadError), outcome
+    assert str(outcome[0]) == "'asset.bin' is not a regular file"
 
 
 def test_size_cap_is_exact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

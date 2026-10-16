@@ -1,0 +1,23 @@
+# The train CI job's SAC smoke run (docs/design/phase-2.md §2.2): sac_balance.yaml written out in
+# full, differing only in total_timesteps, n_envs, vec_env, selection.seeds, selection.every_steps,
+# selection.workers, selection.gate, limits and sac.learning_starts.
+algo: sac
+seed: 0
+total_timesteps: 2048       # evals at 1,024 and the final 2,048
+n_envs: 2
+vec_env: dummy
+start_method: forkserver
+env:
+  challenge: balance-v1
+  preset: standard
+  max_drift_m: 2.0
+  reward: {tilt: 0.30, rate: 0.10, drift: 0.25, yaw_rate: 0.05, effort: 0.10, smooth: 0.20}
+  action_excess: {enabled: false}
+normalize: {obs: true, reward: false, clip_obs: 10.0, epsilon: 1.0e-8}
+policy: {net_arch: {pi: [64, 64], qf: [256, 256]}, activation: relu}
+sac: {buffer_size: 1_000_000, learning_starts: 256, batch_size: 256, gamma: 0.99,
+      learning_rate: {schedule: constant, initial: 3.0e-4, final: 3.0e-4},
+      tau: 0.005, train_freq: 1, gradient_steps: 2, ent_coef: auto}
+selection: {protocol: balance-v1/standard, seeds: {first: 2000, last: 2001}, every_steps: 1024,
+            workers: 2, gate: none, max_saturation: 0.08}   # 1 periodic + final = 2 evals
+limits: {max_wall_clock_s: 300, max_cpu_s: 600, max_tree_rss_mib: 4096}

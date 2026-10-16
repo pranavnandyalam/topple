@@ -1,12 +1,17 @@
-"""Load a submission: a ``.py`` file, or a directory with ``controller.py`` plus assets.
+"""Load a submission: a ``.py`` file, a directory with ``controller.py`` plus assets, or a
+``topple.policy/1`` directory (``policy.onnx`` + ``policy.json``, data only; contract §8, §17).
 
-In-process loading runs the submission's code inside this interpreter, so it is for trusted code
-only (your own controllers, the shipped examples). Untrusted submissions go through the
-subprocess/container runner (Phase 3).
+In-process loading runs a Python submission's code inside this interpreter, so it is for trusted
+code only (your own controllers, the shipped examples). Untrusted submissions go through the
+subprocess/container runner (Phase 3). A policy directory runs no submitted code: its graph is
+validated and run by ONNX Runtime (docs/design/phase-2.md §3.4, §3.5).
 
 The entry file is read once: those bytes are hashed and those bytes are compiled and run, so the
 submission sha256 always covers the code that runs (no bytecode cache is consulted and no second
-read can see a swapped file).
+read can see a swapped file). A policy directory's files are read once too, and the sha256 and
+the validated graph come from those same bytes. A caller that knows which submission it expects
+(a pool worker) passes its sha256, which is compared with that single read before anything
+runs.
 """
 
 from __future__ import annotations
@@ -14,25 +19,53 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import inspect
+import itertools
 import os
+import stat
 import sys
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from topple.contract import Controller, TaskSpec, class_name, describe_exception
 
+if TYPE_CHECKING:
+    from topple.challenge import Challenge
+    from topple.policy.runtime import LoadedPolicy
+
+SubmissionKind = Literal["python", "onnx"]
 ENTRY_FILE = "controller.py"
-_NO_ENTRY = f"expected a .py file or a directory containing {ENTRY_FILE}"
+POLICY_MANIFEST = "policy.json"
+"""A directory holding an entry of this exact name is a ``topple.policy/1`` submission: the
+loader looks for it before ``controller.py`` (docs/design/phase-2.md §3.1)."""
+POLICY_ONNX = "policy.onnx"
+_NO_ENTRY = (
+    f"expected a .py file, a directory containing {ENTRY_FILE}, "
+    f"or a topple.policy/1 directory ({POLICY_ONNX} and {POLICY_MANIFEST})"
+)
 FACTORY = "make_controller"
 MAX_FILES = 50
 MAX_DIRECTORIES = 50
 """Most subdirectories a submission directory may hold (any depth; itself not counted)."""
+KIND_LISTING_CAP = MAX_FILES + MAX_DIRECTORIES + 1
+"""Most top-level entries kind detection lists to confirm the exact name ``policy.json``: one
+more than a Python directory may hold, so every directory that could load as Python is listed
+in full."""
 MAX_BYTES = 20 * 1024 * 1024
 SHA_TAG = b"topple.submission/1\n"
 CONTROLLER_METHODS = ("reset", "act")  # the members of the Controller protocol (contract §8)
+# Reading a hashed file: never through a symlink, never blocking on a FIFO swapped in after the
+# walk, never becoming a controlling terminal or leaking into a child.
+_READ_FLAGS: int = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_NOCTTY", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_BINARY", 0)
+)
 
 
 class LoadError(Exception):
@@ -41,10 +74,27 @@ class LoadError(Exception):
 
 @dataclass(frozen=True)
 class Submission:
+    """A loaded submission: its id, its submission sha256 (contract §8), its entry file
+    (``controller.py``, the ``.py`` file, or a policy's ``policy.onnx``) and a factory.
+
+    A ``topple.policy/1`` submission also carries its ``LoadedPolicy``; ``policy_sha256`` is
+    then sha256(policy.onnx), the policy's identity (``None`` for a Python submission).
+    """
+
     id: str
     sha256: str
     entry: Path
     factory: Callable[[TaskSpec], Controller[Any]]
+    kind: SubmissionKind = "python"
+    policy: LoadedPolicy | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (self.kind == "onnx") != (self.policy is not None):
+            raise ValueError("a submission has a LoadedPolicy exactly when its kind is 'onnx'")
+
+    @property
+    def policy_sha256(self) -> str | None:
+        return None if self.policy is None else self.policy.policy_sha256
 
 
 def _rel(path: Path, root: Path) -> str:
@@ -120,11 +170,22 @@ def _unreadable(exc: OSError, submission: Path) -> LoadError:
     return LoadError(f"cannot read {shown!r}: {exc.strerror or type(exc).__name__}")
 
 
+class _NotRegularError(Exception):
+    """A walked file that is no longer a regular file once it is opened (``_digest`` names it)."""
+
+
 def _read_capped(path: Path, budget: int) -> bytes:
-    """Read at most ``budget + 1`` bytes (never following a symlink) to enforce the size cap."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(fd, "rb") as fh:
-        data: bytes = fh.read(budget + 1)
+    """Read at most ``budget + 1`` bytes of the regular file ``path`` to enforce the size cap.
+
+    The walk checked each entry's type, but a path can be swapped after that: the open never
+    follows a symlink or blocks on a FIFO (``_READ_FLAGS``), and what it opened must be a
+    regular file, else ``_NotRegularError``.
+    """
+    fd = os.open(path, _READ_FLAGS)
+    with os.fdopen(fd, "rb") as fh:  # closes ``fd`` whatever happens next
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _NotRegularError
+        data: bytes = fh.read(budget + 1)  # O_NONBLOCK changes nothing for a regular file
     if len(data) > budget:
         raise LoadError(f"submission is larger than {MAX_BYTES} bytes")
     return data
@@ -132,6 +193,16 @@ def _read_capped(path: Path, budget: int) -> bytes:
 
 def _framed(data: bytes) -> bytes:
     return len(data).to_bytes(8, "big") + data
+
+
+def _records_sha256(records: Iterable[tuple[str, bytes]]) -> str:
+    """The submission sha256 (contract §8) of (POSIX relpath, bytes) records already read, in
+    POSIX-path string order: the same recipe ``submission_sha256`` applies while it reads."""
+    digest = hashlib.sha256(SHA_TAG)
+    for name, data in sorted(records):
+        digest.update(_framed(_utf8_name(name)))
+        digest.update(_framed(data))
+    return digest.hexdigest()
 
 
 def _utf8_name(rel: str) -> bytes:
@@ -162,9 +233,12 @@ def _digest(path: Path, entry: Path | None = None) -> tuple[str, bytes | None]:
     remaining = MAX_BYTES
     source: bytes | None = None
     for f in files:
-        name = _utf8_name(_rel(f, root))
+        rel = _rel(f, root)
+        name = _utf8_name(rel)
         try:
             data = _read_capped(f, remaining)
+        except _NotRegularError:
+            raise LoadError(f"{rel!r} is not a regular file") from None  # as the walk says it
         except OSError as exc:
             raise _unreadable(exc, path) from exc
         remaining -= len(data)
@@ -280,10 +354,27 @@ def submission_id(path: Path) -> str:
     return resolved.stem if resolved.is_file() else resolved.name
 
 
-def load_submission(path: Path) -> Submission:
+def load_submission(
+    path: Path, *, challenge: Challenge | None = None, expected_sha256: str | None = None
+) -> Submission:
+    """The submission at ``path``, else ``LoadError``.
+
+    A directory with a ``policy.json`` is a ``topple.policy/1`` policy (checked before
+    ``controller.py``; one that also holds Python is ``ambiguous submission kind``). A policy
+    is validated for ``challenge``, which is then required (``TypeError`` without it): its dims
+    and action bounds come from the challenge, never from the submission.
+
+    With ``expected_sha256`` (a pool worker re-checking what its parent loaded), the submission
+    sha256 of the single read must equal it before any of it runs or is validated: changed
+    bytes are refused, never executed. Files a Python submission reads itself later (sibling
+    modules, assets) are ordinary reads that no load can cover.
+    """
     _utf8_name(path.name)  # the name becomes the controller id
-    path, entry = _locate(path)
+    path, entry, kind = _locate(path)
+    if kind == "onnx":
+        return _load_policy(path, challenge, expected_sha256)
     sha, source = _digest(path, entry)
+    _check_expected(path, sha, expected_sha256)
     if source is None:
         # No hashed file is named exactly ENTRY_FILE: a case-insensitive file system (macOS,
         # Windows) lets ``Controller.py`` pass ``_locate``'s probe, where Linux refuses it.
@@ -299,8 +390,8 @@ def load_submission(path: Path) -> Submission:
     return Submission(id=sub_id, sha256=sha, entry=entry, factory=factory)
 
 
-def _locate(path: Path) -> tuple[Path, Path]:
-    """The resolved submission and its entry file, else ``LoadError``.
+def _locate(path: Path) -> tuple[Path, Path, SubmissionKind]:
+    """The resolved submission, its entry file and its kind, else ``LoadError``.
 
     Every probe is inside one ``OSError`` guard: Python 3.12's ``Path.is_symlink``, ``exists``,
     ``is_dir`` and ``is_file`` re-raise every error but ENOENT, ENOTDIR, EBADF and ELOOP (so a
@@ -316,12 +407,106 @@ def _locate(path: Path) -> tuple[Path, Path]:
             raise LoadError(f"cannot resolve {str(path)!r}: {exc}") from exc
         if not path.exists():
             raise LoadError(f"{str(path)!r} does not exist")
+        if path.is_dir() and _has_manifest(path):
+            return path, path / POLICY_ONNX, "onnx"
         entry = path / ENTRY_FILE if path.is_dir() else path
         if entry.suffix != ".py" or not entry.is_file():
             raise LoadError(_NO_ENTRY)
     except OSError as exc:
         raise _unreadable(exc, path) from exc
-    return path, entry
+    return path, entry, "python"
+
+
+def _has_manifest(directory: Path) -> bool:
+    """Whether ``directory`` holds an entry named exactly ``policy.json`` (a symlink counts: a
+    symlinked manifest still makes a policy directory, which is then refused as one).
+
+    ``lstat`` answers on a case-sensitive file system; a case-insensitive one (macOS, Windows)
+    also finds ``POLICY.JSON`` under that name, so the name is confirmed in a listing that
+    stops at it or after ``KIND_LISTING_CAP`` entries. A directory with more entries than that
+    is too big for a Python submission and stays a policy, refused by the policy entry rules.
+    The decision is therefore the same on every file system for any directory either kind could
+    load.
+
+    A ``policy.json`` that cannot be examined (a directory without search permission) is not a
+    manifest: the directory is decided as before policies existed, and its ``controller.py``
+    probe reports the error, naming a file the submission has (§3.1: Python submissions are
+    unchanged). A listing that fails leaves the decision to ``lstat``: the policy loader lists
+    the directory again and reports why it cannot.
+    """
+    try:
+        os.lstat(directory / POLICY_MANIFEST)
+    except OSError:
+        return False
+    try:
+        return _listed_exactly(directory)
+    except OSError:
+        return True
+
+
+def _listed_exactly(directory: Path) -> bool:
+    """Whether a listing of at most ``KIND_LISTING_CAP`` entries of ``directory`` holds the
+    name ``policy.json`` exactly, or reaches the cap first."""
+    listed = 0
+    with os.scandir(directory) as listing:
+        for entry in itertools.islice(listing, KIND_LISTING_CAP):
+            if entry.name == POLICY_MANIFEST:
+                return True
+            listed += 1
+    return listed == KIND_LISTING_CAP
+
+
+def _check_expected(path: Path, sha: str, expected: str | None) -> None:
+    """``LoadError`` if ``expected`` is given and is not ``sha``, the hash of the single read."""
+    if expected is not None and sha != expected:
+        raise LoadError(
+            f"the submission {path.name!r} changed since it was hashed (sha256 mismatch)"
+        )
+
+
+def _load_policy(path: Path, challenge: Challenge | None, expected: str | None) -> Submission:
+    """A ``topple.policy/1`` submission: its files read once (directory rules first, so an
+    ambiguous directory is refused whether or not a challenge was given), the submission
+    sha256 from those bytes (checked against ``expected``), then the full validation for
+    ``challenge``."""
+    from topple.controllers.onnx_policy import policy_factory
+    from topple.policy.runtime import load_policy_files, read_policy_dir
+
+    files = read_policy_dir(path)
+    if challenge is None:
+        raise TypeError(
+            "a topple.policy/1 submission is loaded for a challenge: "
+            "load_submission(path, challenge=...)"
+        )
+    sha = _records_sha256(files.items())
+    _check_expected(path, sha, expected)
+    loaded = load_policy_files(files, challenge=challenge)
+    return Submission(
+        id=path.name,
+        sha256=sha,
+        entry=path / POLICY_ONNX,
+        factory=policy_factory(loaded),
+        kind="onnx",
+        policy=loaded,
+    )
+
+
+def submission_hashes(path: Path) -> tuple[str, str | None]:
+    """The submission sha256 of ``path`` and its ``policy_sha256`` (sha256 of ``policy.onnx``
+    for a ``topple.policy/1`` directory, ``None`` for a Python submission), from one read that
+    imports, validates and runs nothing: what ``topple verify --submission`` records (contract
+    §15, §16). A policy directory is read under its own entry rules (§17), as
+    ``load_submission`` reads it, so a directory that could not have run is not recorded."""
+    try:
+        policy = path.is_dir() and _has_manifest(path)
+    except OSError:  # ``submission_sha256`` reports it, as for any submission
+        policy = False
+    if not policy:
+        return submission_sha256(path), None
+    from topple.policy.runtime import read_policy_dir
+
+    files = read_policy_dir(path)
+    return _records_sha256(files.items()), hashlib.sha256(files[POLICY_ONNX]).hexdigest()
 
 
 def _factory(module: ModuleType, entry: Path) -> Callable[[TaskSpec], Controller[Any]]:

@@ -1,8 +1,9 @@
 name: ci
 
+# docs/design/phase-2.md §7: pull requests, and pushes to main and phase-* branches.
 on:
   push:
-    branches: [main]
+    branches: [main, 'phase-*']
   pull_request:
 
 permissions:
@@ -12,16 +13,23 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# Two jobs in parallel, so neither runs close to its timeout. On the 2-vCPU runner the whole suite
+# Three jobs in parallel, so none runs close to its timeout. On the 2-vCPU runner the whole suite
 # under coverage took 294-599 s between two runs of the same commit (2x runner variance); `python`
-# runs everything but the `slow` seed sweeps with coverage (about 70% of that), `python-slow` runs
-# the sweeps without coverage. Each job's timeout leaves room for another 2x slowdown plus growth.
+# runs everything but the `slow` seed sweeps and the `train` tests with coverage (about 70% of
+# that), `python-slow` runs the sweeps without coverage, `python-train` installs the train extra
+# (torch, stable-baselines3) and runs the `train` tests with their own coverage scope
+# (.coveragerc-train: the five torch modules the default scope omits, so the two 80% scopes are
+# disjoint; applied once topple/train/learn.py exists). Each job's timeout leaves room for
+# another 2x slowdown plus growth.
 # Golden scores: these jobs enforce the linux-x86_64 pins; darwin-arm64 pins are enforced only by
 # test runs on Apple Silicon (tests/test_golden.py says how to re-pin both).
 jobs:
   python:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # test_c_reference compiles the C forward pass here: a missing cc fails, never skips.
+      TOPPLE_REQUIRE_CC: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,12 +49,15 @@ jobs:
       # faulthandler_timeout prints every thread's stack if one test runs past 10 minutes.
       - name: Test
         run: >-
-          uv run pytest -n auto -m "not slow" -o faulthandler_timeout=600
+          uv run pytest -n auto -m "not slow and not train" -o faulthandler_timeout=600
           --cov --cov-report=term-missing
 
   python-slow:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # test_shipped_policy writes the shipped policy's eval_v1 results.json here.
+      TOPPLE_ARTIFACT_DIR: out/ci
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -61,4 +72,72 @@ jobs:
       # Seed sweeps over whole protocols, without coverage tracing: every line they reach is
       # already covered by the fast job (98.6% either way, measured).
       - name: Test (slow)
-        run: uv run pytest -n auto -m slow -o faulthandler_timeout=600
+        run: uv run pytest -n auto -m "slow and not train" -o faulthandler_timeout=600
+      # The ubuntu half of G2-G4 (docs/design/phase-2.md §4), once a policy is shipped: the pool
+      # clamps --workers 4 to the runner's 2 vCPUs. phase2_results.py --fetch-ci copies both
+      # files to docs/results/phase2/ci_ubuntu/ from the run whose results.json is this policy's.
+      # Push runs only: a pull request runs its own code, which need not be the code the policy
+      # ships with, so its numbers are never evidence (G8 also checks the run's commit, B40).
+      - name: Ubuntu compare (0..199)
+        if: github.event_name == 'push' && hashFiles('submissions/ppo_balance/policy.onnx') != ''
+        run: >-
+          uv run topple compare submissions/pid_example.py submissions/lqr_example.py
+          submissions/ppo_balance -p balance-v1/standard --seeds 0..199 --workers 4
+          --json out/cmp_cal_ci.json
+      # upload-artifact's if-no-files-found fires only when no path matches at all, so a run
+      # missing test_shipped_policy's results.json would otherwise upload the compare alone and
+      # pass. One command per line: bash -e stops on the first file that is missing.
+      - name: Check the ubuntu evidence
+        if: github.event_name == 'push' && hashFiles('submissions/ppo_balance/policy.onnx') != ''
+        run: |
+          test -f out/ci/results.json
+          test -f out/cmp_cal_ci.json
+      - name: Upload the ubuntu evidence
+        if: github.event_name == 'push' && hashFiles('submissions/ppo_balance/policy.onnx') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ubuntu-evidence
+          path: |
+            out/ci/results.json
+            out/cmp_cal_ci.json
+          if-no-files-found: error
+          retention-days: 90
+
+  python-train:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          enable-cache: true
+      - name: Install headless OpenGL (OSMesa)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libosmesa6
+      # torch comes from the pytorch-cpu index on Linux (pyproject's [tool.uv.sources]).
+      - run: uv sync --locked --extra train
+      - name: Lint
+        run: uv run --extra train ruff check . && uv run --extra train ruff format --check .
+      - name: Type check
+        run: uv run --extra train mypy
+      # The 80% train scope (.coveragerc-train) measures the five torch modules. Until learn.py
+      # exists none of them does, coverage reports "No data to report" as 0% and the job would
+      # fail on every push, so the same tests run without the scope until then (decision log B37).
+      - name: Test (train)
+        if: hashFiles('python/topple/train/learn.py') != ''
+        run: >-
+          uv run --extra train pytest -m train -n 2 -o faulthandler_timeout=600
+          --ignore=tests/test_pack_torch_legacy.py
+          --cov=topple.train --cov-config=.coveragerc-train --cov-report=term-missing
+      - name: Test (train, before the torch modules)
+        if: hashFiles('python/topple/train/learn.py') == ''
+        run: >-
+          uv run --extra train pytest -m train -n 2 -o faulthandler_timeout=600
+          --ignore=tests/test_pack_torch_legacy.py
+      # Advisory: a torch release may remove the legacy (dynamo=False) exporter it packs.
+      - name: Test (train, advisory)
+        if: hashFiles('tests/test_pack_torch_legacy.py') != ''
+        continue-on-error: true
+        run: uv run --extra train pytest -m train tests/test_pack_torch_legacy.py

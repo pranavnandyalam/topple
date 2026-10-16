@@ -579,7 +579,7 @@ def test_verification_replays_on_the_protocols_own_challenge_object(tmp_path: Pa
     root = tmp_path / "balance-v1"
     shutil.copytree(challenge_dir("balance-v1"), root)
     yaml_path = root / "challenge.yaml"
-    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.0", "e_ref_j: 0.001"))
+    yaml_path.write_text(yaml_path.read_text().replace("e_ref_j: 13.1", "e_ref_j: 0.001"))
     stock = public("clean", 1)
     custom = replace(stock, challenge=load_challenge_dir(root))
     honest = run_honest(custom, pid, tmp_path / "run")

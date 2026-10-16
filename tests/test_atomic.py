@@ -8,10 +8,13 @@ from pathlib import Path
 import pytest
 
 from topple._atomic import (
+    DIRECTORY_MODE,
     OUTPUT_MODE,
     SymlinkedOutputError,
     check_output_directory,
+    new_directory,
     replacement,
+    write_new_file,
 )
 
 
@@ -134,3 +137,94 @@ def test_a_component_that_cannot_be_examined_raises_its_oserror(
 def test_the_refusal_is_an_oserror() -> None:
     """Writers that report an ``OSError`` as "cannot write" report this one too."""
     assert issubclass(SymlinkedOutputError, OSError)
+
+
+# --- new_directory (``topple policy pack``) ----------------------------------------------------
+
+
+def test_a_new_directory_appears_complete(tmp_path: Path) -> None:
+    out = tmp_path / "deep" / "bot"
+    with new_directory(out) as tmp:
+        assert tmp.parent == out.parent
+        assert tmp.name.startswith(".bot.")
+        assert not out.exists()  # nothing at the target until the block succeeds
+        write_new_file(tmp / "a.bin", b"a" * 70_000)
+        write_new_file(tmp / "b.bin", b"")
+    assert sorted(p.name for p in out.iterdir()) == ["a.bin", "b.bin"]
+    assert (out / "a.bin").read_bytes() == b"a" * 70_000
+    assert stat.S_IMODE(out.stat().st_mode) == DIRECTORY_MODE
+    assert stat.S_IMODE((out / "b.bin").stat().st_mode) == OUTPUT_MODE
+    assert [p.name for p in out.parent.iterdir()] == ["bot"]
+
+
+def _fill_then_fail(out: Path) -> None:
+    with new_directory(out) as tmp:
+        write_new_file(tmp / "a.bin", b"a")
+        raise RuntimeError("boom")
+
+
+def test_a_failed_block_leaves_nothing(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="boom"):
+        _fill_then_fail(tmp_path / "bot")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_block_removes_the_parents_it_created(tmp_path: Path) -> None:
+    (tmp_path / "kept").mkdir()
+    with pytest.raises(RuntimeError, match="boom"):
+        _fill_then_fail(tmp_path / "kept" / "new" / "deeper" / "bot")
+    assert [p.name for p in tmp_path.iterdir()] == ["kept"]  # only what was there before
+    assert list((tmp_path / "kept").iterdir()) == []
+
+
+def _theirs_then_fail(out: Path, theirs: Path) -> None:
+    with new_directory(out):
+        theirs.write_text("keep")  # someone else writes into a parent created here
+        raise RuntimeError("boom")
+
+
+def test_a_created_parent_someone_wrote_into_is_kept(tmp_path: Path) -> None:
+    out = tmp_path / "new" / "deeper" / "bot"
+    with pytest.raises(RuntimeError, match="boom"):
+        _theirs_then_fail(out, tmp_path / "new" / "theirs")
+    assert sorted(p.name for p in (tmp_path / "new").iterdir()) == ["theirs"]
+
+
+@pytest.mark.parametrize("kind", ["directory", "file", "symlink"])
+def test_never_into_or_over_anything_already_there(tmp_path: Path, kind: str) -> None:
+    out = tmp_path / "bot"
+    if kind == "directory":
+        out.mkdir()
+    elif kind == "file":
+        out.write_text("x")
+    else:
+        os.symlink(tmp_path / "elsewhere", out)
+    with pytest.raises(FileExistsError), new_directory(out):
+        pass
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bot"]
+
+
+def _race(out: Path) -> None:
+    with new_directory(out) as tmp:
+        write_new_file(tmp / "a.bin", b"new")
+        out.mkdir()  # someone else creates the target meanwhile
+        (out / "theirs").write_text("keep")
+
+
+def test_a_directory_that_appears_during_the_block_is_kept(tmp_path: Path) -> None:
+    out = tmp_path / "bot"
+    with pytest.raises(FileExistsError):
+        _race(out)
+    assert (out / "theirs").read_text() == "keep"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bot"]
+
+
+def test_write_new_file_never_follows_or_replaces(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.write_text("keep")
+    os.symlink(target, tmp_path / "link")
+    with pytest.raises(FileExistsError):
+        write_new_file(tmp_path / "link", b"x")
+    with pytest.raises(FileExistsError):
+        write_new_file(target, b"x")
+    assert target.read_text() == "keep"

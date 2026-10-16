@@ -1,0 +1,22 @@
+# SAC on balance-v1 (docs/design/phase-2.md §2.2): comparison only; written in full.
+algo: sac
+seed: 0
+total_timesteps: 1_000_000  # ~500 s train-only at the measured 1,949-2,010 steps/s
+n_envs: 8
+vec_env: subproc
+start_method: forkserver
+env:
+  challenge: balance-v1
+  preset: standard
+  max_drift_m: 2.0
+  reward: {tilt: 0.30, rate: 0.10, drift: 0.25, yaw_rate: 0.05, effort: 0.10, smooth: 0.20}
+  action_excess: {enabled: false}   # no other keys allowed; tanh actions never exceed +-1
+normalize: {obs: true, reward: false, clip_obs: 10.0, epsilon: 1.0e-8}
+policy: {net_arch: {pi: [64, 64], qf: [256, 256]}, activation: relu}   # state-dependent log_std head (no SDE)
+sac: {buffer_size: 1_000_000, learning_starts: 10_000, batch_size: 256, gamma: 0.99,
+      learning_rate: {schedule: constant, initial: 3.0e-4, final: 3.0e-4},
+      tau: 0.005, train_freq: 1, gradient_steps: 2, ent_coef: auto}   # UTD 0.25 (2 grad steps per 8 env steps)
+selection: {protocol: balance-v1/standard, seeds: {first: 2000, last: 2199}, every_steps: 50_000,
+            workers: 4, gate: pid, max_saturation: 0.08}   # 19 periodic + final = 20 evals
+limits: {max_wall_clock_s: 2400, max_cpu_s: 6000, max_tree_rss_mib: 8192}
+# no health block: health is PPO-only (forbidden for SAC)

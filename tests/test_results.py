@@ -115,6 +115,11 @@ def test_rankable_is_gone() -> None:
         (("challenge",), "c" * 201),
         (("protocol",), "p" * 201),
         (("versions", "topple"), "1" * 65),
+        (("versions", "onnxruntime"), "1" * 65),
+        (("versions", "cpu_isa"), "a" * 65),
+        (("controller", "policy_sha256"), HEX.upper()),
+        (("controller", "policy_sha256"), HEX + "\n"),
+        (("controller", "policy_sha256"), "0" * 63),
     ],
 )
 def test_string_bounds(path: tuple[str, ...], value: str) -> None:
@@ -739,6 +744,9 @@ UNSAFE_TEXT = "\x1b]0;pwn\x07\u202e\n::error::x"  # a terminal escape, a bidi ov
         ("versions", "numpy"),
         ("versions", "obs_schema"),
         ("versions", "action_spec"),
+        ("versions", "onnxruntime"),
+        ("versions", "onnx"),
+        ("versions", "cpu_isa"),
     ],
 )
 @pytest.mark.parametrize("text", [UNSAFE_TEXT, "\t", "\u2028", "\u200b", "\x00"])
@@ -808,3 +816,176 @@ def test_the_controller_id_is_untrusted_text() -> None:
         ControllerInfo.model_validate_json(ControllerInfo(id=raw, sha256=HEX).model_dump_json()).id
         == clean
     )
+
+
+# ------------------------------------------------------------------ ONNX fields (phase 2 §3.6)
+
+
+def test_old_files_without_the_onnx_fields_still_read(tmp_path: Path) -> None:
+    path = tmp_path / "results.json"
+    path.write_text(json.dumps(results_dict()))
+    results = read_results(path)
+    assert results.versions.onnxruntime is None
+    assert results.versions.onnx is None
+    assert results.versions.cpu_isa is None
+    assert results.controller.policy_sha256 is None
+
+
+def test_new_files_with_the_onnx_fields_read(tmp_path: Path) -> None:
+    data = results_dict()
+    data["versions"] |= {"onnxruntime": "1.31.0", "onnx": "1.23.2", "cpu_isa": "avx512f"}
+    data["controller"]["policy_sha256"] = "cd" * 32
+    path = tmp_path / "results.json"
+    path.write_text(json.dumps(data))
+    results = read_results(path)
+    assert results.versions.onnxruntime == "1.31.0"
+    assert results.versions.cpu_isa == "avx512f"
+    assert results.controller.policy_sha256 == "cd" * 32
+    write_results(results, tmp_path / "again.json")
+    assert read_results(tmp_path / "again.json") == results
+
+
+def test_null_onnx_fields_read(tmp_path: Path) -> None:
+    data = results_dict()
+    data["versions"] |= {"onnxruntime": None, "onnx": None, "cpu_isa": None}
+    data["controller"]["policy_sha256"] = None
+    path = tmp_path / "results.json"
+    path.write_text(json.dumps(data))
+    assert read_results(path).controller.policy_sha256 is None
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("versions", "onnxruntime"), 1.31),
+        (("versions", "cpu_isa"), True),
+        (("controller", "policy_sha256"), 0),
+    ],
+)
+def test_onnx_fields_are_strict(tmp_path: Path, path: tuple[str, ...], value: object) -> None:
+    data = results_dict()
+    data[path[0]][path[1]] = value
+    file = tmp_path / "results.json"
+    file.write_text(json.dumps(data))
+    with pytest.raises(ValidationError):
+        read_results(file)
+
+
+def test_build_results_fills_versions_and_the_policy_sha() -> None:
+    import importlib.metadata
+    from dataclasses import replace
+
+    from topple.evaluate import EvalProtocol, build_results, cpu_isa
+
+    protocol = EvalProtocol.from_id("balance-v1/ideal")
+    protocol = replace(protocol, seeds=protocol.seeds[:1])
+    ep = EpisodeResult.model_validate(episode(0, seed=protocol.seeds[0]))
+    info = ControllerInfo(id="bot", sha256=HEX, policy_sha256="cd" * 32)
+    results = build_results(protocol, [ep], info, "inprocess")
+    assert results.versions.onnxruntime == importlib.metadata.version("onnxruntime")
+    assert results.versions.onnx == importlib.metadata.version("onnx")
+    assert results.versions.cpu_isa == cpu_isa()
+    assert results.controller.policy_sha256 == "cd" * 32
+    python = build_results(protocol, [ep], ControllerInfo(id="pid", sha256=HEX), "inprocess")
+    assert python.controller.policy_sha256 is None
+
+
+def test_a_missing_distribution_is_recorded_as_null(monkeypatch: pytest.MonkeyPatch) -> None:
+    import topple.evaluate as evaluate_module
+
+    evaluate_module.distribution_version.cache_clear()
+    try:
+        assert evaluate_module.distribution_version("no-such-distribution-xyz") is None
+    finally:
+        evaluate_module.distribution_version.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("flags", "isa"),
+    [
+        ("fpu sse4_1 sse4_2 avx avx2 avx512f avx512bw", "avx512f"),
+        ("fpu sse4_1 sse4_2 avx avx2", "avx2"),
+        ("fpu sse4_1 sse4_2 avx", "sse4"),
+        ("fpu sse4_1", "sse4"),
+        ("fpu sse2", None),
+    ],
+)
+def test_linux_cpu_isa_from_cpuinfo(tmp_path: Path, flags: str, isa: str | None) -> None:
+    from topple.evaluate import linux_cpu_isa
+
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text(
+        f"processor\t: 0\nvendor_id\t: GenuineIntel\nflags\t\t: {flags}\n\n"
+        "processor\t: 1\nflags\t\t: fpu\n"
+    )
+    assert linux_cpu_isa(cpuinfo) == isa
+
+
+def test_linux_cpu_isa_without_flags_or_file(tmp_path: Path) -> None:
+    from topple.evaluate import linux_cpu_isa
+
+    (tmp_path / "arm").write_text("processor\t: 0\nFeatures\t: fp asimd sve\n")
+    assert linux_cpu_isa(tmp_path / "arm") is None
+    assert linux_cpu_isa(tmp_path / "absent") is None
+
+
+@pytest.mark.parametrize(
+    ("answers", "isa"),
+    [
+        ({"hw.optional.arm.FEAT_SME": "1", "hw.optional.neon": "1"}, "arm64-sme"),
+        ({"hw.optional.arm.FEAT_SME": "0", "hw.optional.neon": "1"}, "arm64-neon"),
+        ({"hw.optional.AdvSIMD": "1"}, "arm64-neon"),
+        ({}, None),
+    ],
+)
+def test_macos_cpu_isa_from_sysctl(answers: dict[str, str], isa: str | None) -> None:
+    from topple.evaluate import macos_cpu_isa
+
+    assert macos_cpu_isa(answers.get) == isa
+
+
+@pytest.mark.parametrize(
+    ("system", "expected"),
+    [("Linux", "linux"), ("Darwin", "darwin"), ("Windows", None)],
+)
+def test_cpu_isa_dispatches_on_the_system(
+    monkeypatch: pytest.MonkeyPatch, system: str, expected: str | None
+) -> None:
+    import topple.evaluate as evaluate_module
+
+    monkeypatch.setattr(evaluate_module.platform, "system", lambda: system)
+    monkeypatch.setattr(evaluate_module, "linux_cpu_isa", lambda path: "linux")
+    monkeypatch.setattr(evaluate_module, "macos_cpu_isa", lambda sysctl: "darwin")
+    evaluate_module.cpu_isa.cache_clear()
+    try:
+        assert evaluate_module.cpu_isa() == expected
+    finally:
+        evaluate_module.cpu_isa.cache_clear()
+
+
+def test_sysctl_reads_a_value_or_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    import topple.evaluate as evaluate_module
+
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: Any) -> Any:
+        calls.append(args)
+        if args[-1] == "hw.missing":
+            return subprocess.CompletedProcess(args, 1, "", "unknown oid")
+        if args[-1] == "hw.broken":
+            raise OSError("no sysctl")
+        return subprocess.CompletedProcess(args, 0, "1\n", "")
+
+    monkeypatch.setattr(evaluate_module.subprocess, "run", fake_run)
+    assert evaluate_module.sysctl("hw.optional.neon") == "1"
+    assert evaluate_module.sysctl("hw.missing") is None
+    assert evaluate_module.sysctl("hw.broken") is None
+    assert calls[0] == ["/usr/sbin/sysctl", "-n", "hw.optional.neon"]
+
+
+def test_this_machine_reports_a_known_isa_or_none() -> None:
+    from topple.evaluate import CPU_ISAS, cpu_isa
+
+    assert cpu_isa() in (*CPU_ISAS, None)

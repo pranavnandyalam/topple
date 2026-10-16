@@ -9,7 +9,9 @@ dependencies = [
     "mujoco>=3.15,<3.16",
     "gymnasium>=1.4,<1.5",
     "numpy>=2.0",
-    "onnxruntime>=1.31",
+    "onnx>=1.23.2,<1.24",
+    "onnxruntime>=1.31,<1.32",
+    "protobuf>=7.36,<8",
     "typer>=0.27",
     "imageio>=2.38",
     "imageio-ffmpeg>=0.6",
@@ -22,7 +24,7 @@ train = [
     "stable-baselines3>=2.9",
     "torch>=2.14",
     "tensorboard>=2.21",
-    "onnx>=1.23",
+    "psutil>=6",
 ]
 
 [project.scripts]
@@ -37,6 +39,7 @@ dev = [
     "ruff>=0.17",
     "mypy>=2.4",
     "types-pyyaml>=6.0",
+    "matplotlib>=3.10",
 ]
 
 [build-system]
@@ -71,15 +74,26 @@ explicit = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["scripts"]  # the Phase 2 scripts (phase2_common, phase2_gate, ...) for their tests
 addopts = "-ra --strict-markers"
 markers = [
     "render: needs a headless OpenGL backend (cgl on macOS, osmesa/egl on Linux)",
     "slow: takes more than a few seconds",
+    "train: needs the train extra (torch, stable-baselines3); the python-train CI job runs these",
 ]
 
 [tool.coverage.run]
 source = ["topple"]
 branch = true
+# The torch modules (train extra) are measured by the python-train job (.coveragerc-train), so
+# the default job's 80% scope and the train job's are disjoint (docs/design/phase-2.md §7).
+omit = [
+    "*/topple/train/learn.py",
+    "*/topple/train/snapshot.py",
+    "*/topple/train/callbacks.py",
+    "*/topple/train/surgery.py",
+    "*/topple/train/resources.py",
+]
 
 [tool.coverage.report]
 fail_under = 80
@@ -93,7 +107,7 @@ exclude_also = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["python", "tests"]
+src = ["python", "scripts", "tests"]
 
 [tool.ruff.format]
 exclude = ["*.md"]
@@ -103,10 +117,32 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "N", "PT", "NPY", "C4", "
 
 [tool.mypy]
 python_version = "3.12"
-files = ["python/topple"]
+files = ["python/topple", "scripts"]
 strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["mujoco.*", "imageio.*", "gymnasium.*", "onnxruntime.*", "stable_baselines3.*", "cma.*"]
+module = [
+    "mujoco.*",
+    "imageio.*",
+    "gymnasium.*",
+    "onnxruntime.*",
+    "stable_baselines3.*",
+    "cma.*",
+    "google.protobuf.*",
+    "torch.*",
+    "tensorboard.*",
+    "psutil.*",
+]
 ignore_missing_imports = true
+
+# The default CI job has no SB3, so the callbacks subclass Any there (spec §7).
+[[tool.mypy.overrides]]
+module = [
+    "topple.train.learn",
+    "topple.train.callbacks",
+    "topple.train.snapshot",
+    "topple.train.surgery",
+    "topple.train.resources",
+]
+disallow_subclassing_any = false

@@ -6,7 +6,10 @@ __pycache__/
 htmlcov/
 runs/
 checkpoints/
+*.pkl
+.venv-eval/
 *.mp4
+!docs/results/**/*.mp4
 .env*
 !.env.example
 .dev.vars

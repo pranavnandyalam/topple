@@ -10,11 +10,15 @@ hostile controller could tamper with the scorer; ranked runs isolate it (Phase 3
 
 from __future__ import annotations
 
+import importlib.metadata
+import itertools
 import platform
-from collections.abc import Callable, Iterator
+import subprocess
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Final, Literal, get_args
 
 import mujoco
 import numpy as np
@@ -32,6 +36,7 @@ from topple.contract import (
     describe_exception,
     validate_action,
 )
+from topple.disturbances import Push
 from topple.envs.balance import BalanceEnv
 from topple.ids import parse_protocol, resolve_protocol
 from topple.results import (
@@ -241,6 +246,24 @@ def _next_action(
         return _error("exception", step, describe_exception(exc))
 
 
+def _check_finite(obs_arr: npt.NDArray[Any], step: int) -> None:
+    """``RuntimeError`` unless every feature the controller would see is finite.
+
+    Non-finite observations are outside the policy domain (contract §17: runtimes disagree on
+    NaN inputs), and the env never emits one (``sim_unstable`` rolls the bad substep back, a
+    non-finite reset raises), so one here is a harness bug, like an episode that never ends. A
+    real check, not an ``assert`` (``python -O`` strips those). The features are checked as the
+    controller receives them, quantized to float32 (contract §6), where 1e39 is already inf.
+    """
+    with np.errstate(over="ignore"):
+        quantized = np.asarray(obs_arr, dtype=np.float32)
+    if not np.isfinite(quantized).all():
+        raise RuntimeError(
+            f"the env emitted a non-finite observation at step {step} (a harness bug, not the "
+            "controller's: contract §17)"
+        )
+
+
 def _control_loop(
     env: BalanceEnv,
     controller: Controller[Any],
@@ -251,11 +274,13 @@ def _control_loop(
 
     Bounded by the challenge's episode length (``task_spec.max_steps``), not by the env's own
     counter: an env that stopped ending its episodes is a harness bug, and evaluation fails
-    loudly instead of recording (about 1 KB per step) without end.
+    loudly instead of recording (about 1 KB per step) without end. Every observation is checked
+    to be finite before ``act`` sees it (``_check_finite``).
     """
     limit = env.task_spec.max_steps
     for _ in range(limit):
         step = int(info["step"])
+        _check_finite(obs_arr, step)
         action = _next_action(controller, obs_arr, float(info["t"]), step)
         if isinstance(action, ErrorInfo):  # our own object either way: safe to inspect
             return action
@@ -278,13 +303,19 @@ def run_episode(
     *,
     salt: int = 0,
     report_seed: bool = True,
+    pushes: Sequence[Push] | None = None,
 ) -> EpisodeRun:
     """One episode. Never raises for controller misbehaviour: errors land in the result.
 
     Any exception from the controller (its factory, ``reset``, ``act``, or the code of the object
     it returns) becomes a typed error that scores 0; only ``KeyboardInterrupt`` propagates.
+    ``pushes`` replaces the seed's scenario pushes through the trusted reset hook (contract §9;
+    benches such as ``topple shove``); ``None`` keeps them.
     """
-    obs_arr, info = env.reset(seed=seed)
+    if pushes is None:
+        obs_arr, info = env.reset(seed=seed)
+    else:
+        obs_arr, info = env.reset(seed=seed, options={"pushes": tuple(pushes)})
     controller, error = _start_controller(env, factory, seed, salt)
     if controller is not None:
         error = _control_loop(env, controller, obs_arr, info)
@@ -325,6 +356,97 @@ def platform_tag() -> str:
     return f"{platform.system().lower()}-{platform.machine().lower()}"
 
 
+CPU_ISAS: Final = ("avx512f", "avx2", "sse4", "arm64-sme", "arm64-neon")
+"""What ``cpu_isa`` reports: the widest vector extension that can change float results (numpy
+and ONNX Runtime pick kernels by it), so per-episode results are compared per
+(platform, ``cpu_isa``, onnxruntime version) (docs/design/phase-2.md §3.5)."""
+_CPUINFO: Final = Path("/proc/cpuinfo")
+_MAX_CPUINFO_LINES: Final = 4096  # the first processor's "flags" line comes within ~30
+_SYSCTL: Final = "/usr/sbin/sysctl"
+
+
+@lru_cache(maxsize=1)
+def cpu_isa() -> str | None:
+    """``avx512f`` / ``avx2`` / ``sse4`` from ``/proc/cpuinfo`` on Linux, ``arm64-sme`` /
+    ``arm64-neon`` from ``sysctl hw.optional`` on macOS, ``None`` elsewhere or if unknown."""
+    system = platform.system()
+    if system == "Linux":
+        return linux_cpu_isa(_CPUINFO)
+    if system == "Darwin":
+        return macos_cpu_isa(sysctl)
+    return None
+
+
+def linux_cpu_isa(cpuinfo: Path) -> str | None:
+    """The ISA the first ``flags`` line of ``cpuinfo`` names (x86 only; ``None`` otherwise)."""
+    try:
+        with cpuinfo.open(encoding="ascii", errors="replace") as fh:
+            for line in itertools.islice(fh, _MAX_CPUINFO_LINES):
+                key, sep, value = line.partition(":")
+                if sep and key.strip() == "flags":
+                    return _x86_isa(set(value.split()))
+    except OSError:
+        return None
+    return None
+
+
+def _x86_isa(flags: set[str]) -> str | None:
+    if "avx512f" in flags:
+        return "avx512f"
+    if "avx2" in flags:
+        return "avx2"
+    if flags & {"sse4_1", "sse4_2"}:
+        return "sse4"
+    return None
+
+
+def macos_cpu_isa(read: Callable[[str], str | None]) -> str | None:
+    """``arm64-sme`` if ``hw.optional.arm.FEAT_SME`` is 1, ``arm64-neon`` if NEON is, else
+    ``None``; ``read`` returns a sysctl value (``sysctl`` in production)."""
+    if read("hw.optional.arm.FEAT_SME") == "1":
+        return "arm64-sme"
+    if read("hw.optional.neon") == "1" or read("hw.optional.AdvSIMD") == "1":
+        return "arm64-neon"
+    return None
+
+
+def sysctl(key: str) -> str | None:
+    """``sysctl -n key``, or ``None`` if it fails (an unknown key on this machine)."""
+    try:
+        done = subprocess.run(
+            [_SYSCTL, "-n", key], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+@lru_cache(maxsize=8)
+def distribution_version(name: str) -> str | None:
+    """The installed version of distribution ``name`` (never importing it), else ``None``."""
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def run_versions() -> Versions:
+    """What this machine runs episodes with: Topple, MuJoCo, numpy, the obs and action schemas,
+    and the installed ONNX Runtime, onnx and ``cpu_isa`` (recorded for every run, a Python
+    controller's included: per-episode ONNX results are bit-exact only per platform,
+    ``cpu_isa`` and onnxruntime version, contract §17)."""
+    return Versions(
+        topple=__version__,
+        mujoco=mujoco.__version__,
+        numpy=np.__version__,
+        obs_schema=OBS_SCHEMA_ID,
+        action_spec=BALANCE_V1_ACTION.id,
+        onnxruntime=distribution_version("onnxruntime"),
+        onnx=distribution_version("onnx"),
+        cpu_isa=cpu_isa(),
+    )
+
+
 def build_results(
     protocol: EvalProtocol,
     episodes: list[EpisodeResult],
@@ -332,7 +454,9 @@ def build_results(
     isolation: Isolation,
 ) -> EvalResults:
     """``topple.results/1`` for ``episodes`` of ``protocol``; ``complete`` when all of its N
-    episodes are listed and none is ``missing`` (contract §15)."""
+    episodes are listed and none is ``missing`` (contract §15). ``controller`` carries the
+    ``policy_sha256`` of an ONNX submission; the versions record this machine's ONNX Runtime,
+    onnx and ``cpu_isa`` for every run (a Python controller's included)."""
     private = protocol.seed_set == "private"
     missing = any(e.error is not None and e.error.code == "missing" for e in episodes)
     return EvalResults(
@@ -340,13 +464,7 @@ def build_results(
         protocol=protocol.id,
         protocol_hash=protocol.protocol_hash(),
         seed_set=protocol.seed_set,
-        versions=Versions(
-            topple=__version__,
-            mujoco=mujoco.__version__,
-            numpy=np.__version__,
-            obs_schema=OBS_SCHEMA_ID,
-            action_spec=BALANCE_V1_ACTION.id,
-        ),
+        versions=run_versions(),
         platform=platform_tag(),
         robot_hash=robot_hash(protocol.challenge.robot_xml, protocol.challenge.params),
         controller=controller,

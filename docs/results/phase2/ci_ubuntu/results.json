@@ -1,0 +1,435 @@
+{
+  "format": "topple.results/1",
+  "challenge": "balance-v1",
+  "protocol": "balance-v1/standard",
+  "protocol_hash": "b243606351363f966776bd618f15df12dfdaf7103fcc67e87864139436bd1ea3",
+  "seed_set": "public",
+  "versions": {
+    "topple": "0.1.0",
+    "mujoco": "3.15.0",
+    "numpy": "2.5.3",
+    "obs_schema": "balancer.obs.v1",
+    "action_spec": "diffdrive.effort.v1",
+    "onnxruntime": "1.31.0",
+    "onnx": "1.23.2",
+    "cpu_isa": "avx2"
+  },
+  "platform": "linux-x86_64",
+  "robot_hash": "03f5654f03eff5be5cb7689b3b06356f42c8c4a1b3ed60795d7e8501a767ca59",
+  "controller": {
+    "id": "ppo_balance",
+    "sha256": "bb0cd77123f98cb7a006c9759b039731f44bc41573a3b053f409b984b69c7c7d",
+    "policy_sha256": "72b92aa744bfc596f483e891506febf26b75c46bd39af4459c4f7b085297af04"
+  },
+  "isolation": "inprocess",
+  "complete": true,
+  "episodes": [
+    {
+      "index": 0,
+      "seed": 1000,
+      "success": true,
+      "score": 94.92724431147995,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.028651478596087705,
+        "max_tilt_rad": 0.1490374676756061,
+        "drift_m": 0.04351511989662243,
+        "max_drift_m": 0.09103499280231263,
+        "energy_j": 2.321918185228024,
+        "saturation_fraction": 0.007
+      },
+      "error": null
+    },
+    {
+      "index": 1,
+      "seed": 1001,
+      "success": true,
+      "score": 91.59876558589778,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.05074833922195357,
+        "max_tilt_rad": 0.19235728731063448,
+        "drift_m": 0.055900493132356434,
+        "max_drift_m": 0.2415075187095769,
+        "energy_j": 3.6252881843641207,
+        "saturation_fraction": 0.023
+      },
+      "error": null
+    },
+    {
+      "index": 2,
+      "seed": 1002,
+      "success": true,
+      "score": 89.07980350944345,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.060816760120737084,
+        "max_tilt_rad": 0.21458974459979774,
+        "drift_m": 0.24942552979811228,
+        "max_drift_m": 0.24942552979811228,
+        "energy_j": 3.0709873864572517,
+        "saturation_fraction": 0.048
+      },
+      "error": null
+    },
+    {
+      "index": 3,
+      "seed": 1003,
+      "success": true,
+      "score": 91.305437843181,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.050596307301026607,
+        "max_tilt_rad": 0.23558849060938533,
+        "drift_m": 0.2629276388094489,
+        "max_drift_m": 0.28749039759549505,
+        "energy_j": 1.3174081005946252,
+        "saturation_fraction": 0.022
+      },
+      "error": null
+    },
+    {
+      "index": 4,
+      "seed": 1004,
+      "success": true,
+      "score": 94.03437825507606,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.03390587261383222,
+        "max_tilt_rad": 0.20685185795160763,
+        "drift_m": 0.15644246923993987,
+        "max_drift_m": 0.21776925788031531,
+        "energy_j": 1.3238988263951441,
+        "saturation_fraction": 0.015
+      },
+      "error": null
+    },
+    {
+      "index": 5,
+      "seed": 1005,
+      "success": true,
+      "score": 88.66140607664283,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.05041397242660025,
+        "max_tilt_rad": 0.21976162196367546,
+        "drift_m": 0.3424724063285749,
+        "max_drift_m": 0.3424724063285749,
+        "energy_j": 3.762939128808922,
+        "saturation_fraction": 0.029
+      },
+      "error": null
+    },
+    {
+      "index": 6,
+      "seed": 1006,
+      "success": true,
+      "score": 91.08607290706465,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.0458977809478805,
+        "max_tilt_rad": 0.22476676711490892,
+        "drift_m": 0.3224346284156667,
+        "max_drift_m": 0.36394653132713195,
+        "energy_j": 1.4407415553277425,
+        "saturation_fraction": 0.019
+      },
+      "error": null
+    },
+    {
+      "index": 7,
+      "seed": 1007,
+      "success": true,
+      "score": 92.49657284940884,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.032550850580291016,
+        "max_tilt_rad": 0.17762925726881576,
+        "drift_m": 0.09546090613607092,
+        "max_drift_m": 0.1971325206480154,
+        "energy_j": 4.314790270873768,
+        "saturation_fraction": 0.016
+      },
+      "error": null
+    },
+    {
+      "index": 8,
+      "seed": 1008,
+      "success": true,
+      "score": 93.33285462845505,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.03585221084153829,
+        "max_tilt_rad": 0.20873861088266515,
+        "drift_m": 0.1478763653624178,
+        "max_drift_m": 0.2083128020053574,
+        "energy_j": 2.1001404302347026,
+        "saturation_fraction": 0.025
+      },
+      "error": null
+    },
+    {
+      "index": 9,
+      "seed": 1009,
+      "success": true,
+      "score": 90.86150052295316,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.04710207446707387,
+        "max_tilt_rad": 0.18026932728445103,
+        "drift_m": 0.19777324577658084,
+        "max_drift_m": 0.22021556887413782,
+        "energy_j": 3.2102330400714814,
+        "saturation_fraction": 0.031
+      },
+      "error": null
+    },
+    {
+      "index": 10,
+      "seed": 1010,
+      "success": true,
+      "score": 91.75278425783499,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.039080750230601674,
+        "max_tilt_rad": 0.14496127401146658,
+        "drift_m": 0.2080006662237535,
+        "max_drift_m": 0.2530142329461798,
+        "energy_j": 2.9594656144961773,
+        "saturation_fraction": 0.01
+      },
+      "error": null
+    },
+    {
+      "index": 11,
+      "seed": 1011,
+      "success": true,
+      "score": 85.95431262795685,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.05930822623863334,
+        "max_tilt_rad": 0.2676363311844776,
+        "drift_m": 0.5009501296808135,
+        "max_drift_m": 0.5009501296808135,
+        "energy_j": 4.0680261212969,
+        "saturation_fraction": 0.042
+      },
+      "error": null
+    },
+    {
+      "index": 12,
+      "seed": 1012,
+      "success": true,
+      "score": 85.6267580836534,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.05415220355713283,
+        "max_tilt_rad": 0.2810578746279881,
+        "drift_m": 0.5069071458397008,
+        "max_drift_m": 0.5069071458397008,
+        "energy_j": 5.094524633929573,
+        "saturation_fraction": 0.058
+      },
+      "error": null
+    },
+    {
+      "index": 13,
+      "seed": 1013,
+      "success": true,
+      "score": 91.34978069546148,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.04622400118877172,
+        "max_tilt_rad": 0.20401979356452893,
+        "drift_m": 0.21312651060918258,
+        "max_drift_m": 0.2335003181022187,
+        "energy_j": 2.484485844236096,
+        "saturation_fraction": 0.013
+      },
+      "error": null
+    },
+    {
+      "index": 14,
+      "seed": 1014,
+      "success": true,
+      "score": 92.46283434136794,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.04299036608394994,
+        "max_tilt_rad": 0.25563240947752114,
+        "drift_m": 0.21661889041903512,
+        "max_drift_m": 0.21661889041903512,
+        "energy_j": 1.404241591321198,
+        "saturation_fraction": 0.028
+      },
+      "error": null
+    },
+    {
+      "index": 15,
+      "seed": 1015,
+      "success": true,
+      "score": 87.15175092139195,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.07132646945228166,
+        "max_tilt_rad": 0.32123360890598973,
+        "drift_m": 0.44661155387848356,
+        "max_drift_m": 0.44661155387848356,
+        "energy_j": 1.6368274389195197,
+        "saturation_fraction": 0.02
+      },
+      "error": null
+    },
+    {
+      "index": 16,
+      "seed": 1016,
+      "success": true,
+      "score": 95.10029653103108,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.031680990796602616,
+        "max_tilt_rad": 0.14979996953112387,
+        "drift_m": 0.10551426208394107,
+        "max_drift_m": 0.13779195818029352,
+        "energy_j": 0.8861649166947063,
+        "saturation_fraction": 0.003
+      },
+      "error": null
+    },
+    {
+      "index": 17,
+      "seed": 1017,
+      "success": true,
+      "score": 90.9918031865901,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.04916073711945023,
+        "max_tilt_rad": 0.20013591297858618,
+        "drift_m": 0.21878621641502727,
+        "max_drift_m": 0.23035791901792416,
+        "energy_j": 2.494581827882133,
+        "saturation_fraction": 0.03
+      },
+      "error": null
+    },
+    {
+      "index": 18,
+      "seed": 1018,
+      "success": true,
+      "score": 90.21426738715405,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.04891884375855571,
+        "max_tilt_rad": 0.2062772306309813,
+        "drift_m": 0.1658902647717162,
+        "max_drift_m": 0.22927199286384464,
+        "energy_j": 4.237778721947914,
+        "saturation_fraction": 0.042
+      },
+      "error": null
+    },
+    {
+      "index": 19,
+      "seed": 1019,
+      "success": true,
+      "score": 90.50311589100492,
+      "metrics": {
+        "steps": 1000,
+        "survived": true,
+        "termination": "timeout",
+        "upright_frac": 1.0,
+        "time_upright_s": 10.0,
+        "rms_tilt_rad": 0.05915188468147626,
+        "max_tilt_rad": 0.17980976901541287,
+        "drift_m": 0.2917992975231309,
+        "max_drift_m": 0.3194769189557388,
+        "energy_j": 0.8694504919571542,
+        "saturation_fraction": 0.004
+      },
+      "error": null
+    }
+  ],
+  "aggregate": {
+    "score": 90.92458702065247,
+    "success_rate": 1.0,
+    "mean_time_upright_s": 10.0,
+    "episodes": 20,
+    "errors": 0
+  }
+}

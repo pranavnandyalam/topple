@@ -9,6 +9,82 @@
 push a controller, and get back a deterministic score, a crash-test rating, an AI coach's fix and a
 replay anyone can watch and poke in the browser. Free, Mac-native, zero-install to try.
 
+
+---
+
+## 0. Direction update (2026-10-11): a workbench for your own robot projects
+
+Pranav's direction: Topple should be **a place where people can build, test and simulate their
+own robot projects**, not only compete on our balancer. There should also be an **Arena** where,
+for example, FRC teams practice driving their own robot for competition. The leaderboard, seasons
+and Sumo stay, as the community layer on top of the workbench.
+
+**What changes**
+1. **Bring your own robot is central.** People import a robot from CAD (Onshape via
+   `onshape-to-robot`, URDF) or MJCF, start from templates (balancer, rover/drivetrain, arm,
+   quadruped), and edit it visually. This moves forward from Phases 8, 12 and 13.
+2. **People define their own tests.** The `challenge.yaml` format (Phase 9) becomes a general
+   *test scenario*: goals, pushes, terrain, pass/fail checks, written by anyone.
+3. **Testing is the core feature.** Crash-test ratings (Phase 4), CI on every commit (Phase 3) and
+   sim-to-real checks (Phase 8) are tools people run on *their own* projects. Competing is optional.
+4. **Many ways to control the robot.** Write Python, tune PID, train RL with one command, export to
+   a microcontroller, or ask the AI coach about your own design.
+5. **Robot validation becomes core work.** Every user brings their own robot, so the items in
+   `docs/design/deferred-risks.md` (e.g. a hidden mass below the floor making a passive pendulum)
+   must be closed before user robots are accepted.
+
+**Studio: desktop + browser, one codebase.**
+- *Desktop app* (`topple studio`, later wrapped with Tauri): the main workspace. It opens project
+  folders, imports CAD, runs long simulations and RL training on the user's own CPU/GPU, and talks
+  to hardware over USB/Bluetooth. No server cost.
+- *Browser:* viewing, sharing and quick tries. A link to someone's robot opens instantly; replays,
+  the Arena and classrooms stay zero-install (Chromebooks).
+- The web UI is built once; the desktop app adds local power. The site can also be an installable
+  PWA.
+
+**Arena: practice and play, including FRC driver practice.**
+- Two modes: a *sandbox* (shove and test any robot) and *match modes*. FRC drive practice comes
+  first; Sumo and seasons come later.
+- FRC practice:
+  - the team's own robot (Onshape import) on the current season's field (FIRST publishes field CAD
+    each January), with game pieces and scoring zones;
+  - real driving with a gamepad or driver-station controller (browser Gamepad API), and tank,
+    arcade, swerve and mecanum drivetrains with realistic motor limits, weight, traction and
+    bumper collisions;
+  - the team's real WPILib/RobotPy code run against the sim (WPILib simulation interface), so
+    autonomous routines and driver assists are tested before the robot exists;
+  - drills (cycle times, intake, defence), timed matches with scoring, ghost replays of the best
+    run, and per-driver stats over time;
+  - multiplayer alliances and scrimmages between teams over WebRTC.
+- Edge over existing FRC sims (e.g. xRC Simulator): *your* robot + *your* code + testing tools.
+- Needs: swerve/mecanum drivetrain models, game-piece physics, and a field format.
+- Timing: kickoff is early January and competitions run Feb–Apr, so the FRC Arena must be ready by a
+  kickoff to be useful that season.
+- Check FIRST's terms for field CAD and game names before a public launch.
+
+**Revised build order** (phase numbers below are kept for references; this is the order to build):
+1. Phases 0–2 as planned (0–1 merged; 2 designed).
+2. **Studio:** a project format, a desktop + web workspace and a live simulator.
+3. **Your own robot:** import (CAD/URDF/MJCF), templates, a visual editor, and robot validation
+   hardened against `deferred-risks.md`.
+4. **Test scenarios + crash-test rating** (old Phase 4, generalized to user scenarios).
+5. **Arena:** sandbox + FRC drive practice (drivetrains, fields, gamepad, team code, multiplayer).
+6. **Robot CI action** on the user's own repo (old Phase 3).
+7. **AI Coach + autotune** for any project (old Phase 6).
+8. **Sim-to-real:** hardware export and fidelity checks (old Phase 8).
+9. Community layer: sharing, leaderboards, seasons, Sumo (old Phases 5 and 7), then classrooms and
+   open challenges (old 9) and the extensions (old 10–15).
+
+**Answers from Pranav (2026-10-15)**
+- Main user: **all of them**: hobbyists/makers, students and FRC teams, and researchers. So the UI
+  needs a simple path (templates, sliders, one-click runs) with the power features (scripting,
+  configs, reproducible runs) one level down, never in the way.
+- Robot types: **any robot** (arms, legs, drones too), not only wheeled/balancing. Robot import,
+  validation and test scenarios must not assume a balancer.
+- Hardware: **optional**. Sim-first; hardware export and sim-to-real stay a supported path, not a
+  requirement for any core feature.
+- FRC season target: **still open** (decide before the Arena phase starts).
+
 ---
 
 ## 1. Why this, why now (research summary, Oct 2026)
@@ -50,11 +126,11 @@ the competitor, growth, frontier-tech and feasibility sweeps.
 | Layer | Choice | Notes |
 |---|---|---|
 | Core | Python 3.12 via `uv`, `mujoco==3.15.*` (pinned) | Determinism is guaranteed only within one version + architecture |
-| RL | Gymnasium 1.4, SB3 2.9 (PPO/SAC), TensorBoard | Training on CPU `SubprocVecEnv`, 16 envs on 18 cores |
-| Policy format | **ONNX everywhere** (SB3 export wrapper with VecNormalize + clipping baked in) | Eval/CI/browser never need torch: `onnxruntime` ~15 MB vs. torch 555 MB+ |
+| RL | Gymnasium 1.4, SB3 2.9 (PPO/SAC), TensorBoard | Training runs on CPU with `SubprocVecEnv`: 8 envs, at most 1 run at a time, and eval pools of at most 4 workers. This is because the laptop is shared (Phase 2 spec §1). |
+| Policy format | **ONNX everywhere** (pickle-free `onnx.helper` build, IR 8 / opset 17, VecNormalize and clip baked in, canonical bytes) | Eval/CI/browser never need torch: `onnxruntime` ~15 MB vs. torch 555 MB+ |
 | CLI | `typer` | `topple run / eval / train / export / fuzz / coach / autotune / sumo` |
 | Rendering | `mujoco.Renderer`; `MUJOCO_GL=cgl` (Mac), `osmesa` (Linux CI) | CI renders one short episode at 320×240 → GIF |
-| CI | GitHub Actions, `pull_request` → `workflow_run` split | Fork PRs get no secrets; privileged stage only reads validated artifacts |
+| CI | GitHub Actions, `pull_request` → `workflow_run` split | Fork PRs get no secrets; untrusted policy bytes are parsed only in a token-less, secret-less `rescore` job; the privileged `publish` job only reads its validated output |
 | Web | Vite + TypeScript + three.js, `@mujoco/mujoco` (single-thread build), `onnxruntime-web`, Pyodide in a Web Worker | Start from mjswan rather than from scratch |
 | Hosting | Cloudflare Pages (site), R2 (GIFs, `traj.npz`), D1 (leaderboard) | Est. $0–5/mo at 1k users; Claude API is the real cost, so add quotas |
 | AI | Claude: user's own `ANTHROPIC_API_KEY` or their Claude Code login (`claude-sonnet-5-5` default, `claude-opus-5-5` for hard cases) | Bring-your-own key; images, not video: sample 6–10 key frames |
@@ -77,14 +153,16 @@ topple/
 │   ├── disturbances.py  presets (ideal/clean/standard), JSON scenarios, pushes
 │   ├── estimation.py    IMU model, complementary filter, encoders, odometry (portable float math)
 │   ├── envs/            balance.py (topple/Balance-v1), later waypoint.py, sumo.py
-│   ├── controllers/     pid.py, lqr.py, onnx_policy.py (P2)
+│   ├── controllers/     pid.py, lqr.py, onnx_policy.py (P2), waypoint_pid.py (P2b)
+│   ├── policy/          (P2) topple.policy/1: manifest, ONNX build, acceptance validator, hardened ORT session
+│   ├── train/           (P2) config + wrappers + selection (torch-free); learn/snapshot/callbacks (train extra)
 │   ├── design/          LQR design from the linearized model
 │   ├── traj.py, scoring.py, verify.py   topple.traj/1, metrics + score, trusted replay + re-scoring
 │   ├── evaluate.py, results.py, loader.py   protocols, topple.results/1, submission loading
 │   ├── runner.py        (P3) runs untrusted controllers in a subprocess/container
 │   ├── crashtest/       (P4) fuzzer, RoA, STL, rating
 │   ├── coach/, sumo/, sysid/   (P6, P7, P8)
-│   └── train.py, export.py, video.py, cli.py
+│   └── export.py, stats.py, compare.py, bench.py, course.py (P2b), video.py, cli.py
 ├── web/                 (P5) Arena: replay viewer, live sandbox, leaderboard, share cards
 ├── action/              (P3) reusable GitHub Action (robot-ci)
 ├── firmware/            (P8) ESP32 balancer firmware + host log tool
@@ -128,6 +206,10 @@ changing `obs_v1`.
   re-simulates an uploaded trajectory's commands on its own build from the protocol's own seed and
   scores only that replay; any bit that differs fails verification (contract §16).
 - **Tournament opponents exchange ONNX weights (data), not code.**
+  - An ONNX submission is a directory containing only `policy.onnx` and `policy.json`, with no
+    `.py` and no pickles.
+  - Models are validated on their bytes against an allow-list before ORT parses them.
+  - Pickled training checkpoints never cross a trust boundary.
 
 ---
 
@@ -149,11 +231,54 @@ assume part-time work alongside school.
 - `eval_v1`: 20 seeded episodes → `results.json` + `traj.npz`; `topple run` writes MP4.
 - **Done when:** `env_checker` passes; PID balances >90% of no-push episodes; same seed gives an identical trajectory on the same platform (test); coverage ≥80%.
 
-### Phase 2: Learn (1–2 weeks)
-- PPO (16 envs, curriculum: none → small pushes → full randomization), TensorBoard, checkpoints.
-- `topple export` → ONNX (VecNormalize + clipping baked in); `onnx_policy.py` controller.
-- `WaypointTask`; SAC comparison (wall-clock, sample efficiency).
-- **Done when:** PPO beats PID on `eval_v1` *with* disturbances; ONNX actions match torch within 1e-5; side-by-side PID vs. PPO video exists.
+### Phase 2: Learn (1–2 weeks). Spec: `docs/design/phase-2.md`
+- **2a, balance.**
+  - Training: PPO with 8 SubprocVecEnv workers on `balance-v1/standard` from step 0. There is no
+    curriculum (measured worse). Each seed trains for 5M steps with a linearly decaying learning
+    rate (a constant rate collapsed 1 of 3 seeds late in training), and 3 seeds are run. Seeded
+    training is bit-deterministic per platform and tested.
+  - Training-only action-excess penalty.
+  - Checkpoints are selected on 200 selection seeds through the real harness. Logging uses
+    TensorBoard.
+  - Checkpoints are eligible only if success ≥ PID's, median energy ≤ E_ref and saturation ≤ 0.08.
+  - SAC is the comparison: 1.0M env steps (about PPO's training time), same harness and seeds.
+    It is learner-throughput-limited at this budget and is not expected to reach PID level.
+  - Each run is capped by a process-tree RSS limit and a CPU-seconds budget. Wall-clock is only a
+    runaway guard; an aborted run is re-run, never reported.
+- **Export.** `topple export` builds a pickle-free, torch-free ONNX: VecNormalize and clipping are
+  baked in, with IR 8 and opset 17. It writes a **data-only** submission (`policy.onnx` +
+  `policy.json`, `topple.policy/1`, no code). This needs an ONNX acceptance policy and the
+  hardened `ONNXPolicy` runtime.
+- **Results.** The package covers the CI scoreboard, the shove test, learning curves and the hero
+  video.
+- **Done when (2a):** the shipped ONNX directory, run without torch, must pass all of:
+  - its eval_v1 score > PID's;
+  - on calibration seeds 0..199, the paired-bootstrap 95% CI of (PPO − PID) is above 0;
+  - its success rate ≥ PID's on both seed sets;
+  - it beats LQR (paired CI lower bound of PPO − LQR > 0, success ≥ LQR's − 0.03);
+  - median energy ≤ E_ref and saturation ≤ 0.10;
+  - the 0..199 gates above hold both on the developer Mac and on the ubuntu CI runtime;
+  - ONNX matches SB3's own predict within 1e-5, open-loop at batch 1, re-checked torch-free in CI;
+  - at least 2 of the 3 PPO training seeds independently pass the PID gates (the recipe, not one
+    lucky seed);
+  - a side-by-side PID vs PPO video exists.
+- **2b, waypoint-v1** (after 2a).
+  - The course: fixed-leg courses (5 × 0.70 m), the `balancer-target.obs.v1` observation,
+    and a frozen scorer (55 course / 25 speed / 15 alive / 5 energy).
+  - Baselines and training: a reference driver, and PPO trained from scratch vs fine-tuned from
+    the balance policy.
+- **Done when (2b):**
+  - the challenge is frozen (push strength calibrated first, by a fixed sweep), its two-sided
+    calibration band holds, and its degenerate-strategy anchors pass;
+  - it is learnable, judged relative to the reference driver at the frozen push level on
+    calibration seeds 0..399: the shipped learned policy (the top eligible checkpoint across both
+    arms' 6 runs, with fallback to the next) docks on ≥ 60%, is not clearly worse than the driver
+    (paired CI lower bound of PPO − driver > −5), beats the creeper anchor, and falls at most
+    20 points more often than the driver; falls on the push-free preset are reported;
+  - balance-v1 is unchanged;
+  - verify and rescore work;
+  - both arms are reported (3 seeds each);
+  - a course video exists.
 
 ### Phase 3: Robot CI (1–1.5 weeks): *first public release*
 - `runner.py` subprocess sandbox; rejects bad shapes, NaNs, timeouts, exceptions.
@@ -256,12 +381,20 @@ parts ordering, which should happen in month 2 to absorb shipping time.
 - **Determinism:** same seed → bit-identical trajectory per platform; cross-platform within tolerance over 1k steps.
 - **Contract:** every controller in `submissions/` and every coach output satisfies `Controller`.
 - **Security/red-team:** scorer tampering, `os.system`, network calls, infinite loops, memory bombs, oversized output, malicious artifacts in `workflow_run`.
-- **ONNX parity:** torch vs. ONNX within 1e-5 on 1k random observations.
+- **ONNX parity:** ONNX matches SB3's own predict pipeline within 1e-5. The check runs at batch 1
+  on fixed observation sets, fed open-loop:
+  - on-policy observations;
+  - random observations in normalized space;
+  - edge cases;
+  - with at least 300 unsaturated rows.
+
+  CI re-checks the result without torch.
 - **Integration:** `topple eval` → valid `results.json`; action end-to-end on a test repo.
 - **Golden regression:** PID score range; CI fails if a sim change moves it.
 - **Web:** Vitest for replay decoding and the sandbox worker; Playwright smoke for "load → shove → edit gain".
 - **Coach:** recorded-response tests (no live API in CI); live benchmark run manually.
-- Training is not unit-tested; 2k-step smoke train in CI.
+- Training is not unit-tested. A 2k-step smoke train runs in CI, in the separate `python-train` job
+  that has the train extra. The default job never installs torch.
 
 ---
 
@@ -274,7 +407,7 @@ parts ordering, which should happen in month 2 to absorb shipping time.
 | Pwn-request / CI abuse | High | `pull_request` + `workflow_run` split, `permissions: {}`, timeouts, first-time-contributor approval, never execute artifacts |
 | Cross-platform divergence | Med | Pin MuJoCo, CI image authoritative, replays from stored trajectories |
 | MuJoCo WASM is "WIP" | Med | Pin npm version; Arena falls back to pre-rendered GIF/MP4 |
-| Reward hacking / RL not converging | Med | PID proves solvability; curriculum; watch videos; autotune |
+| Reward hacking / RL not converging | Med | PID proves solvability; 5M budget, 3 seeds, 200-seed selection, action-excess penalty; watch videos; autotune |
 | Claude cost/abuse in coach | Low | Bring-your-own key for public users; Pranav's Max plan covers only his own use (Claude Code) |
 | Onshape API quota / export pain | Med | Placeholder MJCF unblocks everything; export once, commit output |
 | Hardware sim-to-real gap | Med | System ID + domain randomization; PID fallback; treat the gap as a write-up finding |
@@ -298,6 +431,9 @@ parts ordering, which should happen in month 2 to absorb shipping time.
 5. **Workflow:** review-agent gate per phase, then auto-continue (see Review gate).
 6. **Hardware:** decide by month 2. UMich makerspaces for fabrication; Great Lakes HPC for GPU work.
 7. **Accounts** (Cloudflare, Onshape EDU, domain, optional Anthropic API key): created when a phase needs them, with Pranav doing the signup.
+8. **Direction (2026-10-11):** a workbench for people's own robot projects (Studio: desktop + browser), plus an Arena with FRC drive practice. See section 0 for the revised build order.
+9. **Audience and scope (2026-10-15):** all three audiences (makers, students/FRC, researchers), any robot type, hardware optional; the FRC season target is still open (section 0).
+10. **Calibration platform (2026-10-15):** challenges are calibrated on the ranked platform (linux-x86_64); balance-v1's E_ref moved 13.0 → 13.1 J (`docs/design/phase-2-decisions.md`, rows R1–R6).
 
 ---
 

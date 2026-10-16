@@ -457,7 +457,7 @@ def test_verify_a_run_directory(eval_dir: Path, tmp_path: Path) -> None:
     assert trusted["complete"] is True
     assert trusted["aggregate"] == original["aggregate"]
     assert trusted["episodes"] == original["episodes"]
-    assert trusted["controller"] == {"id": "unknown", "sha256": "0" * 64}
+    assert trusted["controller"] == {"id": "unknown", "sha256": "0" * 64, "policy_sha256": None}
 
 
 def test_verify_a_directory_records_the_submission_hash(eval_dir: Path, tmp_path: Path) -> None:
@@ -480,7 +480,11 @@ def test_verify_a_directory_records_the_submission_hash(eval_dir: Path, tmp_path
     )
     assert result.exit_code == 0, result.output
     trusted = json.loads(out.read_text())
-    assert trusted["controller"] == {"id": "bot", "sha256": submission_sha256(sub)}
+    assert trusted["controller"] == {
+        "id": "bot",
+        "sha256": submission_sha256(sub),
+        "policy_sha256": None,  # a Python submission
+    }
     assert trusted["isolation"] == "container"
 
 
@@ -501,7 +505,7 @@ def test_verify_records_the_resolved_submission_name(
     )
     assert result.exit_code == 0, result.output
     recorded = json.loads(out.read_text())["controller"]
-    assert recorded == {"id": "mybot", "sha256": submission_sha256(bot)}
+    assert recorded == {"id": "mybot", "sha256": submission_sha256(bot), "policy_sha256": None}
     assert recorded["id"] == load_submission(Path(spelling)).id
 
 
@@ -1041,8 +1045,8 @@ def test_a_submission_name_that_is_not_utf8_exits_2_before_running(
 
     real = topple.loader.load_submission
 
-    def load(path: Path) -> Submission:
-        return replace(real(path), id=SURROGATE_NAME.removesuffix(".py"))
+    def load(path: Path, **kwargs: Any) -> Submission:
+        return replace(real(path, **kwargs), id=SURROGATE_NAME.removesuffix(".py"))
 
     monkeypatch.setattr(topple.loader, "load_submission", load)
     out = tmp_path / "out"

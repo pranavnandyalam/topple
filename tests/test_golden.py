@@ -4,8 +4,9 @@ These pin values that must never move once balance-v1 is published (docs/contrac
 controller seed derivation, the scenarios materialized from episode seeds, the bundle and protocol
 hashes, and the baseline controllers' episode scores. A failure here means a change can move a
 fixed controller's score on a fixed seed. Do not "update the numbers": either the change is a bug,
-or it needs a new challenge major version (or an ``ENV_ALGO_VERSION`` bump before publication) and
-a deliberate, reviewed re-pin.
+or it is deliberate and needs a reviewed re-pin: before publication the re-pin itself (with an
+``ENV_ALGO_VERSION`` bump if env code changed, as balance-v1's E_ref recalibration was done),
+after publication a new challenge major version (contract §13).
 
 Seeds, scenario draws and hashes are platform-independent (numpy's ``SeedSequence``/PCG64 raw
 bits and sha256 are portable, and scenario draws apply their affine maps in Python; see
@@ -61,16 +62,16 @@ CONTROLLER_SEEDS: dict[tuple[int, int], int] = {
     (0, 2**127 + 12345): 8639439415161446,
 }
 
-BUNDLE_HASH = "a3b4846310a1a174f288da82d9532fe986a4b0428ab5069d1620e1237f5017a9"
+BUNDLE_HASH = "89a62007e2f56e61b3a87f3e30034dafc5e6bde4d6c675c07cd79c8d0bbaedd0"
 # Public protocols: the public seed list, salt 0 (contract §13).
 PROTOCOL_HASHES = {
-    "ideal": "6ad4cf45adfef1b813229aec1e0b899c99f8e4d7953031e70ac8bf27093cb368",
-    "clean": "f30f5119c86f1ef9196d4f4de92cf1b4fc5d7d4204458c8ffe2e5efb6f4194d6",
-    "standard": "a32517413cace0c73c300cddbaf6e480ab78a01ee68b717b67adf0fe7f59c5f4",
+    "ideal": "79450098ce9ad069f7d812e451ff1403e38d3e597fd7166bcb643b66d309c30c",
+    "clean": "3f27d1c91d9e2eaaacddf4609b47c6d582342a6bc23b31524751c679f406e3c2",
+    "standard": "b243606351363f966776bd618f15df12dfdaf7103fcc67e87864139436bd1ea3",
 }
 PRIVATE_SEEDS = (1, 2, 3)
 PRIVATE_SALT = 2**127 + 5
-PRIVATE_PROTOCOL_HASH = "aa7220e396ffefda76e044adbeb8f496d7bb12a45fa36c81e55e069b180c749e"
+PRIVATE_PROTOCOL_HASH = "8db2d33e96f576cc2e2f62bd4815c8f156097450a17098b09de28ad0592ea193"
 
 RANKED_PLATFORM = "linux-x86_64"
 """Where CI runs and ranked scores come from (contract §13)."""
@@ -79,29 +80,30 @@ RANKED_PLATFORM = "linux-x86_64"
 EpisodeKey = tuple[float, bool, float]
 EPISODE_SEEDS = (1000, 1001, 1002)
 EPISODES: dict[str, dict[str, dict[int, EpisodeKey]]] = {
+    # The development platform (Apple Silicon), re-pinned under E_ref 13.1 J on 2026-10-15.
     "darwin-arm64": {
         "pid": {
-            1000: (92.05698981231265, True, 10.0),
+            1000: (92.07486036832013, True, 10.0),
             1001: (77.65148730115902, True, 10.0),
-            1002: (46.296017498043454, False, 5.97),
+            1002: (46.327503731785804, False, 5.97),
         },
         "lqr": {
-            1000: (91.5273532508896, True, 10.0),
-            1001: (84.07772455809453, True, 10.0),
-            1002: (83.74288560556353, True, 10.0),
+            1000: (91.54282414455297, True, 10.0),
+            1001: (84.11681322780457, True, 10.0),
+            1002: (83.76543245729982, True, 10.0),
         },
     },
     # The CI platform (GitHub Actions ubuntu-24.04), the source of truth for ranked scores.
     "linux-x86_64": {
         "pid": {
-            1000: (92.06970433366325, True, 10.0),
+            1000: (92.08753235441824, True, 10.0),
             1001: (77.66275112229928, True, 10.0),
-            1002: (46.37032752230015, False, 5.98),
+            1002: (46.4017119240978, False, 5.98),
         },
         "lqr": {
-            1000: (91.52687435124143, True, 10.0),
-            1001: (85.40370568144897, True, 10.0),
-            1002: (83.79327852535813, True, 10.0),
+            1000: (91.54233637656888, True, 10.0),
+            1001: (85.43305302210213, True, 10.0),
+            1002: (83.81544021121424, True, 10.0),
         },
     },
 }
