@@ -43,7 +43,12 @@ TRAIN_TESTS = (
 )
 # (file -> banned names it may use). Fixed: an entry is a reviewed exception, never a pattern.
 ALLOWED: dict[str, frozenset[str]] = {
-    **dict.fromkeys(TRAIN_TESTS, frozenset({"torch", "stable_baselines3"})),
+    # train-marked tests that import torch / SB3 themselves (test_train_smoke,
+    # test_snapshot_reference and test_resources reach them only through topple.train)
+    **dict.fromkeys(
+        ("tests/test_pack_torch_legacy.py", "tests/test_surgery.py"),
+        frozenset({"torch", "stable_baselines3"}),
+    ),
     # TaskSpec pickles and copies (contract §8)
     "tests/test_contract.py": frozenset({"pickle"}),
     # LoadedPolicy, ONNXPolicy and sessions refuse to be pickled (slice 1b)
@@ -451,7 +456,10 @@ def test_train_code_may_import_torch_but_not_load_unsafely() -> None:
 def test_allow_listed_files_are_exempt_only_for_their_names() -> None:
     assert scan_source("tests/test_contract.py", "import pickle") == []
     assert scan_source("tests/test_contract.py", "import dill") != []
-    assert scan_source("tests/test_train_smoke.py", "import torch\nimport stable_baselines3") == []
+    assert (
+        scan_source("tests/test_pack_torch_legacy.py", "import torch\nimport stable_baselines3")
+        == []
+    )
     assert scan_source("tests/test_policy_canonical.py", "onnx.numpy_helper.to_array(t)") == []
     assert scan_source("tests/test_policy_canonical.py", "onnx.load('m')") != []
 

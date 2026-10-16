@@ -135,3 +135,14 @@ module = [
     "psutil.*",
 ]
 ignore_missing_imports = true
+
+# The default CI job has no SB3, so the callbacks subclass Any there (spec §7).
+[[tool.mypy.overrides]]
+module = [
+    "topple.train.learn",
+    "topple.train.callbacks",
+    "topple.train.snapshot",
+    "topple.train.surgery",
+    "topple.train.resources",
+]
+disallow_subclassing_any = false
