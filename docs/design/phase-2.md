@@ -716,7 +716,7 @@ Export never imports torch or calls `PPO/SAC/VecNormalize.load`, `pickle`, `clou
    `claims.export_parity = None`.
 
 **Third-party recipes.** Primary (dynamo; needs `pip install onnxscript`, which is not in
-Topple's lock): `torch.onnx.export(net, (x,), f, dynamo=True, input_names=["obs"],
+Topple's lock): `torch.onnx.export(net, (x,), f, dynamo=True, external_data=False, input_names=["obs"],
 output_names=["action"], dynamic_shapes=({0: torch.export.Dim("batch")},))` (measured with
 onnxscript 0.7.2: IR 10, opset 20, `Sub Mul Clip Gemm Tanh Gemm Tanh Gemm Clip`, 20 `value_info`,
 rank-0 initializers). Legacy (`dynamo=False`, deprecated by torch 2.14.1 with "will be removed"):
