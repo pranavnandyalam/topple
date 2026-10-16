@@ -21,8 +21,11 @@ from collections import namedtuple
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
-import psutil
 import pytest
+
+pytest.importorskip("psutil")  # the train extra; the default CI jobs lack it
+
+import psutil
 
 from topple.train.config import LimitsConfig
 from topple.train.resources import ResourceReading, ResourceSampler, abort_flag

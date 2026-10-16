@@ -14,6 +14,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+
+pytest.importorskip("torch")  # the train extra; the default CI jobs collect without it
+pytest.importorskip("stable_baselines3")
+
 from typer.testing import CliRunner
 
 from topple.cli import app

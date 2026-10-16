@@ -12,6 +12,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+pytest.importorskip("torch")  # the train extra; the default CI jobs collect without it
+pytest.importorskip("stable_baselines3")
+
 from topple.train.config import read_train_config
 from topple.train.learn import resume_from, train
 
