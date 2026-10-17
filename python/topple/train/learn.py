@@ -54,7 +54,7 @@ from topple.train.selection import (
     run_flags,
     selection_protocol,
 )
-from topple.train.surgery import ExtendedInit, InitError, choose_source, extend_obs
+from topple.train.surgery import ExtendedInit, InitError, extended_init
 from topple.train.wrappers import make_train_env
 
 REPO = Path(__file__).resolve().parents[3]
@@ -81,6 +81,7 @@ def train(cfg: Config, out: Path, *, config_file_sha256: str) -> Path:
     normally after a hard limit too: the abort flag is in ``train_meta.flags``, and the CLI
     exits 4."""
     out = Path(out)
+    ext = _extended_init(cfg)  # first: an unusable init source fails before anything is made
     out.mkdir(parents=True, exist_ok=True)
     for name in SINGLE_THREAD_ENV:  # inherited by the env workers and the eval pool
         os.environ[name] = "1"
@@ -98,7 +99,6 @@ def train(cfg: Config, out: Path, *, config_file_sha256: str) -> Path:
         if cfg.algo == "ppo"
         else EvalTrigger(cfg.selection.every_steps, cfg.total_timesteps)
     )
-    ext = _extended_init(cfg)  # before the baseline: a missing or unusable source fails fast
     sampler = ResourceSampler()
     sampler.start()
     vecnorm: Any = None
@@ -162,7 +162,7 @@ def train(cfg: Config, out: Path, *, config_file_sha256: str) -> Path:
 def _extended_init(cfg: Config) -> ExtendedInit | None:
     if cfg.algo != "ppo" or cfg.init is None:
         return None
-    return extend_obs(cfg, choose_source(cfg.init, cfg.seed))
+    return extended_init(cfg)
 
 
 def apply_init(model: Any, vecnorm: VecNormalize, ext: ExtendedInit) -> None:

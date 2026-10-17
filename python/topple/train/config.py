@@ -397,9 +397,9 @@ def _run_path(value: str) -> str:
         not value
         or not set(value) <= _RUN_PATH_CHARS
         or value.startswith("/")
-        or any(part in ("", ".", "..") for part in parts)
+        or any(not part or part.startswith(".") for part in parts)
     ):
-        raise ValueError("a run path is relative, without '.', '..' or empty components")
+        raise ValueError("a run path is relative, with no empty component or one starting '.'")
     return value
 
 

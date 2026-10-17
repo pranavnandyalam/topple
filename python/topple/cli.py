@@ -878,7 +878,10 @@ def train(
         except OSError as exc:
             _fail(f"cannot move {out} to {attempt}: {exc.strerror or type(exc).__name__}")
         typer.echo(f"retry: moved the aborted run to {attempt}")
-    run_dir = learn.train(loaded.config, out, config_file_sha256=loaded.file_sha256)
+    try:
+        run_dir = learn.train(loaded.config, out, config_file_sha256=loaded.file_sha256)
+    except learn.InitError as exc:  # a fine-tune's source (§8.8): before anything is written
+        _fail(f"{config.name}: init: {exc}")
     if attempt is not None:
         earlier = [
             out.with_name(f"{out.name}.attempt{k}")

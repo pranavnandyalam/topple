@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from phase2_common import RunCore, ShipAttempt
+from phase2_common import InitSource, RunCore, ShipAttempt
 from phase2_results import (
     ResultsError,
     attempts,
@@ -233,3 +233,24 @@ def test_stale_ci_evidence_is_not_rendered(tmp_path: Path, monkeypatch: pytest.M
     (ci / "source.json").write_text("{}")
     monkeypatch.setattr(phase2_results, "read_results", lambda _p: Stub())
     assert phase2_results.ci_render(tmp_path, "d" * 64) == {}
+
+
+@pytest.mark.parametrize(
+    ("run", "ok"),
+    [
+        ("runs/ppo_s0", True),
+        ("ppo_s0", True),
+        ("../ppo_s0", False),
+        ("/abs/run", False),
+        ("runs/.x", False),
+        ("runs//x", False),
+    ],
+)
+def test_init_source_names_the_run_as_the_config_does(run: str, ok: bool) -> None:
+    """§8.8: ``train_meta.init_source.run`` is the config's ``init.from_runs`` entry."""
+    doc = {"run": run, "step": 5013504, "onnx_sha256": "a" * 64}
+    if ok:
+        assert InitSource.model_validate(doc).run == run
+    else:
+        with pytest.raises(ValueError, match="should match pattern"):
+            InitSource.model_validate(doc)

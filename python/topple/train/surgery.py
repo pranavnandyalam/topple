@@ -21,6 +21,7 @@ item 7).
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -133,6 +134,19 @@ def choose_source(init: InitConfig, seed: int, *, cwd: Path | None = None) -> In
     raise InitError("no init.from_runs run is usable: " + "; ".join(reasons))
 
 
+def extended_init(cfg: PpoTrainConfig, *, cwd: Path | None = None) -> ExtendedInit:
+    """``extend_obs`` from ``choose_source`` for ``cfg``'s seed; every failure (a reader's
+    ``ExportError`` included) is an ``InitError``."""
+    from topple.export import ExportError
+
+    if cfg.init is None:
+        raise InitError("the config has no init")
+    try:
+        return extend_obs(cfg, choose_source(cfg.init, cfg.seed, cwd=cwd), cwd=cwd)
+    except ExportError as exc:
+        raise InitError(str(exc)) from None
+
+
 def _usable(run_dir: Path, name: str) -> InitSource | str:
     """The run's best step as a source, or why it cannot be one."""
     from topple.export import _best_step, _flags, _history_row, _object, read_run_json
@@ -194,6 +208,7 @@ def _read_source(run_dir: Path, source: InitSource) -> tuple[Any, dict[str, F32]
         _read_snapshot,
         _Run,
         _step_dir,
+        build_onnx,
         read_run_json,
     )
 
@@ -201,8 +216,16 @@ def _read_source(run_dir: Path, source: InitSource) -> tuple[Any, dict[str, F32]
     step_dir = _step_dir(run_dir, source.step)
     run = _Run(source.step, step_dir, True, source.onnx_sha256, meta, False)
     snap = _read_snapshot(run)
-    if snap.parity_sha256 != source.onnx_sha256:
-        raise InitError(f"{source.run}: the step's parity_ref onnx_sha256 is not its history row's")
+    built = hashlib.sha256(
+        build_onnx(
+            snap.layers, snap.norm, activation=snap.meta.activation, challenge=snap.challenge
+        )
+    ).hexdigest()
+    if not built == snap.meta.onnx_sha256 == snap.parity_sha256 == source.onnx_sha256:
+        raise InitError(
+            f"{source.run}: step {source.step}'s weights do not rebuild the ONNX its selection "
+            "eval scored"
+        )
     if snap.cfg.algo != "ppo" or snap.cfg.env.challenge != "balance-v1":
         raise InitError(f"{source.run}: the source must be a PPO balance-v1 run")
     if snap.task.obs_dim != SOURCE_DIM:
@@ -252,6 +275,8 @@ def sanity_check(ext: ExtendedInit, seeds: range) -> float:
     from topple.challenge import load_challenge
     from topple.envs.balance import BalanceEnv
 
+    if len(seeds) == 0:
+        raise ValueError("sanity_check needs at least one seed")
     env = BalanceEnv("clean", challenge=load_challenge("balance-v1"))
     survived = 0
     try:

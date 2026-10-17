@@ -180,6 +180,14 @@ MAX_ATTEMPTS: Final = 2
 MAX_FREE_KEYS: Final = 64
 
 RunName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,64}$")]
+RunPath = Annotated[
+    str,
+    StringConstraints(
+        max_length=200, pattern=r"^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$"
+    ),
+]
+"""A run directory relative to the checkout, as ``init.from_runs`` names it (``runs/ppo_s0``):
+no absolute path and no component starting with a dot."""
 GitCommit = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 VersionKey = Annotated[str, StringConstraints(pattern=r"^[a-z0-9_.-]{1,32}$")]
 Flag = Literal[  # topple.train.selection.FLAGS, in order (a test keeps them equal)
@@ -286,9 +294,10 @@ class RetryAttempt(_Strict):
 
 
 class InitSource(_Strict):
-    """A fine-tune's starting checkpoint (2b)."""
+    """A fine-tune's starting checkpoint (2b): ``run`` as the config's ``init.from_runs``
+    names it."""
 
-    run: RunName
+    run: RunPath
     step: NonNegInt
     onnx_sha256: Sha256
 

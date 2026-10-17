@@ -41,6 +41,15 @@ from topple.yamlsafe import ConfigError, safe_load_capped
 REPO = Path(__file__).resolve().parents[1]
 CONFIGS = REPO / "configs" / "train"
 PPO_BALANCE_2A_SHA256 = "9ba39c87e3d419ecf13daeff27bf851e9e0e3bd360ec3328ef58451050158874"
+SHA256_2A = {
+    # recorded by the Phase 2a runs (runs/ppo_s0, sac_s0, ablate_nopenalty)
+    "ppo_balance": PPO_BALANCE_2A_SHA256,
+    "sac_balance": "987da388b0f6aa316606afc17f28ad481caf94162df6a1a32f5209c751d257f3",
+    "ablate_nopenalty": "1808680c6432535600ceb48e59928e04301ac83073a12977be8bfe3dbf2e997e",
+    # the train CI job's smoke configs at the 2a merge (386df1e)
+    "smoke_ppo": "424f36b7652ea11ed66eccc104af4e1adab86694cedcbc0e12ca649fde74f612",
+    "smoke_sac": "5ad044128dfcef83d12791c8f14307af4a7f5989d6a00762f4274bcdac6535da",
+}
 SHIPPED = (
     "ppo_balance",
     "sac_balance",
@@ -621,6 +630,11 @@ def test_config_sha256_is_of_the_canonical_json() -> None:
     assert config_sha256(cfg) == hashlib.sha256(text.encode()).hexdigest()
 
 
+@pytest.mark.parametrize("name", list(SHA256_2A))
+def test_every_2a_config_keeps_its_sha256(name: str) -> None:
+    assert config_sha256(load_train_config(CONFIGS / f"{name}.yaml")) == SHA256_2A[name]
+
+
 def test_the_2a_config_sha256_is_unchanged_by_the_2b_keys() -> None:
     """The Phase 2a runs (``runs/ppo_s0``, seed 0) recorded this hash: the 2b keys
     (``env.waypoint_reward``, ``init``) are left out when unset, so 2a runs still export."""
@@ -648,6 +662,7 @@ INIT = {
         ({"from_runs": ["/abs/run"]}, "relative"),
         ({"from_runs": ["runs/../x"]}, "relative"),
         ({"from_runs": ["runs//x"]}, "relative"),
+        ({"from_runs": ["runs/.hidden"]}, "relative"),
         ({"from_runs": ["runs/a", "runs/a"]}, "repeat"),
         ({"from_runs": ["runs/a b"]}, "relative"),
         ({"step": 100}, "best"),
@@ -779,7 +794,7 @@ DERIVED: dict[str, tuple[str, dict[str, object]]] = {
                 "gate": "waypoint",
                 "max_saturation": None,
             },
-            "limits": {"max_wall_clock_s": 3600, "max_cpu_s": 7500, "max_tree_rss_mib": 8192},
+            "limits": {"max_wall_clock_s": 3600, "max_cpu_s": 7129, "max_tree_rss_mib": 8192},
         },
     ),
     # §8.8 arm (b): (a) plus init
