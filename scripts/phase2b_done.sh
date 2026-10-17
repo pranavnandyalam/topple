@@ -19,7 +19,7 @@ A="submissions/waypoint_pid_example.py submissions/anchors/creeper.py submission
 uv run --no-sync topple compare $A submissions/ppo_waypoint -p waypoint-v1/standard --seeds 0..399 --workers 4 --json out/wp_cal.json
 uv run --no-sync topple compare submissions/waypoint_pid_example.py submissions/ppo_waypoint -p waypoint-v1/clean --seeds 0..399 --workers 4 --json out/wp_clean.json
 uv run --no-sync topple compare submissions/waypoint_pid_example.py submissions/anchors/creeper.py submissions/ppo_waypoint -p wp_eval_v1 --workers 4 --json out/wp_eval.json
-uv run --no-sync pytest -m "not train" tests/test_golden.py tests/test_challenge.py tests/test_traj_v2.py tests/test_waypoint_verify.py tests/test_waypoint_driver.py "tests/test_shipped_policy.py::test_the_shipped_policy_loads_and_matches_its_fixture[ppo_waypoint]"
+uv run --no-sync pytest -m "not train" tests/test_golden.py tests/test_golden_waypoint.py tests/test_challenge.py tests/test_traj_v2.py tests/test_waypoint_verify.py tests/test_waypoint_driver.py "tests/test_shipped_policy.py::test_the_shipped_policy_loads_and_matches_its_fixture[ppo_waypoint]"
 unset UV_PROJECT_ENVIRONMENT
 K=$(uv run python -c 'import json;print(json.load(open("docs/results/phase2b.json"))["shipped"]["run"])')
 D=$(mktemp -d)/p2bx
