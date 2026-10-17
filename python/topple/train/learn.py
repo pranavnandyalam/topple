@@ -40,6 +40,7 @@ from topple.train.config import (
     MAX_TRAIN_META_BYTES,
     PpoTrainConfig,
     SacTrainConfig,
+    config_doc,
     config_sha256,
     lr_fn,
     validate_train_config,
@@ -53,6 +54,7 @@ from topple.train.selection import (
     run_flags,
     selection_protocol,
 )
+from topple.train.surgery import ExtendedInit, InitError, choose_source, extend_obs
 from topple.train.wrappers import make_train_env
 
 REPO = Path(__file__).resolve().parents[3]
@@ -96,6 +98,7 @@ def train(cfg: Config, out: Path, *, config_file_sha256: str) -> Path:
         if cfg.algo == "ppo"
         else EvalTrigger(cfg.selection.every_steps, cfg.total_timesteps)
     )
+    ext = _extended_init(cfg)  # before the baseline: a missing or unusable source fails fast
     sampler = ResourceSampler()
     sampler.start()
     vecnorm: Any = None
@@ -108,6 +111,8 @@ def train(cfg: Config, out: Path, *, config_file_sha256: str) -> Path:
             baseline_s = time.monotonic() - t0
             vecnorm = _vec_env(cfg)
             model = _model(cfg, vecnorm, out)
+            if ext is not None:
+                apply_init(model, vecnorm, ext)
             ctx = SelectionContext(
                 cfg=cfg,
                 out=out,
@@ -149,8 +154,37 @@ def train(cfg: Config, out: Path, *, config_file_sha256: str) -> Path:
         protocol_hash=protocol.protocol_hash(),
         bundle_hash=challenge.bundle_hash(),
         e_ref_j=e_ref_j,
+        init_source=None if ext is None else ext.source.to_json(),
     )
     return out
+
+
+def _extended_init(cfg: Config) -> ExtendedInit | None:
+    if cfg.algo != "ppo" or cfg.init is None:
+        return None
+    return extend_obs(cfg, choose_source(cfg.init, cfg.seed))
+
+
+def apply_init(model: Any, vecnorm: VecNormalize, ext: ExtendedInit) -> None:
+    """Load ``ext`` into a fresh PPO ``model`` (its optimizer stays fresh) and freeze
+    ``vecnorm``'s observation statistics at ``ext``'s (§8.8 steps 1-5)."""
+    state = model.policy.state_dict()
+    if set(state) != set(ext.state):
+        raise InitError(f"the policy's parameters {sorted(set(state) ^ set(ext.state))} differ")
+    for key, value in ext.state.items():
+        if tuple(state[key].shape) != value.shape:
+            raise InitError(f"{key}: shape {value.shape}, the policy has {tuple(state[key].shape)}")
+    tensors = {
+        key: torch.from_numpy(np.array(value, dtype=np.float32)) for key, value in ext.state.items()
+    }
+    model.policy.load_state_dict(tensors, strict=True)
+    rms: Any = vecnorm.obs_rms  # a RunningMeanStd for a Box observation space
+    if rms.mean.shape != ext.obs_mean.shape:
+        raise InitError(f"the env observes {rms.mean.shape}, the init {ext.obs_mean.shape}")
+    rms.mean = ext.obs_mean.copy()
+    rms.var = ext.obs_var.copy()
+    rms.count = ext.obs_count
+    vecnorm.training = False
 
 
 def _vec_env(cfg: Config) -> VecNormalize:
@@ -271,6 +305,7 @@ def _write_outputs(
     protocol_hash: str,
     bundle_hash: str,
     e_ref_j: float,
+    init_source: dict[str, Any] | None = None,
 ) -> None:
     history = ctx.history
     best = choose_best(history, ctx.challenge.kind)  # type: ignore[arg-type]
@@ -286,7 +321,7 @@ def _write_outputs(
     meta: dict[str, Any] = {
         "config_sha256": config_sha256(cfg),
         "config_file_sha256": config_file_sha256,
-        "config": cfg.model_dump(mode="json"),
+        "config": config_doc(cfg),
         "git_commit": commit,
         "git_dirty": dirty,
         "versions": _versions(),
@@ -314,6 +349,8 @@ def _write_outputs(
         "flags": [f for f in FLAGS if f in raised],
         "num_timesteps": num_timesteps,
     }
+    if init_source is not None:
+        meta["init_source"] = init_source
     data = (json.dumps(meta, indent=2, allow_nan=False) + "\n").encode("utf-8")
     if len(data) > MAX_TRAIN_META_BYTES:
         raise RuntimeError(f"train_meta.json is {len(data)} bytes: at most {MAX_TRAIN_META_BYTES}")
