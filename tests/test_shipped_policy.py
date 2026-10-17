@@ -1,10 +1,13 @@
-"""The shipped policy (docs/design/phase-2.md §6 ``test_shipped_policy``, §4 "Ubuntu evidence").
+"""The shipped policies (docs/design/phase-2.md §6 ``test_shipped_policy``, §4 "Ubuntu evidence",
+§8.9 items 9-10).
 
-``submissions/ppo_balance`` loads without torch, its parity fixture is bound to its
-``onnx.sha256`` and holds (batch 1, ≤ 1e-5, with ≥ 300 unsaturated and ≥ 32 saturated rows),
-and on eval_v1 it scores above PID. The eval_v1 ``results.json`` is written to
-``$TOPPLE_ARTIFACT_DIR`` when set: CI's ``python-slow`` job uploads it as the ubuntu evidence
-(G2-G4's ubuntu half, G8). Before a policy is shipped, the tests skip.
+``submissions/ppo_balance`` and ``submissions/ppo_waypoint`` load without torch, their parity
+fixtures are bound to their ``onnx.sha256`` and hold (batch 1, ≤ 1e-5, with ≥ 300 unsaturated
+and ≥ 32 saturated rows); on eval_v1 the balance policy scores above PID, and on wp_eval_v1 the
+waypoint policy above the creeper. Each ``results.json`` is written under
+``$TOPPLE_ARTIFACT_DIR`` when set (the waypoint one in ``waypoint/``): CI's ``python-slow`` job
+uploads it as the ubuntu evidence (G2-G4's ubuntu half, G8). Before a policy is shipped, its
+tests skip.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from topple.results import read_results
 pytestmark = pytest.mark.slow
 
 REPO = Path(__file__).resolve().parents[1]
-SHIPPED = {"ppo_balance": "balance-v1"}  # 2b adds ppo_waypoint
+SHIPPED = {"ppo_balance": "balance-v1", "ppo_waypoint": "waypoint-v1"}
 runner = CliRunner()
 
 
@@ -58,9 +61,9 @@ def test_the_shipped_policy_loads_and_matches_its_fixture(name: str) -> None:
     assert saturated >= MIN_SATURATED
 
 
-def _eval(sub: Path, out: Path) -> Path:
+def _eval(sub: Path, out: Path, protocol: str = "eval_v1") -> Path:
     done = runner.invoke(
-        app, ["eval", str(sub), "-p", "eval_v1", "--out", str(out), "--videos", "none"]
+        app, ["eval", str(sub), "-p", protocol, "--out", str(out), "--videos", "none"]
     )
     assert done.exit_code == 0, done.output
     return out / "results.json"
@@ -76,3 +79,15 @@ def test_the_shipped_balance_policy_beats_pid_on_eval_v1(tmp_path: Path) -> None
     assert ppo.controller.policy_sha256 is not None
     assert ppo.versions.onnxruntime is not None
     assert ppo.aggregate.score > pid.aggregate.score
+
+
+def test_the_shipped_waypoint_policy_beats_the_creeper_on_wp_eval_v1(tmp_path: Path) -> None:
+    sub = _shipped("ppo_waypoint")
+    artifacts = os.environ.get("TOPPLE_ARTIFACT_DIR")
+    out = Path(artifacts) / "waypoint" if artifacts else tmp_path / "ppo"
+    ppo = read_results(_eval(sub, out, "wp_eval_v1"))
+    creeper = REPO / "submissions" / "anchors" / "creeper.py"
+    base = read_results(_eval(creeper, tmp_path / "creeper", "wp_eval_v1"))
+    assert ppo.complete
+    assert ppo.controller.policy_sha256 is not None
+    assert ppo.aggregate.score > base.aggregate.score

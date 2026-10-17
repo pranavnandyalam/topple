@@ -51,7 +51,7 @@ from topple.compare import Comparison
 from topple.evaluate import EvalProtocol
 from topple.results import MAX_RESULTS_BYTES, Identifier, Sha256, VersionStr
 from topple.rng import MAX_SEED
-from topple.train.selection import NOT_SHIPPABLE, SelectionResult, rank_key
+from topple.train.selection import NOT_SHIPPABLE, Kind, SelectionResult, rank_key
 
 # --- gates ----------------------------------------------------------------------------------------
 
@@ -568,16 +568,15 @@ def printable(text: str, limit: int = 300) -> str:
 # --- §2.5 shipping --------------------------------------------------------------------------------
 
 
-def candidates(runs: Sequence[RunCore]) -> list[str]:
-    """§2.5's shipping candidates: PPO runs whose best checkpoint is eligible and that carry no
-    abort flag and no ``nondeterministic``, best first by their best's ``rank_key`` on the
-    selection seeds (never on 0..199); a tie keeps the listed order."""
+def candidates(runs: Sequence[RunCore], *, kind: Kind = "balance") -> list[str]:
+    """§2.5's (and §8.8's) shipping candidates: PPO runs whose best checkpoint is eligible and
+    that carry no abort flag and no ``nondeterministic``, best first by their best's ``kind``
+    ``rank_key`` on the selection seeds (never on the fresh seeds); a tie keeps the listed
+    order."""
     eligible = [
         r for r in runs if r.algo == "ppo" and r.best.eligible and not set(r.flags) & NOT_SHIPPABLE
     ]
-    ranked = sorted(
-        eligible, key=lambda r: rank_key(r.best_row().result(), "balance"), reverse=True
-    )
+    ranked = sorted(eligible, key=lambda r: rank_key(r.best_row().result(), kind), reverse=True)
     return [r.run for r in ranked]
 
 
