@@ -1504,6 +1504,23 @@ def test_candidates_are_eligible_clean_ppo_runs_by_selection_rank(good: GoodSet)
     assert common.candidates(ppo_only) == ["ppo_s0", "ppo_s2"]
 
 
+def test_waypoint_candidates_rank_by_the_waypoint_key(good: GoodSet) -> None:
+    """§8.8: the 2b candidates use the waypoint ``rank_key``: a score and success tie goes to the
+    faster median finish; a best row without ``median_t_finish_s`` is refused."""
+    doc = good.doc()
+    for run, t in (("ppo_s0", 11.0), ("ppo_s1", 9.0), ("ppo_s2", 10.0)):
+        for row in runs_of(doc)[run]["selection_history"]:
+            row["score"], row["success_rate"] = 80.0, 0.9
+            row["extras"] = {"median_t_finish_s": t}
+    ppo_only = [c for c in cores(doc) if c.run in PPO_RUNS]
+    assert common.candidates(ppo_only, kind="waypoint") == ["ppo_s1", "ppo_s2", "ppo_s0"]
+    assert common.candidates(ppo_only) == ["ppo_s0", "ppo_s1", "ppo_s2"]  # balance: listed order
+    for row in runs_of(doc)["ppo_s0"]["selection_history"]:
+        row["extras"] = {}
+    with pytest.raises(ValueError, match="median_t_finish_s"):
+        common.candidates([c for c in cores(doc) if c.run in PPO_RUNS], kind="waypoint")
+
+
 def test_the_section_2_5_fallback_ships_the_next_candidate_on_a_g2b_only_failure(
     good: GoodSet,
 ) -> None:

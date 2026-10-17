@@ -4,7 +4,7 @@ This file moves work between Claude Code sessions (local Mac ⇄ cloud at claude
 **Whoever stops working must update it, commit it and push before stopping.** Nothing else
 carries over: local memory, scratch files and workflow scripts stay on the machine that made them.
 
-Last updated: 2026-10-16 by the local Mac session. Branch `phase-2-learn` is pushed; PR #4 (Phase 2a)
+Last updated: 2026-10-17 ~14:40 by the local Mac session (Phase 2b gate fixes done; done script + merge next). Branch `phase-2-learn` is pushed; PR #4 (Phase 2a)
 is open. The training runs live only on the Mac, in `runs/` (gitignored; the shipped run is
 `runs/ppo_s2`, needed by `phase2_done.sh`'s re-export check).
 
@@ -20,15 +20,25 @@ is open. The training runs live only on the Mac, in `runs/` (gitignored; the shi
 | Linux recalibration | E_ref **13.1 J** on linux-x86_64 (the calibration platform); darwin goldens re-pinned (`07681c8`) |
 | Direction update | `PLAN.md` section 0 (2026-10-11): workbench for people's own robot projects, Studio, Arena with FRC drive practice, revised build order |
 | Deferred risks | `docs/design/deferred-risks.md` |
+| **Phase 2a** | **Merged to `main` as 386df1e (PR #4)** |
+| **Phase 2b (waypoint-v1)** | **Built; done-when run and review gate next.** Branch `phase-2b-waypoint` (pushed). Slices 1-3, fine-tune init, pilot (`3654537`); 6 seed runs in `../p2-train` at `3654537` (copied into `runs/`); shipped `submissions/ppo_waypoint` = `ppo_wpft_s1` (fine-tune, step 5,505,024; `1e2bd5d`); compare files carry waypoint extras (`5a65204`); results, gate, done script, course video (`4159c5f`); contract + media (`09367b3`); waypoint goldens (`0b6bc5d`). Fresh standard 0..399: shipped 79.23 vs driver 80.24 (paired −1.02 [−3.35, +1.21]), docked 81%, fell 19%; item 6: 5 of 6 runs pass (`ppo_wp_s1` fails, lo −5.11). Headline: first eligible at a median 3.01M in both arms; fine-tune +5.01M pretraining. Energy: fine-tune 1.03× driver, scratch 2.72×. Item 7 survival 1.0 ×3. Linux anchors match darwin within 0.25 |
 | Phase 3 design inputs | Branch `phase-3-design` (draft + critiques, not yet revised). Never merge it wholesale |
 
 ## Next steps, in order
 
-1. Finish the Phase 2a review-gate fixes (B54: canonical metadata text, G9 push runs only, retry
-   chain, test gaps), push, CI green, re-run `phase2_done.sh`, **squash-merge PR #4**.
-2. **Phase 2b** (waypoint-v1, `topple.traj/2`, spec §8): build in slices in the main session
-   (working mode below), pass the challenge kind to `choose_best` (B52 note), its own done-when
-   (§8.9) and review gate.
+1. **Phase 2b next: run the done script, then squash-merge PR #9.** The review gate (run
+   wf_a21d6525-01f) passed done-when from a fresh clone. Its one HIGH (`run_versions` schema,
+   `7536b81`) and every MEDIUM are fixed (`7ab9e4d`..`95b1226`), as is most of the LOW list.
+   The evidence was regenerated (`77c0a70`, linux anchors `b3b45f6`; scores unchanged). A
+   re-review found the gate trusted derived fields and the runs files; that's fixed in
+   `ee7434f`. `fall_cause` was added to balance-v1 per Pranav's "you decide" (`7f59f3e`;
+   2a evidence and gate unaffected). To finish:
+   - Wait for CI green on HEAD, run `scripts/phase2b_done.sh` (exit 0 expected), then
+     `gh pr merge 9 --squash`.
+   - Open LOW, accepted for now: `waypoint_media.json` names the policy and seeds but not the
+     media bytes. Possible follow-up: record each file's sha256 and re-render in the done script.
+   - Note: the CI python job takes about 16 min (it took 7 min before 2b); the timeout is 30.
+2. Usage: Pranav asked to stop at 55% weekly (2026-10-17). Pause at 97% of the 5-hour window.
 3. Then PLAN.md section 0's build order (Studio, your own robot, test scenarios, Arena, ...), and
    revise the Phase 3 design as a short design note.
 

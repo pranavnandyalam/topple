@@ -6,6 +6,8 @@
 | `random_example.py` | random commands drawn from the episode's `rng_seed` |
 | `pid_example.py` | cascaded PID baseline (`topple/controllers/pid.py`) |
 | `lqr_example.py` | LQR baseline designed from the simulator (`topple/controllers/lqr.py`) |
+| `waypoint_pid_example.py` | waypoint-v1 reference driver (`topple/controllers/waypoint_pid.py`) |
+| `anchors/*.py` | waypoint-v1 degenerate-strategy anchors (`topple/controllers/anchors.py`) |
 
 ## The contract in 10 lines
 

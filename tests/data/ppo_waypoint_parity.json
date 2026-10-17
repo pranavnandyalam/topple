@@ -1,0 +1,10 @@
+{
+  "onnx_sha256": "f3a05d71b891969a2e7e6f532c79a2400fcdeddce3777d9ded612c7c2cf0cb70",
+  "n": 2094,
+  "d": 15,
+  "a": 2,
+  "tolerance": 1e-05,
+  "n_unsaturated": 1129,
+  "n_saturated": 959,
+  "policy_sha256": "f3a05d71b891969a2e7e6f532c79a2400fcdeddce3777d9ded612c7c2cf0cb70"
+}

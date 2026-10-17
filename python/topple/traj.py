@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
@@ -27,9 +27,13 @@ from topple._inputs import open_regular
 from topple._npz import MAX_NPY_HEADER_BYTES as MAX_NPY_HEADER_BYTES
 from topple._npz import read_member
 from topple._zip import Archive
-from topple.contract import BALANCE_V1_ACTION, FEATURES
+from topple.contract import BALANCE_V1_ACTION, FEATURES, OBS_SCHEMA_ID
 
 FORMAT = "topple.traj/1"
+FORMAT_V2 = "topple.traj/2"
+"""Every challenge whose ``obs_schema`` is not ``balancer.obs.v1`` (docs/design/phase-2.md
+§8.1a, contract §14a): ``/1`` with an ``obs`` of any width 1..``MAX_OBS_WIDTH``."""
+MAX_OBS_WIDTH = 64
 MAX_FILE_BYTES = 32 * 1024 * 1024
 """Largest trajectory file ``load_npz`` opens (an honest balance-v1 file is about 0.2 MB)."""
 MAX_DIRECTORY_BYTES = 16 * 1024
@@ -56,6 +60,36 @@ _SCHEMA: dict[str, tuple[str, tuple[int, ...] | None]] = {
 }
 _STATE = ("qpos", "qvel")
 _MEMBERS = frozenset({f"{n}.npy" for n in _SCHEMA} | {f"{META}.npy"})
+
+
+@dataclass(frozen=True)
+class TrajLayout:
+    """What a trusted caller expects of a trajectory file: its format and ``obs`` width, derived
+    from the protocol's challenge, never from the file (§8.1a)."""
+
+    format: str
+    obs_width: int
+
+    def __post_init__(self) -> None:
+        if self.format not in (FORMAT, FORMAT_V2):
+            raise ValueError(f"unknown trajectory format {self.format!r}")
+        if type(self.obs_width) is not int or not 1 <= self.obs_width <= MAX_OBS_WIDTH:
+            raise ValueError(f"obs_width must be an int in 1..{MAX_OBS_WIDTH}")
+        if self.format == FORMAT and self.obs_width != len(FEATURES):
+            raise ValueError(f"{FORMAT} has {len(FEATURES)} obs columns")
+
+
+TRAJ_V1 = TrajLayout(FORMAT, len(FEATURES))
+
+
+def traj_format(meta: Mapping[str, Any]) -> str:
+    """The format rule (§8.1a): ``/2`` iff ``meta`` has an ``obs_schema`` that is not exactly
+    ``balancer.obs.v1``. ``meta`` is touched only with ``in``, ``isinstance`` and ``==``, so a
+    forged meta still constructs (and then fails verification)."""
+    if "obs_schema" not in meta:
+        return FORMAT
+    schema = meta["obs_schema"]
+    return FORMAT if isinstance(schema, str) and schema == OBS_SCHEMA_ID else FORMAT_V2
 
 
 def _frozen(arr: npt.ArrayLike, dtype: str) -> npt.NDArray[Any]:
@@ -100,8 +134,17 @@ class Trajectory:
                 raise ValueError(
                     f"{name} must have at most {MAX_STATE_DIM} columns, got shape {arr.shape}"
                 )
+        width = self.obs.shape[1] if self.obs.ndim == 2 else -1
+        if traj_format(self.meta) == FORMAT:
+            if self.obs.shape != (t, len(FEATURES)):
+                raise ValueError(f"obs must have shape {(t, len(FEATURES))}, got {self.obs.shape}")
+        elif self.obs.ndim != 2 or self.obs.shape[0] != t or not 1 <= width <= MAX_OBS_WIDTH:
+            raise ValueError(
+                f"obs must have shape (T={t}, D) with 1 <= D <= {MAX_OBS_WIDTH} in {FORMAT_V2}, "
+                f"got {self.obs.shape}"
+            )
         for name, (_, trailing) in _SCHEMA.items():
-            if trailing is None:
+            if trailing is None or name == "obs":
                 continue
             arr = getattr(self, name)
             if arr.shape != (t, *trailing):
@@ -116,7 +159,7 @@ class Trajectory:
         """Write the trajectory to ``path`` atomically (contract §14): through a new temporary
         file, mode 0644, renamed over ``path``, so a symlink at ``path`` is replaced, never
         written through, and a failed write leaves ``path`` as it was."""
-        meta = {"format": FORMAT, **self.meta}
+        meta = {"format": traj_format(self.meta), **self.meta}
         arrays = {name: getattr(self, name) for name in _SCHEMA}
         arrays["meta_json"] = np.frombuffer(
             json.dumps(meta, sort_keys=True).encode("utf-8"), dtype=np.uint8
@@ -128,7 +171,7 @@ class Trajectory:
             np.savez_compressed(fh, **arrays)
 
 
-def load_npz(path: Path, *, max_steps: int) -> Trajectory:
+def load_npz(path: Path, *, max_steps: int, layout: TrajLayout = TRAJ_V1) -> Trajectory:
     """Load and validate an untrusted trajectory file (contract §14).
 
     Nothing is unpickled or evaluated, and nothing is allocated beyond what the format allows:
@@ -138,10 +181,17 @@ def load_npz(path: Path, *, max_steps: int) -> Trajectory:
     E at most ``max_steps``, state widths at most ``MAX_STATE_DIM``, ``meta_json`` at most
     ``MAX_META_BYTES``) before any of its data is read. Any problem (including an unreadable or
     missing file) raises ``ValueError``; ``max_steps`` is required.
+
+    ``layout`` (§8.1a) is the protocol's: the ``obs`` header's width must be ``obs_width`` before
+    its data is read, and ``meta.format`` must be ``layout.format``; a ``/2`` file's
+    ``meta.obs_features`` must name exactly ``obs_width`` features. The default fails closed on
+    a waypoint file.
     """
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
         raise ValueError(f"max_steps must be a non-negative int, got {max_steps!r}")
-    return _guarded(path, lambda: _build(path, max_steps))
+    if not isinstance(layout, TrajLayout):
+        raise ValueError("layout must be a TrajLayout")
+    return _guarded(path, lambda: _build(path, max_steps, layout))
 
 
 def read_meta(path: Path) -> dict[str, Any]:
@@ -182,15 +232,26 @@ def _open_members(path: Path) -> Iterator[Archive]:
         )
 
 
-def _build(path: Path, max_steps: int) -> Trajectory:
+def _build(path: Path, max_steps: int, layout: TrajLayout) -> Trajectory:
     with _open_members(path) as archive:
         arrays = {
             name: read_member(
-                archive, name, np.dtype(dtype), partial(_array_limits, name, max_steps=max_steps)
+                archive,
+                name,
+                np.dtype(dtype),
+                partial(_array_limits, name, max_steps=max_steps, obs_width=layout.obs_width),
             )
             for name, (dtype, _) in _SCHEMA.items()
         }
-        meta = _read_meta_member(archive)
+        meta = _read_meta_member(archive, formats=(layout.format,))
+    if layout.format == FORMAT_V2:
+        features = meta.get("obs_features")
+        if not (
+            isinstance(features, list)
+            and len(features) == layout.obs_width
+            and all(isinstance(f, str) for f in features)
+        ):
+            raise ValueError(f"meta.obs_features must name exactly {layout.obs_width} features")
     return Trajectory(**arrays, meta=meta)
 
 
@@ -199,11 +260,15 @@ def _read_meta_only(path: Path) -> dict[str, Any]:
         return _read_meta_member(archive)
 
 
-def _read_meta_member(archive: Archive) -> dict[str, Any]:
-    return _parse_meta(read_member(archive, META, np.dtype("|u1"), _meta_limits))
+def _read_meta_member(
+    archive: Archive, formats: tuple[str, ...] = (FORMAT, FORMAT_V2)
+) -> dict[str, Any]:
+    return _parse_meta(read_member(archive, META, np.dtype("|u1"), _meta_limits), formats)
 
 
-def _array_limits(name: str, shape: tuple[int, ...], *, max_steps: int) -> None:
+def _array_limits(
+    name: str, shape: tuple[int, ...], *, max_steps: int, obs_width: int = len(FEATURES)
+) -> None:
     """Refuse an array header beyond the format's limits (§14) before its data is read.
 
     Rows: T+1 <= max_steps+1 for ``qpos``/``qvel``, T <= max_steps for the per-step arrays and
@@ -213,7 +278,7 @@ def _array_limits(name: str, shape: tuple[int, ...], *, max_steps: int) -> None:
     if len(shape) != 2:
         raise ValueError(f"{name} must be 2-D, got header shape {shape}")
     rows, width = shape
-    trailing = _SCHEMA[name][1]
+    trailing = (obs_width,) if name == "obs" else _SCHEMA[name][1]
     if name == "epilogue_qpos":
         if rows > max_steps:
             raise ValueError(f"epilogue_qpos has {rows} rows, more than {max_steps}")
@@ -251,7 +316,7 @@ def _finite_float(literal: str) -> float:
     return value
 
 
-def _parse_meta(raw: npt.NDArray[Any]) -> dict[str, Any]:
+def _parse_meta(raw: npt.NDArray[Any], formats: tuple[str, ...] = (FORMAT,)) -> dict[str, Any]:
     if raw.ndim != 1:
         raise ValueError("meta_json must be a 1-D uint8 array")
     try:
@@ -266,7 +331,7 @@ def _parse_meta(raw: npt.NDArray[Any]) -> dict[str, Any]:
         raise
     except ValueError as exc:
         raise ValueError(f"meta_json is not valid UTF-8 JSON: {exc}") from exc
-    if not isinstance(meta, dict) or meta.get("format") != FORMAT:
-        raise ValueError(f"meta_json: not a {FORMAT} file")
+    if not isinstance(meta, dict) or meta.get("format") not in formats:
+        raise ValueError(f"meta_json: not a {' or '.join(formats)} file")
     meta.pop("format")
     return meta

@@ -12,11 +12,15 @@ import math
 import numbers
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from topple.course import Course, CourseConfig, make_course
 from topple.rng import Stream, stream_rng, validate_seed
+
+if TYPE_CHECKING:
+    from topple.challenge import Challenge
 
 MAX_PUSHES = 3  # the PUSHES stream always draws this many candidates (fixed consumption)
 MAX_PUSH_FORCE_N = 50.0  # contract §10: no push is ever stronger than this
@@ -151,10 +155,12 @@ class Scenario:
     model: ModelOverrides
     sensors: SensorOffsets
     init_pitch_rate_rads: float = 0.0  # nonzero only for injected states (fuzzer, RoA maps)
+    course: Course | None = None  # waypoint challenges: the accepted course draws (§8.3)
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON data (a new dict: editing it never reaches this frozen scenario)."""
-        return {
+        """JSON data (a new dict: editing it never reaches this frozen scenario). ``course`` is
+        written only when there is one, so balance scenarios keep their key set."""
+        data: dict[str, Any] = {
             "seed": self.seed,
             "preset": self.preset,
             "init_pitch_rad": self.init_pitch_rad,
@@ -163,9 +169,14 @@ class Scenario:
             "model": {**vars(self.model), "motor_gain": list(self.model.motor_gain)},
             "sensors": {**vars(self.sensors), "gyro_bias_rads": list(self.sensors.gyro_bias_rads)},
         }
+        if self.course is not None:
+            data["course"] = self.course.to_dict()
+        return data
 
     @classmethod
-    def from_dict(cls, data: Any, *, clock: EpisodeClock | None = None) -> Scenario:
+    def from_dict(
+        cls, data: Any, *, clock: EpisodeClock | None = None, challenge: Challenge | None = None
+    ) -> Scenario:
         """Parse and validate a scenario from JSON data; any problem raises ``ValueError``.
 
         Checks key sets (string keys only), types, that every number fits a float (integers
@@ -173,9 +184,14 @@ class Scenario:
         with no two at the same step. With the env's ``clock`` (``BalanceEnv.reset`` passes
         it), every push must also start inside the episode, last no longer than it, deliver at
         most ``MAX_PUSH_IMPULSE_NS`` and end before the next one starts.
+
+        With ``challenge`` (docs/design/phase-2.md §8.1), the preset must be one of its presets
+        (its own definitions included) and the scenario holds a course exactly when the
+        challenge has one, checked against its ``CourseConfig``; without it, only ``PRESETS``
+        names and no course (Phase 1's rule).
         """
         try:
-            scenario = _parse_scenario(data)
+            scenario = _parse_scenario(data, challenge)
             validate_scenario(scenario, clock=clock)
         except (TypeError, OverflowError) as exc:  # a case the checks above missed: still bad data
             raise ValueError(f"{_INVALID}{type(exc).__name__}: {exc}") from exc
@@ -269,15 +285,19 @@ def _parse_sensors(data: object) -> SensorOffsets:
     )
 
 
-def _parse_scenario(data: object) -> Scenario:
-    d = _mapping("scenario", data, _SCENARIO_KEYS)
+def _parse_scenario(data: object, challenge: Challenge | None = None) -> Scenario:
+    course_cfg = None if challenge is None else challenge.config.course
+    keys = _SCENARIO_KEYS | {"course"} if course_cfg is not None else _SCENARIO_KEYS
+    d = _mapping("scenario", data, keys)
     pushes = d["pushes"]
     if isinstance(pushes, (str, bytes)) or not isinstance(pushes, Sequence):
         raise ValueError("pushes must be a list")
     preset = d["preset"]
-    if not isinstance(preset, str) or preset not in PRESETS:
+    names = PRESETS if challenge is None else challenge.config.presets
+    if not isinstance(preset, str) or preset not in names:
         raise ValueError(f"unknown preset {preset!r}")
     seed = validate_seed(d["seed"])
+    course = None if course_cfg is None else Course.from_dict(d["course"], course_cfg)
     return Scenario(
         seed=seed,
         preset=preset,
@@ -286,6 +306,7 @@ def _parse_scenario(data: object) -> Scenario:
         pushes=tuple(_parse_push(i, p) for i, p in enumerate(pushes)),
         model=_parse_model(d["model"]),
         sensors=_parse_sensors(d["sensors"]),
+        course=course,
     )
 
 
@@ -367,6 +388,38 @@ def check_initial_state(pitch_rad: float, pitch_rate_rads: float) -> None:
     _check_range("init_pitch_rate_rads", pitch_rate_rads, -limit, limit)
 
 
+def check_preset_bounds(preset: Preset) -> None:
+    """Raise ``ValueError`` unless every scenario ``preset`` can draw lies inside the bounds
+    ``Scenario.from_dict`` enforces (contract §9, §10): a bundle-defined preset (§8.1) is checked
+    when its challenge loads, so the env never draws a scenario its own parser refuses."""
+    r = preset.randomization
+
+    def inside(name: str, rng: tuple[float, float], low: float, high: float) -> None:
+        if not (low <= rng[0] <= rng[1] <= high):
+            raise ValueError(f"preset {preset.name!r}: {name} {rng} is outside [{low}, {high}]")
+
+    inside("mass_scale", r.mass_scale, *SCALE_BOUNDS)
+    inside("wheel_friction_scale", r.wheel_friction_scale, *SCALE_BOUNDS)
+    lo = r.motor_gain_common[0] * r.motor_gain_per_wheel[0]
+    hi = r.motor_gain_common[1] * r.motor_gain_per_wheel[1]
+    inside("motor gain", (lo, hi), *SCALE_BOUNDS)
+    inside("frictionloss_scale", r.frictionloss_scale, *FRICTIONLOSS_SCALE_BOUNDS)
+    inside("com_x_offset_m", r.com_x_offset_m, -MAX_COM_X_OFFSET_M, MAX_COM_X_OFFSET_M)
+    delays = (min(r.actuator_delay_ms) / 1000.0, max(r.actuator_delay_ms) / 1000.0)
+    inside("actuator_delay", delays, 0.0, MAX_ACTUATOR_DELAY_S)
+    inside(
+        "imu_pitch_offset_rad",
+        r.imu_pitch_offset_rad,
+        -MAX_IMU_PITCH_OFFSET_RAD,
+        MAX_IMU_PITCH_OFFSET_RAD,
+    )
+    inside("gyro_bias_rads", r.gyro_bias_rads, -MAX_GYRO_BIAS_RADS, MAX_GYRO_BIAS_RADS)
+    inside("init_pitch_rad", r.init_pitch_rad, -MAX_INIT_PITCH_RAD, MAX_INIT_PITCH_RAD)
+    if preset.pushes is not None:
+        inside("impulse_ns", preset.pushes.impulse_ns, 0.0, MAX_PUSH_IMPULSE_NS)
+        inside("lateral_fraction_max", (0.0, preset.pushes.lateral_fraction_max), 0.0, 1.0)
+
+
 def validate_scenario(scenario: Scenario, *, clock: EpisodeClock | None = None) -> None:
     """Raise ``ValueError`` unless ``scenario`` is inside the contract's sane bounds (§9);
     with the env's ``clock``, its pushes must also fit the episode."""
@@ -432,9 +485,16 @@ def _draw_pushes(
 
 
 def make_scenario(
-    seed: int, preset: Preset, *, timestep: float, control_dt: float, episode_seconds: float
+    seed: int,
+    preset: Preset,
+    *,
+    timestep: float,
+    control_dt: float,
+    episode_seconds: float,
+    course: CourseConfig | None = None,
 ) -> Scenario:
-    """Draw an episode's scenario from named streams (independent of each other)."""
+    """Draw an episode's scenario from named streams (independent of each other); with a
+    ``course`` config (waypoint challenges), also the course from the TARGETS stream."""
     validate_seed(seed)
     r = preset.randomization
     init_pitch = _uniform(stream_rng(seed, Stream.INIT), r.init_pitch_rad)
@@ -479,6 +539,7 @@ def make_scenario(
         pushes=pushes,
         model=model,
         sensors=sensors,
+        course=None if course is None else make_course(seed, course),
     )
 
 

@@ -273,3 +273,24 @@ def test_make_train_env_with_sb3s_monitor() -> None:
         assert layers(env) == [TrainingSeeds, ActionExcessPenalty, Monitor, BalanceEnv]
     finally:
         env.close()
+
+
+@pytest.mark.usefixtures("stub_sb3")
+def test_make_train_env_builds_the_waypoint_env() -> None:
+    """§8.8: a waypoint config trains on ``WaypointEnv`` with its reward weights."""
+    from topple.envs.waypoint import WaypointEnv, WaypointRewardConfig
+
+    cfg = load_train_config(CONFIGS / "ppo_waypoint.yaml")
+    assert cfg.env.waypoint_reward is not None
+    env = make_train_env(cfg, 0)
+    try:
+        assert layers(env) == [TrainingSeeds, ActionExcessPenalty, StubMonitor, WaypointEnv]
+        inner = env.unwrapped
+        assert isinstance(inner, WaypointEnv)
+        assert inner.waypoint_reward == WaypointRewardConfig(**cfg.env.waypoint_reward.model_dump())
+        assert inner.max_drift_m == 2.5
+        assert inner.record is False
+        obs, _ = env.reset()
+        assert obs.shape == (15,)
+    finally:
+        env.close()

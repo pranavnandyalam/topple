@@ -23,7 +23,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Final, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal
 
 from pydantic import (
     AfterValidator,
@@ -61,6 +61,8 @@ it bounds ``selection_history`` and ``gate_baseline`` so that ``train_meta.json`
 MAX_SELECTION_SEEDS: Final = 250
 """Most selection seeds (every config uses 200; smoke 2): ``gate_baseline`` keeps one score per
 seed for each baseline in ``train_meta.json``."""
+GATES_OF_KIND: Final = {"balance": ("pid", "none"), "waypoint": ("waypoint", "none")}
+"""The selection gates each challenge kind takes (``none``: the smoke configs)."""
 MAX_MESSAGES: Final = 8
 MAX_LOC_CHARS: Final = 96
 _PRESET_CHARS: Final = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_")
@@ -209,6 +211,17 @@ ActionExcess = Annotated[
 ]
 
 
+class WaypointRewardWeights(_Frozen):
+    """§8.8's waypoint training reward (not frozen; never part of a score)."""
+
+    balance_scale: Annotated[float, Field(ge=0.0, le=10.0)]
+    progress: Annotated[float, Field(ge=0.0, le=1000.0)]
+    gate: Annotated[float, Field(ge=0.0, le=1000.0)]
+    dock: Annotated[float, Field(ge=0.0, le=1000.0)]
+    terminated: Annotated[float, Field(ge=-1000.0, le=0.0)]
+    dock_hold: Annotated[float, Field(ge=0.0, le=10.0)]
+
+
 class EnvConfig(_Frozen):
     """The training env: the challenge's env class on ``preset`` with the training-only
     ``reward`` and ``max_drift_m`` termination (§2.1)."""
@@ -218,17 +231,23 @@ class EnvConfig(_Frozen):
     max_drift_m: Annotated[float, Field(gt=0.0, le=100.0)]
     reward: RewardWeights
     action_excess: ActionExcess
+    waypoint_reward: WaypointRewardWeights | None = None
+    """Required exactly for a waypoint challenge (§8.8)."""
 
     @model_validator(mode="after")
     def _known(self) -> EnvConfig:
         from topple.challenge import load_challenge
 
         try:
-            presets = load_challenge(self.challenge).config.presets
+            challenge = load_challenge(self.challenge)
         except (OSError, ValueError):
             raise ValueError(f"there is no challenge {self.challenge!r}") from None
-        if self.preset not in presets:
+        if self.preset not in challenge.config.presets:
             raise ValueError(f"{self.challenge} has no preset {self.preset!r}")
+        if (challenge.kind == "waypoint") != (self.waypoint_reward is not None):
+            raise ValueError(
+                "env.waypoint_reward is required for, and only for, a waypoint challenge"
+            )
         return self
 
 
@@ -364,6 +383,49 @@ class HealthConfig(_Frozen):
     regression_drop: Rate
 
 
+MAX_INIT_RUNS: Final = 8
+_RUN_PATH_CHARS: Final = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-/"
+)
+
+
+def _run_path(value: str) -> str:
+    """A run directory relative to the working directory: no absolute path, no ``..``, no
+    empty component, letters, digits and ``_.-/`` only."""
+    parts = value.split("/")
+    if (
+        not value
+        or not set(value) <= _RUN_PATH_CHARS
+        or value.startswith("/")
+        or any(not part or part.startswith(".") for part in parts)
+    ):
+        raise ValueError("a run path is relative, with no empty component or one starting '.'")
+    return value
+
+
+RunPath = Annotated[str, Field(max_length=200), AfterValidator(_run_path)]
+
+
+class InitConfig(_Frozen):
+    """§8.8's fine-tune init (``surgery.extend_obs``): seed k starts from ``from_runs[k mod n]``
+    at its ``best.json`` step, or the next run whose best step is eligible with no abort flag;
+    ``zero_inputs`` are the source features whose first-layer columns are zeroed, and the
+    policy's ``log_std`` restarts at ``log_std``."""
+
+    from_runs: Annotated[tuple[RunPath, ...], Field(min_length=1, max_length=MAX_INIT_RUNS)]
+    step: Literal["best"]
+    zero_inputs: Annotated[tuple[Annotated[int, Field(ge=0, lt=64)], ...], Field(max_length=64)]
+    log_std: Annotated[float, Field(ge=-10.0, le=2.0)]
+
+    @model_validator(mode="after")
+    def _unique(self) -> InitConfig:
+        if len(set(self.from_runs)) != len(self.from_runs):
+            raise ValueError("init.from_runs must not repeat a run")
+        if list(self.zero_inputs) != sorted(set(self.zero_inputs)):
+            raise ValueError("init.zero_inputs must be strictly increasing")
+        return self
+
+
 # --- the config ---------------------------------------------------------------------------------
 
 
@@ -387,6 +449,15 @@ class _Common(_Frozen):
                 f"selection.protocol must be a {self.env.challenge} protocol, "
                 "the challenge the policy is trained on"
             )
+        from topple.challenge import load_challenge
+
+        kind = load_challenge(self.env.challenge).kind
+        allowed = GATES_OF_KIND[kind]
+        if self.selection.gate not in allowed:
+            raise ValueError(
+                f"selection.gate {self.selection.gate!r} does not fit a {kind} challenge "
+                f"(one of {', '.join(allowed)})"
+            )
         evals = self.total_timesteps // self.selection.every_steps
         if evals > MAX_SELECTION_EVALS:
             raise ValueError(
@@ -401,11 +472,18 @@ class PpoTrainConfig(_Common):
     policy: PpoPolicy
     ppo: PpoParams
     health: HealthConfig | None = None
+    init: InitConfig | None = None
+    """A fine-tune from balance runs (§8.8): only for a waypoint challenge."""
 
     @model_validator(mode="after")
     def _rollout(self) -> PpoTrainConfig:
         if self.ppo.batch_size > self.ppo.n_steps * self.n_envs:
             raise ValueError("ppo.batch_size must not exceed ppo.n_steps * n_envs (one rollout)")
+        if self.init is not None and self.env.waypoint_reward is None:
+            raise ValueError("init extends a balance policy to a waypoint challenge only")
+        if self.init is not None and self.normalize.reward:
+            # apply_init freezes VecNormalize (training=False), which also freezes ret_rms
+            raise ValueError("init freezes VecNormalize, so normalize.reward must be false")
         return self
 
 
@@ -453,7 +531,7 @@ def parse_train_config(data: bytes, *, seed: int | None = None) -> PpoTrainConfi
         return cfg
     if isinstance(seed, bool) or not isinstance(seed, int):
         raise ConfigError("--seed must be an int")
-    return validate_train_config({**cfg.model_dump(mode="json"), "seed": seed})
+    return validate_train_config({**config_doc(cfg), "seed": seed})
 
 
 def validate_train_config(raw: object) -> PpoTrainConfig | SacTrainConfig:
@@ -472,10 +550,22 @@ def validate_train_config(raw: object) -> PpoTrainConfig | SacTrainConfig:
         raise ConfigError(_describe(exc)) from None
 
 
+def config_doc(cfg: PpoTrainConfig | SacTrainConfig) -> dict[str, Any]:
+    """The config as plain data, as ``train_meta.json`` records it. The keys added in 2b
+    (``env.waypoint_reward``, ``init``) are left out when unset, so a balance config keeps the
+    document, and so the ``config_sha256``, it had before them (the Phase 2a runs)."""
+    doc = cfg.model_dump(mode="json")
+    if doc["env"].get("waypoint_reward") is None:
+        doc["env"] = {k: v for k, v in doc["env"].items() if k != "waypoint_reward"}
+    if doc.get("init", 0) is None:
+        doc = {k: v for k, v in doc.items() if k != "init"}
+    return doc
+
+
 def config_sha256(cfg: PpoTrainConfig | SacTrainConfig) -> str:
-    """sha256 of the effective config's canonical JSON (keys sorted, no spaces): the same for
-    any key order in the file, different for every ``--seed``."""
-    text = json.dumps(cfg.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    """sha256 of the effective config's canonical JSON (``config_doc``; keys sorted, no
+    spaces): the same for any key order in the file, different for every ``--seed``."""
+    text = json.dumps(config_doc(cfg), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 

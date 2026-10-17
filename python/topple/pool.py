@@ -50,9 +50,9 @@ import numpy as np
 import numpy.typing as npt
 
 from topple.disturbances import Push, check_push_schedule
-from topple.envs.balance import BalanceEnv
 from topple.evaluate import ControllerFactory, EpisodeRun, EvalProtocol, run_episode
 from topple.ids import validate_challenge_id
+from topple.kinds import make_env
 from topple.loader import Submission, load_submission
 from topple.policy.manifest import HEX64
 from topple.policy.validate import MAX_ONNX_BYTES
@@ -283,7 +283,7 @@ def _run[T](
     """``keep`` of each of the checked episodes, in order, on one env; the controller is rebuilt
     (its sha256 re-checked) before the first episode."""
     factory = worker_factory(ref)
-    env = BalanceEnv(protocol.preset, challenge=protocol.challenge, record=True)
+    env = make_env(protocol.challenge, protocol.preset, record=True)
     try:
         return [
             keep(

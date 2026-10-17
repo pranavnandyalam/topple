@@ -1,0 +1,25 @@
+# PPO on waypoint-v1 fine-tuned from the Phase 2a balance runs (docs/design/phase-2.md §8.8 arm b):
+# ppo_waypoint.yaml plus init (surgery.extend_obs); the LR schedule restarts at 3e-4.
+algo: ppo
+seed: 0                     # runs use --seed 0, 1, 2
+total_timesteps: 6_000_000  # adopted reward plateaued by 3M (pilot); the §8.8 budget rule may raise it to 8M
+n_envs: 8
+vec_env: subproc            # subproc | dummy (tests)
+start_method: forkserver    # SubprocVecEnv start method, pinned and recorded (determinism key)
+env:
+  challenge: waypoint-v1
+  preset: standard          # from step 0; no curriculum
+  max_drift_m: 2.5          # training-only: course radius 1.5 m + 1 m
+  reward: {tilt: 0.30, rate: 0.10, drift: 0.0, yaw_rate: 0.05, effort: 0.10, smooth: 0.20}
+  action_excess: {enabled: true, box: 2.0, weight: 0.10}
+  waypoint_reward: {balance_scale: 0.1, progress: 20.0, gate: 10.0, dock: 20.0, terminated: -50.0, dock_hold: 0.0}
+normalize: {obs: true, reward: false, clip_obs: 10.0, epsilon: 1.0e-8}
+policy: {net_arch: {pi: [64, 64], vf: [64, 64]}, activation: tanh, log_std_init: 0.0}
+ppo: {n_steps: 2048, batch_size: 2048, n_epochs: 10, gamma: 0.99, gae_lambda: 0.95,
+      learning_rate: {schedule: linear, initial: 3.0e-4, final: 0.0},   # clamped: progress reaches -0.0027
+      clip_range: 0.2, ent_coef: 0.0, vf_coef: 0.5, max_grad_norm: 0.5, target_kl: null}
+selection: {protocol: waypoint-v1/standard, seeds: {first: 2000, last: 2199}, every_steps: 500_000,
+            workers: 4, gate: waypoint}   # 11 periodic + final = 12 evals
+limits: {max_wall_clock_s: 3600, max_cpu_s: 7129, max_tree_rss_mib: 8192}   # max_cpu_s = 3 x the pilot's cpu_s 2,376 (§8.7 step 4)
+health: {min_std: 0.03, min_std_before_step: 2_000_000, regression_after_step: 2_000_000, regression_drop: 0.10}
+init: {from_runs: [runs/ppo_s0, runs/ppo_s1, runs/ppo_s2], step: best, zero_inputs: [2, 4, 5], log_std: -1.0}

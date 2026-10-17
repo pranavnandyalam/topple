@@ -1,0 +1,239 @@
+{
+  "format": "topple.wp_pilot/1",
+  "run": "../p2-train/runs/ppo_wp_pilot_s0",
+  "git_commit": "52b28bdc8b2c2499c0a71ae9d814a707aebffa59",
+  "git_dirty": false,
+  "platform": "darwin-arm64",
+  "cpu_isa": "arm64-sme",
+  "best": {
+    "step": 6012928,
+    "eligible": true,
+    "onnx_sha256": "a671c923c4db1b734052d0db2c05d989ecacf154bcf650141c07ae278d8b90f6"
+  },
+  "flags": [
+    "late_regression",
+    "high_energy"
+  ],
+  "num_timesteps": 6012928,
+  "cpu_s": 2376.053122613,
+  "wall_clock_s": 779.9109786250046,
+  "max_cpu_s": 7129,
+  "budget_rule": {
+    "late_steps": [
+      5505024,
+      6012928
+    ],
+    "mid_steps": [
+      3506176,
+      4014080
+    ],
+    "paired": {
+      "mean": 0.6558227331501026,
+      "lo": -0.7790557987159352,
+      "hi": 2.032613142579638
+    },
+    "total_timesteps": null
+  },
+  "standard": {
+    "ppo": {
+      "n": 400,
+      "errors": 0,
+      "score": 81.94730689651959,
+      "docked": 0.885,
+      "fell": 0.1775,
+      "falls_by_cause": {
+        "push": 64,
+        "self": 7
+      }
+    },
+    "driver": {
+      "n": 400,
+      "errors": 0,
+      "score": 80.2437856340844,
+      "docked": 0.9325,
+      "fell": 0.0675,
+      "falls_by_cause": {
+        "push": 27
+      }
+    },
+    "creeper": {
+      "n": 400,
+      "errors": 0,
+      "score": 60.65404048220146,
+      "docked": 0.0,
+      "fell": 0.005,
+      "falls_by_cause": {
+        "push": 2
+      }
+    }
+  },
+  "clean_report_only": {
+    "ppo": {
+      "n": 400,
+      "errors": 0,
+      "score": 87.13402288083071,
+      "docked": 0.9825,
+      "fell": 0.0175,
+      "falls_by_cause": {
+        "self": 7
+      }
+    },
+    "driver": {
+      "n": 400,
+      "errors": 0,
+      "score": 83.67693060759213,
+      "docked": 1.0,
+      "fell": 0.0,
+      "falls_by_cause": {}
+    }
+  },
+  "item6": {
+    "paired_ppo_driver": {
+      "mean": 1.7035212624351783,
+      "lo": -0.19776486743521482,
+      "hi": 3.552502504310688
+    },
+    "checks": {
+      "a_docked": true,
+      "b_paired_lo": true,
+      "c_above_creeper": true,
+      "d_falls": true,
+      "no_errors": true
+    },
+    "pass": true
+  },
+  "selection_history": [
+    {
+      "step": 507904,
+      "score": 12.390626427993872,
+      "eligible": false,
+      "extras": {
+        "fell": 0.67,
+        "mean_gates": 0.03,
+        "docked": 0.0,
+        "median_t_finish_s": 20.0
+      }
+    },
+    {
+      "step": 1015808,
+      "score": 40.828509150067994,
+      "eligible": false,
+      "extras": {
+        "fell": 0.08,
+        "mean_gates": 1.565,
+        "docked": 0.0,
+        "median_t_finish_s": 20.0
+      }
+    },
+    {
+      "step": 1507328,
+      "score": 67.72930453554109,
+      "eligible": false,
+      "extras": {
+        "fell": 0.04,
+        "mean_gates": 4.145,
+        "docked": 0.375,
+        "median_t_finish_s": 20.0
+      }
+    },
+    {
+      "step": 2015232,
+      "score": 77.17453064981244,
+      "eligible": false,
+      "extras": {
+        "fell": 0.085,
+        "mean_gates": 4.77,
+        "docked": 0.88,
+        "median_t_finish_s": 14.34
+      }
+    },
+    {
+      "step": 2506752,
+      "score": 78.80394445609589,
+      "eligible": true,
+      "extras": {
+        "fell": 0.135,
+        "mean_gates": 4.74,
+        "docked": 0.89,
+        "median_t_finish_s": 12.275
+      }
+    },
+    {
+      "step": 3014656,
+      "score": 76.37228351387043,
+      "eligible": false,
+      "extras": {
+        "fell": 0.23,
+        "mean_gates": 4.545,
+        "docked": 0.835,
+        "median_t_finish_s": 11.600000000000001
+      }
+    },
+    {
+      "step": 3506176,
+      "score": 80.16454387926768,
+      "eligible": true,
+      "extras": {
+        "fell": 0.17,
+        "mean_gates": 4.66,
+        "docked": 0.88,
+        "median_t_finish_s": 10.585
+      }
+    },
+    {
+      "step": 4014080,
+      "score": 81.23704758906932,
+      "eligible": true,
+      "extras": {
+        "fell": 0.155,
+        "mean_gates": 4.72,
+        "docked": 0.885,
+        "median_t_finish_s": 10.34
+      }
+    },
+    {
+      "step": 4505600,
+      "score": 80.95834514436591,
+      "eligible": true,
+      "extras": {
+        "fell": 0.18,
+        "mean_gates": 4.655,
+        "docked": 0.885,
+        "median_t_finish_s": 9.855
+      }
+    },
+    {
+      "step": 5013504,
+      "score": 80.6729064832225,
+      "eligible": true,
+      "extras": {
+        "fell": 0.14,
+        "mean_gates": 4.645,
+        "docked": 0.88,
+        "median_t_finish_s": 10.0
+      }
+    },
+    {
+      "step": 5505024,
+      "score": 81.33996158102828,
+      "eligible": true,
+      "extras": {
+        "fell": 0.2,
+        "mean_gates": 4.695,
+        "docked": 0.885,
+        "median_t_finish_s": 9.690000000000001
+      }
+    },
+    {
+      "step": 6012928,
+      "score": 81.37327535360895,
+      "eligible": true,
+      "extras": {
+        "fell": 0.19,
+        "mean_gates": 4.68,
+        "docked": 0.885,
+        "median_t_finish_s": 9.67
+      }
+    }
+  ]
+}

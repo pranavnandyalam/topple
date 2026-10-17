@@ -39,6 +39,7 @@ from topple.contract import (
 from topple.disturbances import Push
 from topple.envs.balance import BalanceEnv
 from topple.ids import parse_protocol, resolve_protocol
+from topple.kinds import make_env, score_trajectory
 from topple.results import (
     MAX_EPISODES,
     ControllerInfo,
@@ -51,7 +52,6 @@ from topple.results import (
 from topple.results import summarize as summarize  # re-exported: §12's aggregate
 from topple.rng import controller_seed
 from topple.robot import robot_hash
-from topple.scoring import episode_metrics, episode_score, episode_success
 from topple.traj import Trajectory
 
 ControllerFactory = Callable[[TaskSpec], Controller[Any]]
@@ -227,11 +227,16 @@ def _start_controller(
 
 
 def _next_action(
-    controller: Controller[Any], obs_arr: npt.NDArray[np.float32], t: float, step: int
+    controller: Controller[Any],
+    obs_arr: npt.NDArray[np.float32],
+    t: float,
+    step: int,
+    schema: str = OBS_SCHEMA_ID,
 ) -> tuple[float, ...] | ErrorInfo:
-    """The controller's validated action for this step, or the ``ErrorInfo`` it earned."""
+    """The controller's validated action for this step, or the ``ErrorInfo`` it earned; the
+    observation is built in the task's own schema (§8.4)."""
     try:
-        raw = controller.act(controller_obs(obs_arr, t))
+        raw = controller.act(controller_obs(obs_arr, t, schema=schema))
     except KeyboardInterrupt:
         raise
     except BaseException as exc:
@@ -281,7 +286,7 @@ def _control_loop(
     for _ in range(limit):
         step = int(info["step"])
         _check_finite(obs_arr, step)
-        action = _next_action(controller, obs_arr, float(info["t"]), step)
+        action = _next_action(controller, obs_arr, float(info["t"]), step, env.task_spec.obs_schema)
         if isinstance(action, ErrorInfo):  # our own object either way: safe to inspect
             return action
         obs_arr, _, terminated, truncated, info = env.step(action)
@@ -322,22 +327,20 @@ def run_episode(
     if wants_epilogue(env.termination_reason or "timeout", error is not None):
         env.simulate_epilogue(EPILOGUE_S)
     traj = env.trajectory({"episode_index": index, "error": error.model_dump() if error else None})
-    metrics = episode_metrics(traj, env.params.motor)
-    score_cfg = env.challenge.config.score
-    score = 0.0 if error else episode_score(metrics, score_cfg)
+    scored = score_trajectory(traj, env.challenge, error=error is not None)
     result = EpisodeResult(
         index=index,
         seed=seed if report_seed else None,
-        success=error is None and episode_success(metrics, score_cfg),
-        score=min(max(score, 0.0), 100.0),
-        metrics=metrics.as_dict(),
+        success=scored.success,
+        score=scored.score,
+        metrics=scored.metrics,
         error=error,
     )
     return EpisodeRun(result=result, trajectory=traj)
 
 
 def iter_episodes(protocol: EvalProtocol, factory: ControllerFactory) -> Iterator[EpisodeRun]:
-    env = BalanceEnv(protocol.preset, challenge=protocol.challenge, record=True)
+    env = make_env(protocol.challenge, protocol.preset, record=True)
     try:
         for index, seed in enumerate(protocol.seeds):
             yield run_episode(
@@ -430,17 +433,18 @@ def distribution_version(name: str) -> str | None:
         return None
 
 
-def run_versions() -> Versions:
-    """What this machine runs episodes with: Topple, MuJoCo, numpy, the obs and action schemas,
-    and the installed ONNX Runtime, onnx and ``cpu_isa`` (recorded for every run, a Python
-    controller's included: per-episode ONNX results are bit-exact only per platform,
-    ``cpu_isa`` and onnxruntime version, contract §17)."""
+def run_versions(challenge: Challenge | None = None) -> Versions:
+    """What this machine runs episodes with: Topple, MuJoCo, numpy, ``challenge``'s obs and
+    action schemas (balance-v1's when None), and the installed ONNX Runtime, onnx and
+    ``cpu_isa`` (recorded for every run, a Python controller's included: per-episode ONNX
+    results are bit-exact only per platform, ``cpu_isa`` and onnxruntime version, contract
+    §17)."""
     return Versions(
         topple=__version__,
         mujoco=mujoco.__version__,
         numpy=np.__version__,
-        obs_schema=OBS_SCHEMA_ID,
-        action_spec=BALANCE_V1_ACTION.id,
+        obs_schema=OBS_SCHEMA_ID if challenge is None else challenge.config.obs_schema,
+        action_spec=BALANCE_V1_ACTION.id if challenge is None else challenge.config.action_spec,
         onnxruntime=distribution_version("onnxruntime"),
         onnx=distribution_version("onnx"),
         cpu_isa=cpu_isa(),
@@ -464,7 +468,7 @@ def build_results(
         protocol=protocol.id,
         protocol_hash=protocol.protocol_hash(),
         seed_set=protocol.seed_set,
-        versions=run_versions(),
+        versions=run_versions(protocol.challenge),
         platform=platform_tag(),
         robot_hash=robot_hash(protocol.challenge.robot_xml, protocol.challenge.params),
         controller=controller,

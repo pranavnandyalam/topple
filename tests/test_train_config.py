@@ -28,6 +28,7 @@ from topple.train.config import (
     LrSchedule,
     PpoTrainConfig,
     SacTrainConfig,
+    config_doc,
     config_sha256,
     load_train_config,
     lr_fn,
@@ -39,7 +40,25 @@ from topple.yamlsafe import ConfigError, safe_load_capped
 
 REPO = Path(__file__).resolve().parents[1]
 CONFIGS = REPO / "configs" / "train"
-SHIPPED = ("ppo_balance", "sac_balance", "smoke_ppo", "smoke_sac", "ablate_nopenalty")
+PPO_BALANCE_2A_SHA256 = "9ba39c87e3d419ecf13daeff27bf851e9e0e3bd360ec3328ef58451050158874"
+SHA256_2A = {
+    # recorded by the Phase 2a runs (runs/ppo_s0, sac_s0, ablate_nopenalty)
+    "ppo_balance": PPO_BALANCE_2A_SHA256,
+    "sac_balance": "987da388b0f6aa316606afc17f28ad481caf94162df6a1a32f5209c751d257f3",
+    "ablate_nopenalty": "1808680c6432535600ceb48e59928e04301ac83073a12977be8bfe3dbf2e997e",
+    # the train CI job's smoke configs at the 2a merge (386df1e)
+    "smoke_ppo": "424f36b7652ea11ed66eccc104af4e1adab86694cedcbc0e12ca649fde74f612",
+    "smoke_sac": "5ad044128dfcef83d12791c8f14307af4a7f5989d6a00762f4274bcdac6535da",
+}
+SHIPPED = (
+    "ppo_balance",
+    "sac_balance",
+    "smoke_ppo",
+    "smoke_sac",
+    "ablate_nopenalty",
+    "ppo_waypoint",
+    "ppo_waypoint_ft",
+)
 
 
 def raw(name: str) -> dict[str, Any]:
@@ -607,8 +626,68 @@ def test_config_sha256_is_of_the_canonical_json() -> None:
     import hashlib
 
     cfg = load_train_config(CONFIGS / "sac_balance.yaml")
-    text = json.dumps(cfg.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    text = json.dumps(config_doc(cfg), sort_keys=True, separators=(",", ":"))
     assert config_sha256(cfg) == hashlib.sha256(text.encode()).hexdigest()
+
+
+@pytest.mark.parametrize("name", list(SHA256_2A))
+def test_every_2a_config_keeps_its_sha256(name: str) -> None:
+    assert config_sha256(load_train_config(CONFIGS / f"{name}.yaml")) == SHA256_2A[name]
+
+
+def test_the_2a_config_sha256_is_unchanged_by_the_2b_keys() -> None:
+    """The Phase 2a runs (``runs/ppo_s0``, seed 0) recorded this hash: the 2b keys
+    (``env.waypoint_reward``, ``init``) are left out when unset, so 2a runs still export."""
+    cfg = load_train_config(CONFIGS / "ppo_balance.yaml")
+    assert config_sha256(cfg) == PPO_BALANCE_2A_SHA256
+    assert "init" not in config_doc(cfg)
+    assert "waypoint_reward" not in config_doc(cfg)["env"]
+    wp = load_train_config(CONFIGS / "ppo_waypoint.yaml")
+    assert config_doc(wp)["env"]["waypoint_reward"]["progress"] == 20.0
+    assert "init" in config_doc(load_train_config(CONFIGS / "ppo_waypoint_ft.yaml"))
+
+
+INIT = {
+    "from_runs": ["runs/a", "runs/b"],
+    "step": "best",
+    "zero_inputs": [2, 4, 5],
+    "log_std": -1.0,
+}
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"from_runs": []}, "at least 1"),
+        ({"from_runs": ["/abs/run"]}, "relative"),
+        ({"from_runs": ["runs/../x"]}, "relative"),
+        ({"from_runs": ["runs//x"]}, "relative"),
+        ({"from_runs": ["runs/.hidden"]}, "relative"),
+        ({"from_runs": ["runs/a", "runs/a"]}, "repeat"),
+        ({"from_runs": ["runs/a b"]}, "relative"),
+        ({"step": 100}, "best"),
+        ({"zero_inputs": [4, 2]}, "increasing"),
+        ({"zero_inputs": [-1]}, "greater than or equal"),
+        ({"log_std": 3.0}, "less than or equal"),
+        ({"extra": 1}, "Extra inputs"),
+    ],
+)
+def test_init_is_validated(change: dict[str, object], match: str) -> None:
+    data = raw("ppo_waypoint")
+    data["init"] = {**INIT, **change}
+    with pytest.raises(ConfigError, match=match):
+        parse_train_config(as_yaml(data))
+
+
+def test_init_is_for_a_waypoint_challenge_only() -> None:
+    data = raw("ppo_balance")
+    data["init"] = INIT
+    with pytest.raises(ConfigError, match="waypoint challenge only"):
+        parse_train_config(as_yaml(data))
+    data = raw("sac_balance")
+    data["init"] = INIT
+    with pytest.raises(ConfigError, match="Extra inputs"):
+        parse_train_config(as_yaml(data))
 
 
 @pytest.mark.parametrize("name", SHIPPED)
@@ -691,6 +770,45 @@ DERIVED: dict[str, tuple[str, dict[str, object]]] = {
         "ppo_balance",
         {"seed": 1, "total_timesteps": 1_000_000, "env.action_excess": {"enabled": False}},
     ),
+    # §8.8: exactly these key paths (it keeps the LR schedule, start_method and health)
+    "ppo_waypoint": (
+        "ppo_balance",
+        {
+            "total_timesteps": 6_000_000,
+            "env.challenge": "waypoint-v1",
+            "env.max_drift_m": 2.5,
+            "env.reward.drift": 0.0,
+            "env.waypoint_reward": {
+                "balance_scale": 0.1,
+                "progress": 20.0,
+                "gate": 10.0,
+                "dock": 20.0,
+                "terminated": -50.0,
+                "dock_hold": 0.0,
+            },
+            "selection": {
+                "protocol": "waypoint-v1/standard",
+                "seeds": {"first": 2000, "last": 2199},
+                "every_steps": 500_000,
+                "workers": 4,
+                "gate": "waypoint",
+                "max_saturation": None,
+            },
+            "limits": {"max_wall_clock_s": 3600, "max_cpu_s": 7129, "max_tree_rss_mib": 8192},
+        },
+    ),
+    # §8.8 arm (b): (a) plus init
+    "ppo_waypoint_ft": (
+        "ppo_waypoint",
+        {
+            "init": {
+                "from_runs": ["runs/ppo_s0", "runs/ppo_s1", "runs/ppo_s2"],
+                "step": "best",
+                "zero_inputs": [2, 4, 5],
+                "log_std": -1.0,
+            }
+        },
+    ),
 }
 
 
@@ -708,3 +826,49 @@ def test_the_listed_paths_check_has_teeth() -> None:
     derived = load_train_config(CONFIGS / "smoke_ppo.yaml").model_dump(mode="json")
     derived["ppo"]["n_epochs"] = 5
     assert derived != _replaced(base, DERIVED["smoke_ppo"][1])
+
+
+def test_a_waypoint_config_needs_the_waypoint_reward() -> None:
+    def drop(d: dict[str, Any]) -> None:
+        del d["env"]["waypoint_reward"]
+
+    refused(edited("ppo_waypoint", drop), "waypoint_reward")
+
+
+def test_a_balance_config_refuses_the_waypoint_reward() -> None:
+    def add(d: dict[str, Any]) -> None:
+        d["env"]["waypoint_reward"] = raw("ppo_waypoint")["env"]["waypoint_reward"]
+
+    refused(edited("ppo_balance", add), "waypoint_reward")
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("terminated", 1.0), ("progress", -1.0), ("balance_scale", 11.0), ("dock_hold", 10.5)],
+)
+def test_the_waypoint_reward_weights_are_bounded(key: str, value: float) -> None:
+    def bad(d: dict[str, Any]) -> None:
+        d["env"]["waypoint_reward"][key] = value
+
+    refused(edited("ppo_waypoint", bad), key)
+
+
+@pytest.mark.parametrize(
+    ("name", "gate"),
+    [("ppo_waypoint", "pid"), ("ppo_balance", "waypoint"), ("sac_balance", "waypoint")],
+)
+def test_the_gate_must_fit_the_challenge_kind(name: str, gate: str) -> None:
+    def swap(d: dict[str, Any]) -> None:
+        d["selection"]["gate"] = gate
+        d["selection"]["max_saturation"] = 0.08 if gate == "pid" else None
+
+    refused(edited(name, swap), "selection.gate", "does not fit")
+
+
+def test_init_refuses_reward_normalization() -> None:
+    """apply_init freezes VecNormalize, which would also freeze the reward statistics."""
+    data = raw("ppo_waypoint")
+    data["init"] = INIT
+    data["normalize"] = {**data["normalize"], "reward": True}
+    with pytest.raises(ConfigError, match=r"normalize\.reward must be false"):
+        parse_train_config(as_yaml(data))

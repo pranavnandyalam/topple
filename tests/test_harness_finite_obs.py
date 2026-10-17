@@ -81,9 +81,14 @@ def one_seed() -> EvalProtocol:
     return replace(protocol, seeds=protocol.seeds[:1])
 
 
+def fake_make_env(challenge: object, preset: str, **kwargs: Any) -> FakeEnv:
+    """``kinds.make_env`` for the fake: ``evaluate`` builds its env through it."""
+    return FakeEnv(preset, challenge, kwargs["record"])
+
+
 def run_with(monkeypatch: pytest.MonkeyPatch, rows: list[np.ndarray[Any, Any]]) -> Recorder:
     FakeEnv.rows = rows
-    monkeypatch.setattr(evaluate_module, "BalanceEnv", FakeEnv)
+    monkeypatch.setattr(evaluate_module, "make_env", fake_make_env)
     recorder = Recorder()
     with pytest.raises(RuntimeError, match="non-finite observation"):
         evaluate(one_seed(), lambda spec: recorder, INFO)
@@ -117,7 +122,7 @@ def test_the_message_names_the_step_and_blames_the_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     FakeEnv.rows = [finite(), with_value(np.nan)]
-    monkeypatch.setattr(evaluate_module, "BalanceEnv", FakeEnv)
+    monkeypatch.setattr(evaluate_module, "make_env", fake_make_env)
     with pytest.raises(RuntimeError) as info:
         evaluate(one_seed(), lambda spec: Recorder(), INFO)
     assert str(info.value) == (
@@ -136,7 +141,7 @@ def test_the_check_holds_under_optimized_python(tmp_path: Path) -> None:
         import topple.evaluate as ev
         from test_harness_finite_obs import FakeEnv, Recorder, one_seed, INFO, with_value
         FakeEnv.rows = [with_value(float("nan"))]
-        ev.BalanceEnv = FakeEnv
+        ev.make_env = lambda challenge, preset, **kw: FakeEnv(preset, challenge, kw["record"])
         recorder = Recorder()
         try:
             ev.evaluate(one_seed(), lambda spec: recorder, INFO)

@@ -22,6 +22,8 @@ MODULES = (
     "topple.cli",
     "topple.pool",
     "topple.controllers.onnx_policy",
+    "topple.controllers.waypoint_pid",
+    "topple.controllers.anchors",
     "topple.compare",
     "topple.bench",
     "topple.stats",

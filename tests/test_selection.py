@@ -208,10 +208,41 @@ def test_the_none_gate_takes_every_checkpoint() -> None:
     assert is_eligible(bad, GateBaseline("none"), selection("none", None), E_REF)
 
 
-def test_the_waypoint_gate_is_phase_2b() -> None:
-    base = GateBaseline("waypoint", reference=result(), anchor=result(score=10.0))
-    with pytest.raises(NotImplementedError):
-        is_eligible(result(), base, selection("waypoint", None), E_REF)
+def wp(score: float, docked: float, fell: float, scores: tuple[float, ...]) -> SelectionResult:
+    return replace(
+        result(score=score, docked=docked, fell=fell, median_t_finish_s=12.0, mean_gates=4.5),
+        scores=scores,
+    )
+
+
+DRIVER = wp(80.0, 0.93, 0.05, (80.0, 82.0, 78.0, 81.0) * 25)
+CREEPER = wp(60.0, 0.99, 0.01, (60.0,) * 100)
+WP_BASE = GateBaseline("waypoint", reference=DRIVER, anchor=CREEPER)
+
+
+@pytest.mark.parametrize(
+    ("candidate", "eligible"),
+    [
+        (wp(79.0, 0.90, 0.10, (79.0, 81.0, 77.0, 80.0) * 25), True),
+        (wp(59.0, 0.90, 0.10, (59.0,) * 100), False),  # not above the creeper
+        (wp(79.0, 0.64, 0.10, (79.0, 81.0, 77.0, 80.0) * 25), False),  # docked < 0.65
+        (wp(79.0, 0.90, 0.26, (79.0, 81.0, 77.0, 80.0) * 25), False),  # falls > driver's + 0.20
+        (wp(70.0, 0.90, 0.10, (70.0, 72.0, 68.0, 71.0) * 25), False),  # paired lo <= -5
+    ],
+    ids=["eligible", "creeper", "docked", "falls", "paired"],
+)
+def test_the_waypoint_gate(candidate: SelectionResult, eligible: bool) -> None:
+    """§8.8: score > creeper's, docked >= 0.65, fell <= driver's + 0.20, paired lo > -5."""
+    assert is_eligible(candidate, WP_BASE, selection("waypoint", None), E_REF) is eligible
+
+
+def test_the_waypoint_gate_needs_both_baselines_on_the_same_seeds() -> None:
+    with pytest.raises(ValueError, match="anchor"):
+        GateBaseline("waypoint", reference=DRIVER)
+    with pytest.raises(ValueError, match="anchor"):
+        GateBaseline("pid", reference=DRIVER, anchor=CREEPER)
+    with pytest.raises(ValueError, match="same seeds"):
+        is_eligible(wp(80.0, 0.9, 0.0, (1.0,)), WP_BASE, selection("waypoint", None), E_REF)
 
 
 def test_the_baseline_must_match_the_configs_gate() -> None:
@@ -242,8 +273,12 @@ def test_measure_the_pid_baseline_on_the_selection_seeds() -> None:
     assert measure_gate_baseline("none", protocol, InlinePool(2), pid_submission=PID) == (
         GateBaseline("none")
     )
-    with pytest.raises(NotImplementedError):
-        measure_gate_baseline("waypoint", protocol, InlinePool(2), pid_submission=PID)
+    wp_protocol = replace(EvalProtocol.from_id("waypoint-v1/standard"), seeds=(2000, 2001))
+    wp_base = measure_gate_baseline("waypoint", wp_protocol, InlinePool(2), pid_submission=PID)
+    assert wp_base.rule == "waypoint"
+    assert wp_base.reference is not None
+    assert wp_base.anchor is not None
+    assert {"docked", "fell", "mean_gates", "median_t_finish_s"} <= set(wp_base.reference.extras)
 
 
 # --- rank and best ------------------------------------------------------------------------------
@@ -788,3 +823,97 @@ def test_parity_rows_refuse_bad_statistics(norm: ObsNorm) -> None:
         edge_rows(norm)
     with pytest.raises(ValueError, match=r"mean|var|epsilon"):
         random_rows(norm)
+
+
+# --- the waypoint gate in detail (§8.8) ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("candidate", "eligible"),
+    [
+        (wp(79.0, 0.65, 0.10, (79.0, 81.0, 77.0, 80.0) * 25), True),  # docked exactly 0.65
+        (wp(79.0, 0.90, 0.25, (79.0, 81.0, 77.0, 80.0) * 25), True),  # falls exactly driver + 0.20
+        (wp(60.0, 0.90, 0.10, (79.0, 81.0, 77.0, 80.0) * 25), False),  # score equals the creeper's
+    ],
+    ids=["docked-bound", "falls-bound", "creeper-tie"],
+)
+def test_the_waypoint_gate_bounds(candidate: SelectionResult, eligible: bool) -> None:
+    assert is_eligible(candidate, WP_BASE, selection("waypoint", None), E_REF) is eligible
+
+
+def test_the_falls_bound_holds_at_every_k_over_n() -> None:
+    """``k/200 + 0.20`` is not exact in floating point; the bound still includes it."""
+    for k in range(161):
+        driver = replace(DRIVER, extras={**DRIVER.extras, "fell": k / 200})
+        base = GateBaseline("waypoint", reference=driver, anchor=CREEPER)
+        r = wp(79.0, 0.90, (k + 40) / 200, (79.0, 81.0, 77.0, 80.0) * 25)
+        assert is_eligible(r, base, selection("waypoint", None), E_REF), k
+
+
+def test_the_waypoint_gate_pairs_seeds() -> None:
+    """Per-seed scores that vary a lot but sit 3 below the driver on every seed: the paired
+    bound is -3 (eligible); an unpaired one would be about -11."""
+    spread = (20.0, 90.0, 40.0, 75.0) * 25
+    driver = wp(56.25, 0.93, 0.05, spread)
+    candidate = wp(53.25, 0.90, 0.10, tuple(s - 3.0 for s in spread))
+    base = GateBaseline("waypoint", reference=driver, anchor=wp(30.0, 0.99, 0.0, (30.0,) * 100))
+    assert is_eligible(candidate, base, selection("waypoint", None), E_REF)
+    shuffled = wp(53.25, 0.90, 0.10, tuple(s - 3.0 for s in spread[1:] + spread[:1]))
+    assert not is_eligible(shuffled, base, selection("waypoint", None), E_REF)
+
+
+def wp_episode(
+    index: int, *, score: float, gates: int, docked: bool, t_finish: float, termination: str
+) -> EpisodeResult:
+    return EpisodeResult(
+        index=index,
+        seed=2000 + index,
+        success=docked,
+        score=score,
+        metrics={
+            "termination": termination,
+            "energy_j": 5.0,
+            "saturation_fraction": 0.0,
+            "time_upright_s": 20.0,
+            "waypoints": gates,
+            "docked": docked,
+            "t_finish_s": t_finish,
+        },
+    )
+
+
+def test_summarize_adds_the_waypoint_extras() -> None:
+    episodes = [
+        wp_episode(0, score=85.0, gates=5, docked=True, t_finish=10.0, termination="timeout"),
+        wp_episode(1, score=80.0, gates=5, docked=True, t_finish=14.0, termination="timeout"),
+        wp_episode(2, score=40.0, gates=3, docked=False, t_finish=20.0, termination="fell"),
+        EpisodeResult(
+            index=3,
+            seed=2003,
+            success=False,
+            score=0.0,
+            metrics=None,
+            error=ErrorInfo(code="missing", step=0, detail=""),
+        ),
+    ]
+    r = summarize_episodes(episodes, step=0, kind="waypoint", episode_s=20.0)
+    assert r.extras == {
+        "fell": 0.25,
+        "mean_gates": 3.25,  # the missing episode counts 0 gates
+        "docked": 0.5,
+        "median_t_finish_s": 17.0,  # median of (10, 14, 20, 20): missing counts the episode
+    }
+    assert summarize_episodes(episodes, step=0).extras == {"fell": 0.25}  # balance
+    with pytest.raises(ValueError, match="episode length"):
+        summarize_episodes(episodes, step=0, kind="waypoint")
+
+
+def test_a_baseline_that_errs_is_refused() -> None:
+    """The waypoint driver errs on every balance episode (no gate in the observation): as a
+    selection eval it scores 0; as a gate baseline it raises."""
+    protocol = replace(EvalProtocol.from_id("balance-v1/standard"), seeds=(2000, 2001))
+    ref = policy_ref(REPO / "submissions" / "waypoint_pid_example.py", challenge=protocol.challenge)
+    r, _ = evaluate_policy_bytes(ref, protocol, InlinePool(2))
+    assert r.scores == (0.0, 0.0)
+    with pytest.raises(RuntimeError, match="erred on 2 of 2 episodes"):
+        evaluate_policy_bytes(ref, protocol, InlinePool(2), baseline=True)

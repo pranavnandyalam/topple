@@ -43,12 +43,10 @@ TRAIN_TESTS = (
 )
 # (file -> banned names it may use). Fixed: an entry is a reviewed exception, never a pattern.
 ALLOWED: dict[str, frozenset[str]] = {
-    # train-marked tests that import torch / SB3 themselves (test_train_smoke,
-    # test_snapshot_reference and test_resources reach them only through topple.train)
-    **dict.fromkeys(
-        ("tests/test_pack_torch_legacy.py", "tests/test_surgery.py"),
-        frozenset({"torch", "stable_baselines3"}),
-    ),
+    # a train-marked test that imports torch / SB3 itself (test_train_smoke,
+    # test_snapshot_reference, test_resources and test_surgery reach them only through
+    # topple.train)
+    "tests/test_pack_torch_legacy.py": frozenset({"torch", "stable_baselines3"}),
     # TaskSpec pickles and copies (contract §8)
     "tests/test_contract.py": frozenset({"pickle"}),
     # LoadedPolicy, ONNXPolicy and sessions refuse to be pickled (slice 1b)

@@ -14,6 +14,7 @@ _PRESET_RE = re.compile(r"[a-z][a-z0-9_]*")
 PROTOCOL_ALIASES: Mapping[str, str] = {
     "eval_v1": "balance-v1/standard",
     "eval_v1_clean": "balance-v1/clean",
+    "wp_eval_v1": "waypoint-v1/standard",
 }
 
 

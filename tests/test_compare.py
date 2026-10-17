@@ -680,3 +680,39 @@ def test_markdown_never_builds_the_range_of_a_seed_file(
 def test_parse_comparison_caps_its_input() -> None:
     with pytest.raises(ValueError, match="at most"):
         parse_comparison(b" " * (MAX_RESULTS_BYTES + 1))
+
+
+# --- §8.6: waypoint extras ------------------------------------------------------------------------
+
+
+def test_balance_entries_carry_no_extras(three: Comparison) -> None:
+    assert all(e.extras == {} for e in three.entries)
+
+
+def test_waypoint_entries_carry_the_waypoint_metrics_per_seed(
+    tmp_path: Path, inline: list[InlinePool]
+) -> None:
+    """Each waypoint entry records ``compare_module.WAYPOINT_EXTRAS`` per seed, equal to the
+    episode's metrics, so a gate can recompute docked and fell rates from the file alone."""
+    driver = REPO / "submissions" / "waypoint_pid_example.py"
+    protocol = EvalProtocol.from_id("waypoint-v1/standard")
+    protocol = replace(protocol, seeds=protocol.seeds[:2])
+    cmp = compare([driver], protocol, workers=1)
+    (entry,) = cmp.entries
+    assert tuple(entry.extras) == compare_module.WAYPOINT_EXTRAS
+    factory = load_submission(driver, challenge=protocol.challenge).factory
+    metrics = [run.result.metrics for run in iter_episodes(protocol, factory)]
+    for name in compare_module.WAYPOINT_EXTRAS:
+        assert entry.extras[name] == tuple(m[name] for m in metrics if m is not None), name
+    path = tmp_path / "wp.json"
+    path.write_text(cmp.model_dump_json())
+    assert read_comparison(path).entries[0].extras == entry.extras
+
+
+def test_an_errored_waypoint_episode_records_null_extras() -> None:
+    from topple.results import EpisodeResult, ErrorInfo
+
+    error = ErrorInfo(code="exception", step=0)
+    err = EpisodeResult(index=0, seed=0, score=0.0, success=False, metrics=None, error=error)
+    assert compare_module._extras([err], "waypoint")["docked"] == (None,)
+    assert compare_module._extras([err], "balance") == {}

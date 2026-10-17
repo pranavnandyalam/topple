@@ -1,0 +1,47 @@
+# waypoint-v1: drive a two-wheeled balancer through 4 gates and hold it in a dock for 1 s within
+# 20 s (docs/design/phase-2.md §8). Frozen at the end of Phase 2b (§8 intro): after the freeze any
+# change that can move a fixed controller's score on a fixed seed requires waypoint-v2.
+# robot/ and scene.xml are byte-identical to balance-v1's.
+# Calibration (docs/design/phase-2.md §8.7; scripts/phase2b_calibrate.py; the JSON curves are in
+# docs/results/phase2b/calibration/). Reference driver on standard seeds 0..399, waypoint
+# ENV_ALGO_VERSION 1. The calibration platform is linux-x86_64 (decision log R1):
+#   linux-x86_64 avx2 (2026-10-17, GitHub Actions): impulse_hi falls / docked
+#     0.300 2.2% / 97.8%   0.325 3.7% / 96.3%   0.350 5.2% / 94.8%   0.375 6.5% / 93.5%
+#     0.400 9.5% / 90.5%   0.425 12.0% / 88.7%  0.450 14.5% / 86.5%  ...
+#     chosen 0.375 (falls closest to 6% within [3%, 10%], docked >= 88%); E_ref 21.4 J;
+#     clean - standard driver score gap 3.29 (target >= 1.5)
+#   darwin-arm64 (2026-10-17): 0.350 5.2% / 94.8%, 0.375 6.8% / 93.2% (a tie at 0.8 points from
+#     6%, which the rule breaks toward 0.350); E_ref would be 21.5 J there.
+id: waypoint-v1
+kind: waypoint
+obs_schema: balancer-target.obs.v1
+action_spec: diffdrive.effort.v1
+robot: robot/balancer.xml
+params: robot/params.yaml
+scene: scene.xml
+control_dt: 0.01
+episode_seconds: 20.0
+presets: [clean, standard]
+preset_defs:
+  clean: {name: clean, sensors: full, randomize: true}
+  standard:
+    name: standard
+    sensors: full
+    randomize: true
+    # impulse_hi 0.375 N.s, frozen by §8.7 calibration step 1 (below).
+    pushes: {count: [1, 2], impulse_ns: [0.15, 0.375], duration_s: 0.1, earliest_s: 2.0,
+              latest_s: 18.0, min_spacing_s: 3.0, lateral_fraction_max: 0.3, max_force_n: 50.0}
+course: {n_waypoints: 5, leg_m: 0.70, turn_deg: [30.0, 150.0], max_radius_m: 1.5, max_attempts: 1000,
+         gate_radius_m: 0.10, dock_hold_steps: 100}
+score:
+  weights: [55.0, 25.0, 15.0, 5.0]
+  t_par_s: 5.0
+  dock_progress_weights: [0.8, 0.2]
+  success_energy_factor: 5.0
+  e_ref_j: 21.4         # 2x the reference driver's median battery energy on standard 0..399 at impulse_hi 0.375, linux-x86_64 (2 x 10.72 J)
+seeds:
+  public: [3000, 3001, 3002, 3003, 3004, 3005, 3006, 3007, 3008, 3009,
+           3010, 3011, 3012, 3013, 3014, 3015, 3016, 3017, 3018, 3019,
+           3020, 3021, 3022, 3023, 3024, 3025, 3026, 3027, 3028, 3029,
+           3030, 3031, 3032, 3033, 3034, 3035, 3036, 3037, 3038, 3039,
+           3040, 3041, 3042, 3043, 3044, 3045, 3046, 3047, 3048, 3049]

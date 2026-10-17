@@ -15,9 +15,8 @@ from pydantic import BaseModel, ConfigDict, NonNegativeFloat, model_validator
 
 from topple import __version__
 from topple.challenge import Challenge, load_challenge
-from topple.contract import FEATURES, BalancerObs, clip_action, validate_action
+from topple.contract import BalancerObs, clip_action, validate_action
 from topple.disturbances import (
-    PRESETS,
     EpisodeClock,
     Preset,
     Push,
@@ -139,6 +138,8 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self.challenge: Challenge = (
             challenge if isinstance(challenge, Challenge) else load_challenge(challenge)
         )
+        if type(self) is BalanceEnv and self.challenge.kind != "balance":
+            raise ValueError(f"{self.challenge.id} is a {self.challenge.kind} challenge: make_env")
         if preset not in self.challenge.config.presets:
             raise ValueError(f"preset {preset!r} is not part of {self.challenge.id}")
         if render_mode is not None and render_mode not in self.metadata["render_modes"]:
@@ -164,7 +165,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self.clock = EpisodeClock(
             timestep=timestep, frame_skip=self.frame_skip, max_steps=self.max_steps
         )
-        self._preset: Preset = PRESETS[preset]
+        self._preset: Preset = self.challenge.preset(preset)
         self._pending_preset: Preset | None = None
         self.reward_config = reward or RewardConfig()
         self.max_drift_m = max_drift_m
@@ -184,7 +185,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             actuator_delay=m.actuator_delay.copy(),
         )
         self.observation_space = gym.spaces.Box(
-            -np.inf, np.inf, shape=(len(FEATURES),), dtype=np.float32
+            -np.inf, np.inf, shape=(len(self.task_spec.obs_features),), dtype=np.float32
         )
         self.action_space = gym.spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32)
         self._scenario: Scenario | None = None
@@ -212,7 +213,9 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self._accel: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self._epilogue: list[npt.NDArray[np.float64]] = []
         self._rec: dict[str, list[Any]] = {}
-        self._last_obs_for_record: npt.NDArray[np.float32] = np.zeros(len(FEATURES), np.float32)
+        self._last_obs_for_record: npt.NDArray[np.float32] = np.zeros(
+            len(self.task_spec.obs_features), np.float32
+        )
         self._stable_qpos = np.zeros(self.model.nq)  # state before the current substep
         self._stable_qvel = np.zeros(self.model.nv)
 
@@ -237,7 +240,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         """Curriculum hook: switch disturbance preset at the next reset (works via env_method)."""
         if preset not in self.challenge.config.presets:
             raise ValueError(f"preset {preset!r} is not part of {self.challenge.id}")
-        self._pending_preset = PRESETS[preset]
+        self._pending_preset = self.challenge.preset(preset)
 
     # ------------------------------------------------------------------ gym API
 
@@ -257,7 +260,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             scenario = (
                 given
                 if isinstance(given, Scenario)
-                else Scenario.from_dict(given, clock=self.clock)
+                else Scenario.from_dict(given, clock=self.clock, challenge=self.challenge)
             )
         else:
             episode_seed = seed if seed is not None else int(self.np_random.integers(MAX_SEED))
@@ -267,6 +270,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
                 timestep=float(self.model.opt.timestep),
                 control_dt=self.control_dt,
                 episode_seconds=self.task_spec.episode_seconds,
+                course=self.challenge.config.course,
             )
         if "init_pitch_rad" in opts:
             scenario = replace(scenario, init_pitch_rad=float(opts["init_pitch_rad"]))
@@ -282,7 +286,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         check_push_schedule(scenario.pushes, frame_skip=self.frame_skip)
 
         self._scenario = scenario
-        self._sensors_ideal = PRESETS[scenario.preset].sensors == "ideal"
+        self._sensors_ideal = self.challenge.preset(scenario.preset).sensors == "ideal"
         self._apply_model_overrides(scenario)
         self._set_initial_state(scenario.init_pitch_rad, scenario.init_pitch_rate_rads)
         if not self._finite_state():
@@ -293,6 +297,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
                 "are not finite after mj_forward"
             )
         self._init_episode_state(scenario)
+        self._after_reset()
         obs = self._observe(last_action=(0.0, 0.0))
         if self.record:
             self._start_recording(obs)
@@ -354,6 +359,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self._step_count += 1
 
         self._accumulate_energy(u)
+        self._after_physics()
         obs = self._observe(last_action=u)
         reward, terms = self._reward(u)
         self._prev_u = u
@@ -426,7 +432,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             "frame_skip": self.frame_skip,
             "max_steps": self.max_steps,
             "obs_schema": self.task_spec.obs_schema,
-            "obs_features": list(FEATURES),
+            "obs_features": list(self.task_spec.obs_features),
             "joint_qpos": {
                 "root": self.binding.root_qposadr,
                 "wheels": list(self.binding.wheel_qposadr),
@@ -444,7 +450,9 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         return Trajectory(
             qpos=np.array(rec["qpos"]),
             qvel=np.array(rec["qvel"]),
-            obs=np.array(rec["obs"], dtype=np.float32).reshape(-1, len(FEATURES)),
+            obs=np.array(rec["obs"], dtype=np.float32).reshape(
+                -1, len(self.task_spec.obs_features)
+            ),
             action=np.array(rec["action"], dtype=np.float64).reshape(-1, 2),
             ctrl=np.array(rec["ctrl"], dtype=np.float64).reshape(-1, 2),
             enc_counts=np.array(rec["enc"], dtype=np.int32).reshape(-1, 2),
@@ -671,6 +679,13 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self._prev_wheel_pos = pos2
         yaw = odometry_yaw(pos2[0], pos2[1], b.wheel_radius_m, b.track_width_m)
         return BalancerObs(t, self._pitch_est, self._gyro[1], yaw, self._gyro[2], pos2, vel2, la)
+
+    def _after_reset(self) -> None:
+        """Hook: the episode state is set, before the first observation (task kinds extend it)."""
+
+    def _after_physics(self) -> None:
+        """Hook: a step's physics is done, before its observation and reward (task kinds use it
+        to advance their task state, so the observation already shows it, §8.4)."""
 
     def _drift(self) -> float:
         b, d = self.binding, self.data
