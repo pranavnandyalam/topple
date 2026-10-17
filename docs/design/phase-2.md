@@ -1643,7 +1643,7 @@ limits: {max_wall_clock_s: 3600, max_cpu_s: 7500, max_tree_rss_mib: 8192}   # ma
 `paired_bootstrap(mean of the two latest evals' per-seed scores (labels nearest 5.5M and the
 final), mean of the evals nearest 3.5M and 4.0M)`. If its lower bound is > 0, `total_timesteps`
 becomes 8,000,000 (every_steps unchanged) for both arms; the CI and the choice go into
-`phase2.json`. (Comparing like with like: a max over 8 noisy evals sits about 1.4 SE ≈ 2 points
+`phase2b.json`. (Comparing like with like: a max over 8 noisy evals sits about 1.4 SE ≈ 2 points
 above the true value, so a max-based rule is biased toward stopping.)
 
 **Reward** (not frozen; never bumps, contract §13):
@@ -1675,7 +1675,7 @@ records mean gates, docked, fell, median `t_finish`.
   runs/ppo_s1, runs/ppo_s2], step: best, zero_inputs: [2, 4, 5], log_std: -1.0}`. Fine-tune
   seed k starts from `from_runs[k]` at its `best.json.step`, which MUST be `eligible: true` with
   no abort flag; otherwise the next index (k+1, k+2 mod 3) is used. Source run, step and
-  `onnx_sha256` go into `train_meta.init_source` and `phase2.json` (not all from the shipped run:
+  `onnx_sha256` go into `train_meta.init_source` and `phase2b.json` (not all from the shipped run:
   that would add best-of-3 selection bias and hide pretraining variance). The LR schedule
   restarts at 3e-4. `extend_obs` (pickle-free; reads only `best.json` (integer step),
   `actor.npz`, `critic.npz`, `dist.npz`, `normalize.json`, `meta.json`, with the §3.3 file
@@ -1718,6 +1718,10 @@ records mean gates, docked, fell, median `t_finish`.
 
 ### 8.9 Done-when for 2b
 
+*(As built, 2026-10-17: the 2b results are `docs/results/phase2b.json` (`topple.phase2b/1`) and
+`phase2b.md`, not a section of `phase2.json`, so the merged 2a evidence stays untouched; the
+script below is `scripts/phase2b_done.sh` as committed.)*
+
 `scripts/phase2b_done.sh` (`set -euo pipefail`):
 
 ```bash
@@ -1736,16 +1740,16 @@ uv run --no-sync pytest -m "not train" tests/test_golden.py tests/test_challenge
    tests/test_waypoint_verify.py tests/test_driver_golden.py \
    "tests/test_shipped_policy.py::test_shipped[ppo_waypoint]"                              # items 2, 3, 9
 unset UV_PROJECT_ENVIRONMENT
-K=$(uv run python -c 'import json;print(json.load(open("docs/results/phase2.json"))["waypoint"]["shipped"]["run"])')
+K=$(uv run python -c 'import json;print(json.load(open("docs/results/phase2b.json"))["shipped"]["run"])')
 D=$(mktemp -d)/p2bx
 uv run topple export "runs/$K" --out "$D" && cmp "$D/policy.onnx" submissions/ppo_waypoint/policy.onnx
 uv run python scripts/phase2_ci_check.py --head "$(git rev-parse HEAD)" --workflow ci.yml          # item 10
-uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_eval.json docs/results/phase2.json \
+uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_eval.json docs/results/phase2b.json \
    --submission submissions/ppo_waypoint --fixture tests/data/ppo_waypoint_parity.npz --results-dir docs/results/phase2
 ```
 
-`phase2b_gate.py` exits 0 iff all items pass (item 7 is read from `phase2.json`, written by
-`phase2_results.py` from `surgery.sanity_check` in the train environment):
+`phase2b_gate.py` exits 0 iff all items pass (item 7 is read from `phase2b.json`, written by
+`phase2b_results.py` from `surgery.sanity_check` in the train environment):
 1. **Challenge frozen.** Bundle, scorer and calibration comment frozen; the §8.7 band (falls in
    [3%, 10%], docked ≥ 88%) and all five anchor requirements hold on `standard` 0..399.
 2. **No regression.** balance-v1's Phase 1 goldens (`tests/test_golden.py`: bundle and
@@ -1770,7 +1774,7 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
    scenario includes `course`; uploads load with the protocol's layout), §17 (non-finite
    observations outside the policy domain). Schema id, feature order, gym id and alias frozen.
    Checked by a grep of `docs/contract.md` for each named term.
-5. **Results.** Both arms × 3 seeds in `phase2.md` vs the driver on 0..399 (paired bootstrap) and
+5. **Results.** Both arms × 3 seeds in `phase2b.md` vs the driver on 0..399 (paired bootstrap) and
    on `wp_eval_v1`, with gates, docked, falls, `t_finish` per selection eval, the headline
    comparison (§8.8) and an anchors-plus-PPO table of score parts, docked, fell and median
    `t_finish`, plus the exchange-rate sentence (§8.6).
@@ -1779,7 +1783,7 @@ uv run python scripts/phase2b_gate.py out/wp_cal.json out/wp_clean.json out/wp_e
    lower bound > −5.0; (c) score > creeper's; (d) fell ≤ driver's fell + 0.20. Falls are reported
    split by `fall_cause`. (e) **Report only:** PPO and driver falls on `waypoint-v1/clean` 0..399
    (pilot on 0..199: PPO 5.0%, all launch falls at t = 0.60–1.89 s at gate index 0 or 1; driver
-   0%). Pilot numbers are templated from `phase2.json`.
+   0%). Pilot numbers are templated from `phase2b.json`.
 7. **Fine-tune sanity.** `surgery.sanity_check` on `balance-v1/clean` seeds 0..19 with a test
    wrapper that appends 5 zeros and adds +100.0 rad to features 4 and 5: survival of the full
    10 s ≥ 95%.

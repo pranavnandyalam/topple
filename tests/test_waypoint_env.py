@@ -124,3 +124,31 @@ def test_scoring_dispatches_by_kind(driver: object) -> None:
     assert scored.score == 0.0
     assert not scored.success
     assert len(scored.metrics) == 18
+
+
+def test_target_features_follow_the_course(driver: object) -> None:
+    """Contract §6: ``final`` is 1 exactly while the dock is current; then ``gate == next``
+    (also after docking); before it ``gate != next``; the observation of the step that reaches
+    a gate already shows the next one (its gate equals the previous row's next, up to the robot's
+    one-step motion)."""
+    from topple.kinds import waypoint_replay
+
+    env = make_env(WP, "clean", record=True)
+    run = run_episode(env, driver, 3000, 0)  # type: ignore[arg-type]
+    traj = run.trajectory
+    replay = waypoint_replay(traj, WP, str(traj.meta["termination"]["reason"]))
+    reached = replay.events.reached_step
+    assert replay.events.docked
+    assert all(s is not None for s in reached)
+    obs = traj.obs.astype(np.float64)
+    gate, nxt, final = obs[:, 10:12], obs[:, 12:14], obs[:, 14]
+    dock_from = int(reached[3])  # type: ignore[arg-type]
+    assert set(np.unique(final)) == {0.0, 1.0}
+    assert (final[:dock_from] == 0.0).all()
+    assert (final[dock_from:] == 1.0).all()
+    assert np.array_equal(gate[dock_from:], nxt[dock_from:])
+    assert (np.abs(gate[:dock_from] - nxt[:dock_from]).max(axis=1) > 0.1).all()
+    for k in range(4):
+        r = int(reached[k])  # type: ignore[arg-type]
+        assert np.abs(gate[r] - nxt[r - 1]).max() < 0.02, k
+        assert np.abs(gate[r] - gate[r - 1]).max() > 0.1, k
