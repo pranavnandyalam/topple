@@ -97,3 +97,14 @@ def test_topple_verify_passes_a_full_wp_eval_v1_run(tmp_path: Path) -> None:
     assert done.exit_code == 0, done.output
     verified = runner.invoke(app, ["verify", str(out)])
     assert verified.exit_code == 0, verified.output
+
+
+def test_waypoint_results_record_the_waypoint_obs_schema(uploads: dict[int, Trajectory]) -> None:
+    """Gate F1: results, trusted rescores and compare files name the challenge's own schemas."""
+    from topple.compare import compare
+
+    verdict = verify_run(P5, uploads, INFO, "inprocess")
+    assert verdict.results.versions.obs_schema == "balancer-target.obs.v1"
+    assert verdict.results.versions.action_spec == P5.challenge.config.action_spec
+    cmp = compare([DRIVER], replace(P5, seeds=P5.seeds[:1]), workers=1)
+    assert cmp.versions.obs_schema == "balancer-target.obs.v1"

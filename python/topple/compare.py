@@ -269,7 +269,7 @@ def compare(subs: Sequence[Path], protocol: EvalProtocol, *, workers: int = 4) -
         complete=not any(MISSING in e.termination for e in entries),
         seeds=tuple(protocol.seeds),
         platform=platform_tag(),
-        versions=run_versions(),
+        versions=run_versions(protocol.challenge),
         entries=entries,
         paired=tuple(_paired(entries[i], entries[j]) for i, j in ordered_pairs(len(entries))),
     )

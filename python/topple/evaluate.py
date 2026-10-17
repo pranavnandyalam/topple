@@ -433,17 +433,18 @@ def distribution_version(name: str) -> str | None:
         return None
 
 
-def run_versions() -> Versions:
-    """What this machine runs episodes with: Topple, MuJoCo, numpy, the obs and action schemas,
-    and the installed ONNX Runtime, onnx and ``cpu_isa`` (recorded for every run, a Python
-    controller's included: per-episode ONNX results are bit-exact only per platform,
-    ``cpu_isa`` and onnxruntime version, contract §17)."""
+def run_versions(challenge: Challenge | None = None) -> Versions:
+    """What this machine runs episodes with: Topple, MuJoCo, numpy, ``challenge``'s obs and
+    action schemas (balance-v1's when None), and the installed ONNX Runtime, onnx and
+    ``cpu_isa`` (recorded for every run, a Python controller's included: per-episode ONNX
+    results are bit-exact only per platform, ``cpu_isa`` and onnxruntime version, contract
+    §17)."""
     return Versions(
         topple=__version__,
         mujoco=mujoco.__version__,
         numpy=np.__version__,
-        obs_schema=OBS_SCHEMA_ID,
-        action_spec=BALANCE_V1_ACTION.id,
+        obs_schema=OBS_SCHEMA_ID if challenge is None else challenge.config.obs_schema,
+        action_spec=BALANCE_V1_ACTION.id if challenge is None else challenge.config.action_spec,
         onnxruntime=distribution_version("onnxruntime"),
         onnx=distribution_version("onnx"),
         cpu_isa=cpu_isa(),
@@ -467,7 +468,7 @@ def build_results(
         protocol=protocol.id,
         protocol_hash=protocol.protocol_hash(),
         seed_set=protocol.seed_set,
-        versions=run_versions(),
+        versions=run_versions(protocol.challenge),
         platform=platform_tag(),
         robot_hash=robot_hash(protocol.challenge.robot_xml, protocol.challenge.params),
         controller=controller,
