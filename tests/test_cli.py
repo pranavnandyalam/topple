@@ -585,8 +585,8 @@ def test_verify_a_directory_holds_one_upload_at_a_time(
     live_at_verify: list[int] = []
     real_load, real_verify = topple.traj.load_npz, topple.verify._verify
 
-    def load(path: Path, *, max_steps: int) -> object:
-        traj = real_load(path, max_steps=max_steps)
+    def load(path: Path, *, max_steps: int, **kwargs: Any) -> object:
+        traj = real_load(path, max_steps=max_steps, **kwargs)
         loaded.append(weakref.ref(traj))
         return traj
 

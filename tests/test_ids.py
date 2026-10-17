@@ -70,7 +70,8 @@ def test_aliases_resolve() -> None:
     assert resolve_protocol("eval_v1") == "balance-v1/standard"
     assert resolve_protocol("eval_v1_clean") == "balance-v1/clean"
     assert resolve_protocol("balance-v1/standard") == "balance-v1/standard"
-    assert set(PROTOCOL_ALIASES) == {"eval_v1", "eval_v1_clean"}
+    assert resolve_protocol("wp_eval_v1") == "waypoint-v1/standard"
+    assert set(PROTOCOL_ALIASES) == {"eval_v1", "eval_v1_clean", "wp_eval_v1"}
 
 
 CHALLENGE_GRAMMAR = r"[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*-v[1-9][0-9]*"

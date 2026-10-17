@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from topple.evaluate import EvalProtocol
     from topple.loader import Submission
     from topple.results import ControllerInfo, EpisodeResult, EvalResults, Isolation
-    from topple.traj import Trajectory
+    from topple.traj import Trajectory, TrajLayout
     from topple.verify import EpisodeVerdict, RunVerdict
 
 app = typer.Typer(help="Topple: CI for robots.", no_args_is_help=True)
@@ -235,11 +235,15 @@ def _print_results(results: EvalResults) -> None:
 def _render(traj_path: Path, out: Path, fmt: VideoFormat, protocol: EvalProtocol) -> None:
     from topple.rendering import RenderingUnavailableError
     from topple.traj import load_npz
-    from topple.verify import protocol_max_steps
+    from topple.verify import protocol_max_steps, protocol_traj_layout
     from topple.video import render_trajectory
 
     try:
-        traj = load_npz(traj_path, max_steps=protocol_max_steps(protocol))
+        traj = load_npz(
+            traj_path,
+            max_steps=protocol_max_steps(protocol),
+            layout=protocol_traj_layout(protocol),
+        )
         render_trajectory(traj, out.with_suffix(f".{fmt.value}"))
     except (RenderingUnavailableError, ValueError, OSError) as exc:
         typer.echo(f"warning: video skipped: {_printable(str(exc))}", err=True)
@@ -353,10 +357,12 @@ def _read_meta(path: Path) -> dict[str, Any]:
 
 def _load_upload(path: Path, protocol: EvalProtocol) -> Trajectory:
     from topple.traj import load_npz
-    from topple.verify import protocol_max_steps
+    from topple.verify import protocol_max_steps, protocol_traj_layout
 
     try:
-        return load_npz(path, max_steps=protocol_max_steps(protocol))
+        return load_npz(
+            path, max_steps=protocol_max_steps(protocol), layout=protocol_traj_layout(protocol)
+        )
     except ValueError as exc:
         _fail(str(exc))
 
@@ -499,16 +505,17 @@ class _UploadFiles(Mapping[int, "Trajectory"]):
     upload at a time is in memory however many files the directory holds. Nothing is cached.
     """
 
-    def __init__(self, files: dict[int, Path], max_steps: int) -> None:
+    def __init__(self, files: dict[int, Path], max_steps: int, layout: TrajLayout) -> None:
         self._files = files
         self._max_steps = max_steps
+        self._layout = layout
 
     def __getitem__(self, index: int) -> Trajectory:
         from topple.traj import load_npz
 
         path = self._files[index]  # KeyError: no file for this index (``missing``)
         try:
-            return load_npz(path, max_steps=self._max_steps)
+            return load_npz(path, max_steps=self._max_steps, layout=self._layout)
         except ValueError as exc:
             raise _UploadLoadError(str(exc)) from exc
 
@@ -533,7 +540,9 @@ def _verify_directory(
     for index, path in files.items():
         if index >= n:
             _fail(f"{path.name}: index outside {protocol.id}'s {n} episodes")
-    uploads = _UploadFiles(files, trusted.protocol_max_steps(protocol))
+    uploads = _UploadFiles(
+        files, trusted.protocol_max_steps(protocol), trusted.protocol_traj_layout(protocol)
+    )
     try:
         return trusted.verify_run(protocol, uploads, controller, isolation)
     except _UploadLoadError as exc:
@@ -809,11 +818,18 @@ def _load_trajectory(path: Path) -> Trajectory:
     if not isinstance(challenge_id, str):
         _fail(f"{path.name}: the trajectory does not name its challenge")
     try:
-        cfg = load_challenge(challenge_id).config
+        challenge = load_challenge(challenge_id)
     except (ValueError, OSError) as exc:
         _fail(f"{path.name}: {exc}")
+    from topple.kinds import traj_layout
+
+    cfg = challenge.config
     try:
-        return load_npz(path, max_steps=round(cfg.episode_seconds / cfg.control_dt))
+        return load_npz(
+            path,
+            max_steps=round(cfg.episode_seconds / cfg.control_dt),
+            layout=traj_layout(challenge),
+        )
     except ValueError as exc:
         _fail(str(exc))
 

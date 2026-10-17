@@ -166,14 +166,13 @@ def _as_points(points: Sequence[tuple[float, float]]) -> list[tuple[float, float
     return out
 
 
-def _as_rows(qpos_xy: npt.NDArray[np.float64]) -> list[list[float]]:
+def _as_rows(qpos_xy: npt.NDArray[np.float64]) -> list[tuple[float, float]]:
     xy = np.asarray(qpos_xy, dtype=np.float64)
     if xy.ndim != 2 or xy.shape[0] < 1 or xy.shape[1] != 2:
         raise ValueError(f"qpos_xy must have shape (T + 1, 2), got {xy.shape}")
     if not np.isfinite(xy).all():
         raise ValueError("qpos_xy must be finite")
-    rows: list[list[float]] = xy.tolist()
-    return rows
+    return [(float(x), float(y)) for x, y in xy.tolist()]
 
 
 def env_terminated(termination: str) -> bool:
@@ -182,6 +181,82 @@ def env_terminated(termination: str) -> bool:
     This is ``waypoint_events``' ``terminated``: ``timeout`` and ``error`` keep the last row.
     """
     return termination in TERMINATING_REASONS
+
+
+class WaypointTracker:
+    """§8.5's course rules, one checked row at a time: the single implementation the env (each
+    step it does not terminate on) and the scorer (``waypoint_events``, over the recorded rows)
+    share, so their events are equal by construction. Positions are in the course frame."""
+
+    def __init__(
+        self,
+        points: Sequence[tuple[float, float]],
+        first_xy: tuple[float, float],
+        *,
+        gate_radius_m: float,
+        dock_hold_steps: int,
+    ) -> None:
+        _check_positive("gate_radius_m", gate_radius_m)
+        _check_count("dock_hold_steps", dock_hold_steps)
+        self.points = _as_points(points)
+        self.gate_radius_m = gate_radius_m
+        self.dock_hold_steps = dock_hold_steps
+        self.reached: list[int | None] = [None] * len(self.points)
+        self.current = 0
+        self.d_min = self._dist(first_xy, 0)
+        self.hold = 0
+        self.max_hold = 0
+
+    @property
+    def dock(self) -> int:
+        return len(self.points) - 1
+
+    @property
+    def docked(self) -> bool:
+        return self.reached[self.dock] is not None
+
+    def _dist(self, xy: tuple[float, float], i: int) -> float:
+        return math.hypot(xy[0] - self.points[i][0], xy[1] - self.points[i][1])
+
+    def check(self, k: int, xy: tuple[float, float]) -> None:
+        """Check row ``k`` at position ``xy``: at most one waypoint advances, and nothing is
+        checked once docked."""
+        if self.docked:
+            return
+        d = self._dist(xy, self.current)
+        self.d_min = min(self.d_min, d)
+        if self.current < self.dock:
+            if d <= self.gate_radius_m:
+                self.reached[self.current] = k
+                self.current += 1
+                self.d_min = self._dist(xy, self.current)
+            return
+        self.hold = self.hold + 1 if d <= self.gate_radius_m else 0
+        self.max_hold = max(self.max_hold, self.hold)
+        if self.hold == self.dock_hold_steps:
+            self.reached[self.dock] = k
+
+    def events(self, control_dt: float) -> WaypointEvents:
+        _check_positive("control_dt", control_dt)
+        finish = self.reached[self.dock]
+        return WaypointEvents(
+            reached_step=tuple(self.reached),
+            docked=finish is not None,
+            t_finish_s=None if finish is None else finish * control_dt,
+            d_min=self.d_min,
+            max_hold_steps=self.max_hold,
+            waypoints=sum(s is not None for s in self.reached),
+        )
+
+
+def to_course_frame(
+    xy: tuple[float, float], origin: tuple[float, float], heading: float
+) -> tuple[float, float]:
+    """A world position in the course (start) frame: origin = axle midpoint at reset, x = the
+    initial heading (§8.3). Env and scorer both use this on ``qpos`` values."""
+    c, s = math.cos(heading), math.sin(heading)
+    dx, dy = xy[0] - origin[0], xy[1] - origin[1]
+    return (c * dx + s * dy, -s * dx + c * dy)
 
 
 def waypoint_events(
@@ -193,7 +268,8 @@ def waypoint_events(
     control_dt: float,
     terminated: bool,
 ) -> WaypointEvents:
-    """Course events of one episode (§8.5); ``points`` are the gates then the dock (last).
+    """Course events of one episode (§8.5); ``points`` are the gates then the dock (last), and
+    ``qpos_xy`` rows 0..T are course-frame positions.
 
     Rows k = 1..T-1 are checked when the env terminated the episode (it skips the check on the
     terminating step), else 1..T. At row k only the current waypoint is checked, so at most one
@@ -204,45 +280,17 @@ def waypoint_events(
     checked after that. ``d_min`` starts at the current waypoint's distance on the row it became
     current (row 0 for the first gate) and takes the minimum over the rows checked since.
     """
-    _check_positive("gate_radius_m", gate_radius_m)
-    _check_count("dock_hold_steps", dock_hold_steps)
     _check_positive("control_dt", control_dt)
-    pts = _as_points(points)
     rows = _as_rows(qpos_xy)
-    n = len(pts)
-    dock = n - 1
-    last = len(rows) - 1 - (1 if terminated else 0)
-
-    def dist(k: int, i: int) -> float:
-        return math.hypot(rows[k][0] - pts[i][0], rows[k][1] - pts[i][1])
-
-    reached: list[int | None] = [None] * n
-    current = 0
-    d_min = dist(0, current)
-    hold = max_hold = 0
-    for k in range(1, last + 1):
-        d = dist(k, current)
-        d_min = min(d_min, d)
-        if current < dock:
-            if d <= gate_radius_m:
-                reached[current] = k
-                current += 1
-                d_min = dist(k, current)
-            continue
-        hold = hold + 1 if d <= gate_radius_m else 0
-        max_hold = max(max_hold, hold)
-        if hold == dock_hold_steps:
-            reached[dock] = k
-            break
-    finish = reached[dock]
-    return WaypointEvents(
-        reached_step=tuple(reached),
-        docked=finish is not None,
-        t_finish_s=None if finish is None else finish * control_dt,
-        d_min=d_min,
-        max_hold_steps=max_hold,
-        waypoints=sum(s is not None for s in reached),
+    tracker = WaypointTracker(
+        points, rows[0], gate_radius_m=gate_radius_m, dock_hold_steps=dock_hold_steps
     )
+    last = len(rows) - 1 - (1 if terminated else 0)
+    for k in range(1, last + 1):
+        tracker.check(k, rows[k])
+        if tracker.docked:
+            break
+    return tracker.events(control_dt)
 
 
 def waypoint_progress(

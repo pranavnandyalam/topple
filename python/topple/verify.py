@@ -28,6 +28,7 @@ from topple.evaluate import (
     build_results,
     wants_epilogue,
 )
+from topple.kinds import make_env, score_trajectory, traj_layout
 from topple.results import (
     MAX_EPISODES,
     RUN_ERROR_CODES,
@@ -40,8 +41,8 @@ from topple.results import (
 )
 from topple.rng import validate_seed
 from topple.robot import robot_hash
-from topple.scoring import SURVIVED, episode_metrics, episode_score, episode_success
-from topple.traj import Trajectory
+from topple.scoring import SURVIVED
+from topple.traj import Trajectory, TrajLayout
 
 VerifyCode = Literal["not_reproducible", "incomplete"]
 
@@ -135,6 +136,12 @@ def _not_reproducible(reason: str) -> _RejectedError:
 
 
 # ------------------------------------------------------------------ public API
+
+
+def protocol_traj_layout(protocol: EvalProtocol) -> TrajLayout:
+    """The trajectory layout every upload of ``protocol`` must have (§8.1a): from the
+    protocol's challenge, never from the file, as ``protocol_max_steps``."""
+    return traj_layout(protocol.challenge)
 
 
 def protocol_max_steps(protocol: EvalProtocol) -> int:
@@ -416,15 +423,13 @@ def _check_integrity(upload: Trajectory, replay: Trajectory) -> None:
 def _accepted(env: BalanceEnv, target: _Target, replayed: _Replayed) -> EpisodeVerdict:
     """6. Score the replay exactly as ``evaluate.run_episode`` scores a live episode."""
     replay, error = replayed.trajectory, replayed.error
-    cfg = env.challenge.config.score
-    metrics = episode_metrics(replay, env.params.motor)
-    score = 0.0 if error else episode_score(metrics, cfg)
+    scored = score_trajectory(replay, env.challenge, error=error is not None)
     result = EpisodeResult(
         index=target.index,
         seed=target.reported_seed,
-        success=error is None and episode_success(metrics, cfg),
-        score=min(max(score, 0.0), 100.0),
-        metrics=metrics.as_dict(),
+        success=scored.success,
+        score=scored.score,
+        metrics=scored.metrics,
         error=error,
     )
     reason = "reproduced bit-exactly" + (f"; the episode ended with {error.code}" if error else "")
@@ -438,7 +443,9 @@ def _rejected(
     rejection: _RejectedError,
     replay: Trajectory | None,
 ) -> EpisodeVerdict:
-    metrics = episode_metrics(replay, env.params.motor).as_dict() if replay is not None else None
+    metrics = (
+        score_trajectory(replay, env.challenge, error=True).metrics if replay is not None else None
+    )
     result = EpisodeResult(
         index=target.index,
         seed=target.reported_seed,
@@ -472,7 +479,7 @@ def _target(protocol: EvalProtocol, index: int, seed: int, *, bind: bool) -> _Ta
 @contextmanager
 def _replay_env(protocol: EvalProtocol) -> Iterator[BalanceEnv]:
     """The trusted env: the protocol's own challenge object and preset, recording."""
-    env = BalanceEnv(protocol.preset, challenge=protocol.challenge, record=True)
+    env = make_env(protocol.challenge, protocol.preset, record=True)
     try:
         yield env
     finally:

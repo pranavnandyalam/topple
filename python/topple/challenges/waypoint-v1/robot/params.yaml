@@ -1,0 +1,22 @@
+# balancer.robot.v1 parameters: motors, sensors and estimator. Geometry and inertia live in
+# balancer.xml. Changing any value here changes scores: bump the challenge version (contract §13).
+motor:
+  tau_stall_nm: 0.3          # stall torque at the wheel (after gearbox)
+  omega_noload_rads: 30.0    # no-load wheel speed at u = 1 (1.02 m/s top speed)
+  torque_limit_nm: 0.3       # current limit expressed as wheel torque
+  stall_current_a: 1.5       # for battery energy accounting
+  v_nom: 7.4                 # nominal supply (2S LiPo); u = V_cmd / v_nom
+  armature: 0.0001           # reflected rotor inertia
+  frictionloss_nm: 0.02      # gearbox Coulomb friction
+contact:
+  wheel_friction: 1.0        # sliding friction coefficient, tire on floor
+sensing:
+  encoder_cpr: 1320          # counts per wheel revolution
+  gyro_noise_rads: 0.01      # white noise std per physics sample
+  accel_noise_ms2: 0.05
+  gyro_range_rads: 8.73      # +-500 deg/s full scale
+  accel_range_ms2: 39.2      # +-4 g full scale
+estimation:
+  cf_tau_s: 0.5              # complementary filter time constant
+safety:
+  fall_angle_rad: 0.70       # ~40 deg; also the firmware motor cutoff

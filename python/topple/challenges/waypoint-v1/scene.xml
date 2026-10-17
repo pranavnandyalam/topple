@@ -1,0 +1,18 @@
+<mujoco model="balance-v1-scene">
+  <option timestep="0.002" integrator="implicitfast">
+    <flag autoreset="disable"/>
+  </option>
+  <visual>
+    <global offwidth="1280" offheight="720"/>
+  </visual>
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1="0.82 0.84 0.87" rgb2="0.74 0.76 0.80"
+             width="512" height="512"/>
+    <material name="grid" texture="grid" texrepeat="8 8" reflectance="0.05"/>
+  </asset>
+  <worldbody>
+    <light name="key" pos="0.5 -1 2.5" dir="-0.2 0.4 -1" diffuse="0.8 0.8 0.8"/>
+    <light name="fill" pos="-1 1 2" dir="0.4 -0.4 -1" diffuse="0.3 0.3 0.3"/>
+    <geom name="floor" type="plane" size="20 20 0.1" material="grid"/>
+  </worldbody>
+</mujoco>

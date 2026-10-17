@@ -10,7 +10,8 @@ from topple.contract import BalancerObs, Controller, TaskSpec, validate_action
 from topple.envs.balance import BalanceEnv
 
 SUBMISSIONS = Path(__file__).resolve().parents[1] / "submissions"
-EXAMPLES = sorted(SUBMISSIONS.glob("*.py"))
+WAYPOINT_EXAMPLES = ("waypoint_pid_example",)  # waypoint-v1: tested in test_waypoint_driver.py
+EXAMPLES = sorted(p for p in SUBMISSIONS.glob("*.py") if p.stem not in WAYPOINT_EXAMPLES)
 BALANCERS = ("pid_example", "lqr_example")
 
 
@@ -67,6 +68,8 @@ def drive(
 def test_shipped_examples_are_present() -> None:
     stems = {p.stem for p in EXAMPLES}
     assert stems >= {"pid_example", "lqr_example", "zero_example", "random_example"}
+    for stem in WAYPOINT_EXAMPLES:
+        assert (SUBMISSIONS / f"{stem}.py").is_file()
     assert (SUBMISSIONS / "README.md").is_file()
 
 

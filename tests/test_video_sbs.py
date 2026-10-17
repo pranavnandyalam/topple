@@ -484,9 +484,9 @@ def test_cli_video_loads_with_the_challenge_bound(
     seen: list[tuple[str, int]] = []
     real = traj_module.load_npz
 
-    def recording(path: Path, *, max_steps: int) -> Trajectory:
+    def recording(path: Path, *, max_steps: int, **kwargs: Any) -> Trajectory:
         seen.append((Path(path).name, max_steps))
-        return real(path, max_steps=max_steps)
+        return real(path, max_steps=max_steps, **kwargs)
 
     monkeypatch.setattr(traj_module, "load_npz", recording)
     monkeypatch.setattr(video, "render_side_by_side", lambda *a, **k: 0)
@@ -574,7 +574,7 @@ def test_cli_video_survives_odd_termination_meta(
 def test_cli_video_a_file_that_does_not_load_exits_2(
     npzs: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def refuse(path: Path, *, max_steps: int) -> Trajectory:
+    def refuse(path: Path, *, max_steps: int, **kwargs: Any) -> Trajectory:
         raise ValueError(f"{Path(path).name}: T exceeds max_steps")
 
     monkeypatch.setattr(traj_module, "load_npz", refuse)
