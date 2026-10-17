@@ -209,6 +209,17 @@ ActionExcess = Annotated[
 ]
 
 
+class WaypointRewardWeights(_Frozen):
+    """§8.8's waypoint training reward (not frozen; never part of a score)."""
+
+    balance_scale: Annotated[float, Field(ge=0.0, le=10.0)]
+    progress: Annotated[float, Field(ge=0.0, le=1000.0)]
+    gate: Annotated[float, Field(ge=0.0, le=1000.0)]
+    dock: Annotated[float, Field(ge=0.0, le=1000.0)]
+    terminated: Annotated[float, Field(ge=-1000.0, le=0.0)]
+    dock_hold: Annotated[float, Field(ge=0.0, le=10.0)]
+
+
 class EnvConfig(_Frozen):
     """The training env: the challenge's env class on ``preset`` with the training-only
     ``reward`` and ``max_drift_m`` termination (§2.1)."""
@@ -218,17 +229,23 @@ class EnvConfig(_Frozen):
     max_drift_m: Annotated[float, Field(gt=0.0, le=100.0)]
     reward: RewardWeights
     action_excess: ActionExcess
+    waypoint_reward: WaypointRewardWeights | None = None
+    """Required exactly for a waypoint challenge (§8.8)."""
 
     @model_validator(mode="after")
     def _known(self) -> EnvConfig:
         from topple.challenge import load_challenge
 
         try:
-            presets = load_challenge(self.challenge).config.presets
+            challenge = load_challenge(self.challenge)
         except (OSError, ValueError):
             raise ValueError(f"there is no challenge {self.challenge!r}") from None
-        if self.preset not in presets:
+        if self.preset not in challenge.config.presets:
             raise ValueError(f"{self.challenge} has no preset {self.preset!r}")
+        if (challenge.kind == "waypoint") != (self.waypoint_reward is not None):
+            raise ValueError(
+                "env.waypoint_reward is required for, and only for, a waypoint challenge"
+            )
         return self
 
 

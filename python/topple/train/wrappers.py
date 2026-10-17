@@ -109,13 +109,19 @@ def make_train_env(cfg: PpoTrainConfig | SacTrainConfig, env_index: int) -> gym.
     from topple.train.config import ActionExcessOn
 
     challenge = load_challenge(cfg.env.challenge)
-    env: gym.Env[Obs, Act] = BalanceEnv(
-        cfg.env.preset,
-        challenge=challenge,
-        reward=cfg.env.reward.reward_config(),
-        max_drift_m=cfg.env.max_drift_m,
-        record=False,
-    )
+    kwargs: dict[str, object] = {
+        "challenge": challenge,
+        "reward": cfg.env.reward.reward_config(),
+        "max_drift_m": cfg.env.max_drift_m,
+        "record": False,
+    }
+    if cfg.env.waypoint_reward is not None:
+        from topple.envs.waypoint import WaypointEnv, WaypointRewardConfig
+
+        reward = WaypointRewardConfig(**cfg.env.waypoint_reward.model_dump())
+        env: gym.Env[Obs, Act] = WaypointEnv(cfg.env.preset, waypoint_reward=reward, **kwargs)  # type: ignore[arg-type]
+    else:
+        env = BalanceEnv(cfg.env.preset, **kwargs)  # type: ignore[arg-type]
     env = Monitor(env)
     excess = cfg.env.action_excess
     if cfg.algo == "ppo" and isinstance(excess, ActionExcessOn):

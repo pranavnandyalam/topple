@@ -208,10 +208,41 @@ def test_the_none_gate_takes_every_checkpoint() -> None:
     assert is_eligible(bad, GateBaseline("none"), selection("none", None), E_REF)
 
 
-def test_the_waypoint_gate_is_phase_2b() -> None:
-    base = GateBaseline("waypoint", reference=result(), anchor=result(score=10.0))
-    with pytest.raises(NotImplementedError):
-        is_eligible(result(), base, selection("waypoint", None), E_REF)
+def wp(score: float, docked: float, fell: float, scores: tuple[float, ...]) -> SelectionResult:
+    return replace(
+        result(score=score, docked=docked, fell=fell, median_t_finish_s=12.0, mean_gates=4.5),
+        scores=scores,
+    )
+
+
+DRIVER = wp(80.0, 0.93, 0.05, (80.0, 82.0, 78.0, 81.0) * 25)
+CREEPER = wp(60.0, 0.99, 0.01, (60.0,) * 100)
+WP_BASE = GateBaseline("waypoint", reference=DRIVER, anchor=CREEPER)
+
+
+@pytest.mark.parametrize(
+    ("candidate", "eligible"),
+    [
+        (wp(79.0, 0.90, 0.10, (79.0, 81.0, 77.0, 80.0) * 25), True),
+        (wp(59.0, 0.90, 0.10, (59.0,) * 100), False),  # not above the creeper
+        (wp(79.0, 0.64, 0.10, (79.0, 81.0, 77.0, 80.0) * 25), False),  # docked < 0.65
+        (wp(79.0, 0.90, 0.26, (79.0, 81.0, 77.0, 80.0) * 25), False),  # falls > driver's + 0.20
+        (wp(70.0, 0.90, 0.10, (70.0, 72.0, 68.0, 71.0) * 25), False),  # paired lo <= -5
+    ],
+    ids=["eligible", "creeper", "docked", "falls", "paired"],
+)
+def test_the_waypoint_gate(candidate: SelectionResult, eligible: bool) -> None:
+    """§8.8: score > creeper's, docked >= 0.65, fell <= driver's + 0.20, paired lo > -5."""
+    assert is_eligible(candidate, WP_BASE, selection("waypoint", None), E_REF) is eligible
+
+
+def test_the_waypoint_gate_needs_both_baselines_on_the_same_seeds() -> None:
+    with pytest.raises(ValueError, match="driver"):
+        is_eligible(
+            DRIVER, GateBaseline("waypoint", reference=DRIVER), selection("waypoint", None), E_REF
+        )
+    with pytest.raises(ValueError, match="same seeds"):
+        is_eligible(wp(80.0, 0.9, 0.0, (1.0,)), WP_BASE, selection("waypoint", None), E_REF)
 
 
 def test_the_baseline_must_match_the_configs_gate() -> None:
@@ -242,8 +273,12 @@ def test_measure_the_pid_baseline_on_the_selection_seeds() -> None:
     assert measure_gate_baseline("none", protocol, InlinePool(2), pid_submission=PID) == (
         GateBaseline("none")
     )
-    with pytest.raises(NotImplementedError):
-        measure_gate_baseline("waypoint", protocol, InlinePool(2), pid_submission=PID)
+    wp_protocol = replace(EvalProtocol.from_id("waypoint-v1/standard"), seeds=(2000, 2001))
+    wp_base = measure_gate_baseline("waypoint", wp_protocol, InlinePool(2), pid_submission=PID)
+    assert wp_base.rule == "waypoint"
+    assert wp_base.reference is not None
+    assert wp_base.anchor is not None
+    assert {"docked", "fell", "mean_gates", "median_t_finish_s"} <= set(wp_base.reference.extras)
 
 
 # --- rank and best ------------------------------------------------------------------------------

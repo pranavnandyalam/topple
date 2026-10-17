@@ -691,6 +691,33 @@ DERIVED: dict[str, tuple[str, dict[str, object]]] = {
         "ppo_balance",
         {"seed": 1, "total_timesteps": 1_000_000, "env.action_excess": {"enabled": False}},
     ),
+    # §8.8: exactly these key paths (it keeps the LR schedule, start_method and health)
+    "ppo_waypoint": (
+        "ppo_balance",
+        {
+            "total_timesteps": 6_000_000,
+            "env.challenge": "waypoint-v1",
+            "env.max_drift_m": 2.5,
+            "env.reward.drift": 0.0,
+            "env.waypoint_reward": {
+                "balance_scale": 0.1,
+                "progress": 20.0,
+                "gate": 10.0,
+                "dock": 20.0,
+                "terminated": -50.0,
+                "dock_hold": 0.0,
+            },
+            "selection": {
+                "protocol": "waypoint-v1/standard",
+                "seeds": {"first": 2000, "last": 2199},
+                "every_steps": 500_000,
+                "workers": 4,
+                "gate": "waypoint",
+                "max_saturation": None,
+            },
+            "limits": {"max_wall_clock_s": 3600, "max_cpu_s": 7500, "max_tree_rss_mib": 8192},
+        },
+    ),
 }
 
 

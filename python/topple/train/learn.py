@@ -273,7 +273,7 @@ def _write_outputs(
     e_ref_j: float,
 ) -> None:
     history = ctx.history
-    best = choose_best(history, "balance")
+    best = choose_best(history, ctx.challenge.kind)  # type: ignore[arg-type]
     if best is None:
         raise RuntimeError("training finished without a selection eval")
     raised = set(run_flags(history, health=getattr(cfg, "health", None), e_ref_j=e_ref_j))

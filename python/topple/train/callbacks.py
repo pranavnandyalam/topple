@@ -194,7 +194,7 @@ class SelectionCallback(BaseCallback):
         ctx.history.append(row)
         ctx.scores.append(result.scores)
         ctx.selection_s += wall
-        best = choose_best(ctx.history, "balance")
+        best = choose_best(ctx.history, ctx.challenge.kind)  # type: ignore[arg-type]
         if best is not None and (best.step, best.eligible) != self._best_key:
             write_best_json(ctx.out / "best.json", best, ctx.baseline.rule)
             self._best_key = (best.step, best.eligible)

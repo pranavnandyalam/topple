@@ -38,6 +38,7 @@ from topple.evaluate import FALL_REASONS, EvalProtocol
 from topple.policy.manifest import policy_task
 from topple.pool import ONPOLICY_ROWS, EpisodeRows, PolicyRef, policy_ref, submit_episodes_with_rows
 from topple.results import summarize
+from topple.stats import paired_bootstrap
 
 if TYPE_CHECKING:
     from topple.policy.build import ObsNorm
@@ -77,6 +78,12 @@ FLAGS: Final = (
 """Every flag, in the order ``train_meta.flags`` lists them (a tuple: never a set's order, which
 follows the string hash seed and so changes from process to process)."""
 FLOAT_SLACK: Final = 1e-9
+WAYPOINT_DRIVER: Final = "waypoint_pid_example.py"
+WAYPOINT_CREEPER: Final = "anchors/creeper.py"
+WAYPOINT_MIN_DOCKED: Final = 0.65
+"""§8.8: item 6's docked >= 0.60 with a 0.05 margin, like balance's saturation 0.08 vs 0.10."""
+WAYPOINT_FALL_MARGIN: Final = 0.20
+WAYPOINT_MIN_PAIRED_LO: Final = -5.0
 """Success rates are k/n: a drop of 0.85 - 0.75 is 0.0999999... in floating point."""
 
 
@@ -121,7 +128,9 @@ class SelectionResult:
         }
 
 
-def summarize_episodes(episodes: Sequence[EpisodeResult], *, step: int) -> SelectionResult:
+def summarize_episodes(
+    episodes: Sequence[EpisodeResult], *, step: int, episode_s: float | None = None
+) -> SelectionResult:
     """The ``SelectionResult`` of ``episodes`` (one per selection seed, in seed order): score and
     success rate are the leaderboard's own aggregate (``results.summarize``, contract §12). An
     episode without metrics (``missing``) counts 0 energy, 0 saturation and no fall."""
@@ -141,8 +150,29 @@ def summarize_episodes(episodes: Sequence[EpisodeResult], *, step: int) -> Selec
         median_energy_j=float(median(energy)),
         mean_saturation=math.fsum(saturation) / n,
         scores=tuple(float(e.score) for e in episodes),
-        extras={"fell": fell / n},
+        extras={"fell": fell / n, **_waypoint_extras(episodes, episode_s)},
     )
+
+
+def _waypoint_extras(
+    episodes: Sequence[EpisodeResult], episode_s: float | None
+) -> dict[str, float]:
+    """§8.8: a waypoint eval also records mean gates, the docked rate and the median finish
+    time (a non-finisher, and a missing episode, counts the whole episode, as ``t_finish_s``
+    does). Empty for a balance eval."""
+    if not any(e.metrics is not None and "waypoints" in e.metrics for e in episodes):
+        return {}
+    if episode_s is None:
+        raise ValueError("a waypoint selection eval needs the episode length")
+    n = len(episodes)
+    gates = [0.0 if e.metrics is None else float(e.metrics["waypoints"]) for e in episodes]
+    docked = sum(e.metrics is not None and e.metrics.get("docked") is True for e in episodes)
+    finish = [episode_s if e.metrics is None else float(e.metrics["t_finish_s"]) for e in episodes]
+    return {
+        "mean_gates": math.fsum(gates) / n,
+        "docked": docked / n,
+        "median_t_finish_s": float(median(finish)),
+    }
 
 
 def _metric(e: EpisodeResult, name: str) -> float:
@@ -178,7 +208,9 @@ def evaluate_policy_bytes(
     width = policy_task(protocol.challenge).obs_dim
     rows = [e.obs_rows for e in episodes if e.obs_rows.shape[0]]
     onpolicy = np.concatenate(rows) if rows else np.empty((0, width), dtype=np.float32)
-    return summarize_episodes([e.result for e in episodes], step=step), onpolicy
+    episode_s = float(protocol.challenge.config.episode_seconds)
+    result = summarize_episodes([e.result for e in episodes], step=step, episode_s=episode_s)
+    return result, onpolicy
 
 
 def onpolicy_seed_count(onpolicy: npt.NDArray[np.float32]) -> int:
@@ -227,7 +259,13 @@ def measure_gate_baseline(
     if rule == "none":
         return GateBaseline("none")
     if rule == "waypoint":
-        raise NotImplementedError("the waypoint gate (creeper and reference driver) is phase 2b")
+        # §8.8: the reference driver and the creeper anchor, beside the PID example
+        root = pid_submission.parent
+        driver = policy_ref(root / WAYPOINT_DRIVER, challenge=protocol.challenge)
+        creeper = policy_ref(root / WAYPOINT_CREEPER, challenge=protocol.challenge)
+        reference, _ = evaluate_policy_bytes(driver, protocol, pool)
+        anchor, _ = evaluate_policy_bytes(creeper, protocol, pool)
+        return GateBaseline("waypoint", reference=reference, anchor=anchor)
     ref = policy_ref(pid_submission, challenge=protocol.challenge)
     reference, _ = evaluate_policy_bytes(ref, protocol, pool)
     return GateBaseline("pid", reference=reference)
@@ -244,7 +282,7 @@ def is_eligible(
     if base.rule == "none":
         return True
     if base.rule == "waypoint":
-        raise NotImplementedError("the waypoint gate (§8.8) is phase 2b")
+        return _waypoint_eligible(r, base)
     reference = base.reference
     if reference is None or sel.max_saturation is None:  # GateBaseline and the config check
         raise ValueError("the pid gate needs PID's result and selection.max_saturation")
@@ -252,6 +290,23 @@ def is_eligible(
         r.success_rate >= reference.success_rate
         and r.median_energy_j <= e_ref_j
         and r.mean_saturation <= sel.max_saturation
+    )
+
+
+def _waypoint_eligible(r: SelectionResult, base: GateBaseline) -> bool:
+    """§8.8: score above the creeper's, docked >= 0.65, falls at most the driver's + 0.20, and
+    the paired bootstrap lower bound of (scores - driver's) above -5 (every item-6 sub-gate)."""
+    driver, creeper = base.reference, base.anchor
+    if driver is None or creeper is None:
+        raise ValueError("the waypoint gate needs the driver's and the creeper's results")
+    if len(r.scores) != len(driver.scores):
+        raise ValueError("a waypoint eval and the driver's must cover the same seeds")
+    _, lo, _ = paired_bootstrap(r.scores, driver.scores)
+    return (
+        r.score > creeper.score
+        and r.extras["docked"] >= WAYPOINT_MIN_DOCKED
+        and r.extras["fell"] <= driver.extras["fell"] + WAYPOINT_FALL_MARGIN
+        and lo > WAYPOINT_MIN_PAIRED_LO
     )
 
 
