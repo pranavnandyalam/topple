@@ -4,7 +4,7 @@ This file moves work between Claude Code sessions (local Mac ⇄ cloud at claude
 **Whoever stops working must update it, commit it and push before stopping.** Nothing else
 carries over: local memory, scratch files and workflow scripts stay on the machine that made them.
 
-Last updated: 2026-10-17 by the local Mac session (Phase 2b built; review gate next). Branch `phase-2-learn` is pushed; PR #4 (Phase 2a)
+Last updated: 2026-10-17 ~14:40 by the local Mac session (Phase 2b gate fixes done; done script + merge next). Branch `phase-2-learn` is pushed; PR #4 (Phase 2a)
 is open. The training runs live only on the Mac, in `runs/` (gitignored; the shipped run is
 `runs/ppo_s2`, needed by `phase2_done.sh`'s re-export check).
 
@@ -26,41 +26,18 @@ is open. The training runs live only on the Mac, in `runs/` (gitignored; the shi
 
 ## Next steps, in order
 
-1. **Phase 2b next: the gate fix pass, then merge.** Review gate v6 (run wf_a21d6525-01f,
-   2026-10-17) on PR #9: the done-when verifier passed `scripts/phase2b_done.sh` from a fresh
-   clone with CI green (4,266 tests, 98% coverage). One HIGH, now fixed in `7536b81`:
-   `run_versions()` recorded `balancer.obs.v1` for waypoint runs. Still to do, in order:
-   - **Regenerate evidence** with the F1 fix: rerun `scripts/phase2b_results.py` (all six runs;
-     about 15 min) and `phase2b_media.py`; re-measure `docs/results/phase2b/anchors/
-     wp_anchors_darwin.json` (`topple compare` of the driver and 5 anchors on standard 0..399) and
-     re-run the `calibrate-waypoint` CI `anchors` job for the linux file. Do this once, after the
-     fixes below that change `phase2b.json`.
-   - **Done 2026-10-17:** gate binding (each comparison bound to its protocol and the
-     shipped bytes; per-run rows recomputed from `phase2b/runs_*.json`; §8.8 shipping replayed),
-     falls from the validated termination array with the extras cross-checked, `sim_unstable`
-     counted as an error, and the MP4 ftyp check (`7ab9e4d` and the commit after it). Still open
-     on item 8: check that the media show the shipped policy (e.g. the media script writes the
-     hero seed and policy sha to `phase2b.json`, and the gate checks them).
-   - **Video (MEDIUM):** the checkered dock is hard to see at GIF scale (make it larger or higher
-     contrast); add tests for a fall (epilogue, then the FELL hold), push arrows and the MP4 path; mark
-     rendering tests `render` so they skip when rendering is disabled. LOWs: keep the gate index in the
-     caption after a fall, don't let gate numbers hide the robot, anchor trails to a fixed grid,
-     remove the unused `_yaw_mat`, and decide whether the camera looks along or across the axis
-     (the spec says "along").
-   - **Tests (MEDIUM):** known-answer waypoint episode scores per platform (driver on 3 seeds, as
-     `test_golden.py` does for PID/LQR); env tests for next/final/after-dock observation semantics
-     (contract §6); tests for `phase2b_results.py` shipping, headline and arms. LOW: env ==
-     scorer events on 50 seeds (spec §8.5), not 10.
-   - **Contract LOWs:** the §12a metric order and the darwin E_ref figure.
-   - **Pranav's decision (2026-10-17, "you decide"): add `fall_cause` to balance-v1** as an
-     additive metric (spec §8.1 allows new keys; scores, success and hashes don't change). Check
-     that the 2a goldens and `phase2_done.sh` still pass; update contract §12, spec §8.5 and the
-     "known" note.
-   - Update spec §8.9's text: results go to `phase2b.json`/`phase2b.md`.
-   - Then: re-run `phase2b_done.sh` with CI green, a short re-review of the fixes (one agent per
-     area, high effort), and squash-merge PR #9.
-   Notes: `phase2_ci_check.py` cannot resolve the repo in a clone of a local path (set GH_REPO);
-   the CI python job went from 7 to 16 min (watch it; the 30-min timeout is the limit).
+1. **Phase 2b next: run the done script, then squash-merge PR #9.** The review gate (run
+   wf_a21d6525-01f) passed done-when from a fresh clone. Its one HIGH (`run_versions` schema,
+   `7536b81`) and every MEDIUM are fixed (`7ab9e4d`..`95b1226`), as is most of the LOW list.
+   The evidence was regenerated (`77c0a70`, linux anchors `b3b45f6`; scores unchanged). A
+   re-review found the gate trusted derived fields and the runs files; that's fixed in
+   `ee7434f`. `fall_cause` was added to balance-v1 per Pranav's "you decide" (`7f59f3e`;
+   2a evidence and gate unaffected). To finish:
+   - Wait for CI green on HEAD, run `scripts/phase2b_done.sh` (exit 0 expected), then
+     `gh pr merge 9 --squash`.
+   - Open LOW, accepted for now: `waypoint_media.json` names the policy and seeds but not the
+     media bytes. Possible follow-up: record each file's sha256 and re-render in the done script.
+   - Note: the CI python job takes about 16 min (it took 7 min before 2b); the timeout is 30.
 2. Usage: Pranav asked to stop at 55% weekly (2026-10-17). Pause at 97% of the 5-hour window.
 3. Then PLAN.md section 0's build order (Studio, your own robot, test scenarios, Arena, ...), and
    revise the Phase 3 design as a short design note.
