@@ -411,7 +411,7 @@ def fall_cause(
     """``push``, ``self`` or ``none`` (§8.5; a metric of both kinds).
 
     For a fall (``termination`` in ``FALL_REASONS``) at step ``fall_step`` (the episode's step
-    count T), ``push`` if some push started on a step s with ``0 <= fall_step - s <= W``, where
+    count T), ``push`` if some push started on a step s with ``0 < fall_step - s <= W``, where
     W = round(1.5 s / control_dt) steps (150 at 0.01 s), so a push exactly 1.5 s before counts and
     one starting after the fall does not; else ``self``. Every other reason is ``none``.
     Compared in whole steps, so the 1.5 s boundary is exact.
@@ -422,6 +422,7 @@ def fall_cause(
     if fall_step is None or isinstance(fall_step, bool) or fall_step < 0:
         raise ValueError(f"fall_step must be a step >= 0 for a fall, got {fall_step!r}")
     window = round(FALL_CAUSE_WINDOW_S / control_dt)
-    if any(0 <= fall_step - s <= window for s in push_start_steps):
+    # a push scheduled at step T never ran: the episode ended during step T - 1 (review)
+    if any(0 < fall_step - s <= window for s in push_start_steps):
         return "push"
     return "self"

@@ -388,6 +388,38 @@ def check_initial_state(pitch_rad: float, pitch_rate_rads: float) -> None:
     _check_range("init_pitch_rate_rads", pitch_rate_rads, -limit, limit)
 
 
+def check_preset_bounds(preset: Preset) -> None:
+    """Raise ``ValueError`` unless every scenario ``preset`` can draw lies inside the bounds
+    ``Scenario.from_dict`` enforces (contract §9, §10): a bundle-defined preset (§8.1) is checked
+    when its challenge loads, so the env never draws a scenario its own parser refuses."""
+    r = preset.randomization
+
+    def inside(name: str, rng: tuple[float, float], low: float, high: float) -> None:
+        if not (low <= rng[0] <= rng[1] <= high):
+            raise ValueError(f"preset {preset.name!r}: {name} {rng} is outside [{low}, {high}]")
+
+    inside("mass_scale", r.mass_scale, *SCALE_BOUNDS)
+    inside("wheel_friction_scale", r.wheel_friction_scale, *SCALE_BOUNDS)
+    lo = r.motor_gain_common[0] * r.motor_gain_per_wheel[0]
+    hi = r.motor_gain_common[1] * r.motor_gain_per_wheel[1]
+    inside("motor gain", (lo, hi), *SCALE_BOUNDS)
+    inside("frictionloss_scale", r.frictionloss_scale, *FRICTIONLOSS_SCALE_BOUNDS)
+    inside("com_x_offset_m", r.com_x_offset_m, -MAX_COM_X_OFFSET_M, MAX_COM_X_OFFSET_M)
+    delays = (min(r.actuator_delay_ms) / 1000.0, max(r.actuator_delay_ms) / 1000.0)
+    inside("actuator_delay", delays, 0.0, MAX_ACTUATOR_DELAY_S)
+    inside(
+        "imu_pitch_offset_rad",
+        r.imu_pitch_offset_rad,
+        -MAX_IMU_PITCH_OFFSET_RAD,
+        MAX_IMU_PITCH_OFFSET_RAD,
+    )
+    inside("gyro_bias_rads", r.gyro_bias_rads, -MAX_GYRO_BIAS_RADS, MAX_GYRO_BIAS_RADS)
+    inside("init_pitch_rad", r.init_pitch_rad, -MAX_INIT_PITCH_RAD, MAX_INIT_PITCH_RAD)
+    if preset.pushes is not None:
+        inside("impulse_ns", preset.pushes.impulse_ns, 0.0, MAX_PUSH_IMPULSE_NS)
+        inside("lateral_fraction_max", (0.0, preset.pushes.lateral_fraction_max), 0.0, 1.0)
+
+
 def validate_scenario(scenario: Scenario, *, clock: EpisodeClock | None = None) -> None:
     """Raise ``ValueError`` unless ``scenario`` is inside the contract's sane bounds (§9);
     with the env's ``clock``, its pushes must also fit the episode."""

@@ -170,3 +170,21 @@ def test_read_meta_accepts_both_formats(tmp_path: Path) -> None:
     make(width=10, meta={"challenge": "balance-v1"}).save_npz(b)
     assert read_meta(wp)["challenge"] == "waypoint-v1"
     assert read_meta(b)["challenge"] == "balance-v1"
+
+
+def test_a_65_wide_header_is_refused_before_its_data_is_read(tmp_path: Path) -> None:
+    """The header check fires before any obs data: a file whose obs member is only a header
+    claiming 65 columns (and no data) is refused for its width, not for truncation."""
+    path = tmp_path / "wide.npz"
+    make().save_npz(path)
+    members_ = members(path)
+    header = io.BytesIO()
+    np.lib.format.write_array_header_1_0(
+        header, {"descr": "<f4", "fortran_order": False, "shape": (5, 65)}
+    )
+    members_["obs.npy"] = b"\x93NUMPY\x01\x00" + header.getvalue()[8:]
+    with zipfile.ZipFile(path, "w") as zf:
+        for name, data in members_.items():
+            zf.writestr(name, data)
+    with pytest.raises(ValueError, match="obs must have shape"):
+        load_npz(path, max_steps=10, layout=WAYPOINT)

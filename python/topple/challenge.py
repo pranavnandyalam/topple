@@ -22,7 +22,7 @@ from topple.contract import (
     obs_features,
     validate_schema_id,
 )
-from topple.disturbances import PRESETS, Preset
+from topple.disturbances import PRESETS, Preset, check_preset_bounds
 from topple.ids import validate_challenge_id
 from topple.rng import validate_seed
 from topple.robot import RobotParams, challenge_dir, hashed_bytes, load_params, referenced_files
@@ -105,8 +105,9 @@ class ChallengeConfig(_Frozen):
     presets: tuple[str, ...]
     score: Any  # the kind's score model (ScoreConfig for balance), validated below
     seeds: SeedConfig
-    preset_defs: dict[str, Preset] = {}
-    """Bundle-defined presets (§8.1): a name here shadows ``PRESETS``."""
+    preset_defs: tuple[Preset, ...] = ()
+    """Bundle-defined presets (§8.1), written as a mapping name -> preset in the YAML; a name
+    here shadows ``PRESETS``. A tuple keeps the config hashable."""
     course: Any = None  # waypoint: its CourseConfig (topple.course), validated below
 
     @model_validator(mode="before")
@@ -116,6 +117,16 @@ class ChallengeConfig(_Frozen):
             return data
         kind = data.get("kind", "balance")
         out = dict(data)
+        defs = out.get("preset_defs")
+        if isinstance(defs, dict):
+            listed = []
+            for key, value in defs.items():
+                preset = Preset.model_validate(value)
+                if preset.name != key:
+                    raise ValueError(f"preset_defs[{key!r}] is named {preset.name!r}")
+                check_preset_bounds(preset)
+                listed.append(preset)
+            out["preset_defs"] = tuple(listed)
         if kind in ("balance", "waypoint") and "score" in out:
             out["score"] = score_model(kind).model_validate(out["score"])
         if kind == "waypoint":
@@ -140,11 +151,22 @@ class ChallengeConfig(_Frozen):
 
     @model_validator(mode="after")
     def _presets(self) -> ChallengeConfig:
-        unknown = set(self.presets) - set(PRESETS) - set(self.preset_defs)
+        defined = {p.name for p in self.preset_defs}
+        if len(defined) != len(self.preset_defs):
+            raise ValueError("preset_defs names must be unique")
+        unknown = set(self.presets) - set(PRESETS) - defined
         if unknown:
             raise ValueError(f"unknown presets {sorted(unknown)}")
         if self.obs_schema != KIND_OBS_SCHEMA[self.kind]:
             raise ValueError(f"a {self.kind} challenge emits {KIND_OBS_SCHEMA[self.kind]}")
+        if self.kind == "waypoint":
+            course, score = self.course, self.score
+            if not course.gate_radius_m < course.leg_m <= course.max_radius_m:
+                raise ValueError("a course needs gate_radius_m < leg_m <= max_radius_m")
+            if not course.max_attempts <= 100_000:
+                raise ValueError("course.max_attempts must be at most 100000")
+            if not score.t_par_s < self.episode_seconds:
+                raise ValueError("score.t_par_s must be below episode_seconds")
         return self
 
 
@@ -175,8 +197,10 @@ class Challenge:
         one, else ``PRESETS[name]``; only names in ``config.presets``."""
         if name not in self.config.presets:
             raise ValueError(f"{self.id} has no preset {name!r}")
-        defined = self.config.preset_defs.get(name)
-        return defined if defined is not None else PRESETS[name]
+        for defined in self.config.preset_defs:
+            if defined.name == name:
+                return defined
+        return PRESETS[name]
 
     def task_spec(self, wheel_radius_m: float, track_width_m: float) -> TaskSpec:
         if self.config.action_spec != BALANCE_V1_ACTION.id:

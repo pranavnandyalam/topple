@@ -442,7 +442,8 @@ def test_env_terminated(reason: str, expected: bool) -> None:
     ("pushes", "expected"),
     [
         ((), "self"),
-        ((500,), "push"),  # 0.5 s before
+        ((499,), "push"),  # the step before the fall
+        ((500,), "self"),  # scheduled at the fall step: it never ran
         ((350,), "push"),  # exactly 1.5 s before
         ((349,), "self"),  # 1.51 s before
         ((501,), "self"),  # after the fall
@@ -454,8 +455,10 @@ def test_fall_cause_window(reason: str, pushes: tuple[int, ...], expected: str) 
     assert fall_cause(reason, 500, pushes, DT) == expected
 
 
-def test_a_push_on_the_fall_step_counts() -> None:
-    assert fall_cause("fell", 500, (500,), DT) == "push"
+def test_a_push_scheduled_at_the_fall_step_never_ran() -> None:
+    """T is the step count at the fall, so a push starting at step T was never applied."""
+    assert fall_cause("fell", 500, (500,), DT) == "self"
+    assert fall_cause("fell", 500, (499,), DT) == "push"
 
 
 @pytest.mark.parametrize("reason", ["timeout", "error", "sim_unstable"])

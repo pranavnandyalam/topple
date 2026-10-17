@@ -43,10 +43,13 @@ def challenge_with(impulse_hi: float | None) -> Any:
     base: Challenge = load_challenge("waypoint-v1")
     if impulse_hi is None:
         return base
-    std = base.config.preset_defs["standard"]
+    std = base.preset("standard")
     assert std.pushes is not None
     pushes = std.pushes.model_copy(update={"impulse_ns": (std.pushes.impulse_ns[0], impulse_hi)})
-    presets = {**base.config.preset_defs, "standard": std.model_copy(update={"pushes": pushes})}
+    presets = tuple(
+        std.model_copy(update={"pushes": pushes}) if p.name == "standard" else p
+        for p in base.config.preset_defs
+    )
     return replace(base, config=base.config.model_copy(update={"preset_defs": presets}))
 
 

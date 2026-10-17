@@ -138,6 +138,8 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self.challenge: Challenge = (
             challenge if isinstance(challenge, Challenge) else load_challenge(challenge)
         )
+        if type(self) is BalanceEnv and self.challenge.kind != "balance":
+            raise ValueError(f"{self.challenge.id} is a {self.challenge.kind} challenge: make_env")
         if preset not in self.challenge.config.presets:
             raise ValueError(f"preset {preset!r} is not part of {self.challenge.id}")
         if render_mode is not None and render_mode not in self.metadata["render_modes"]:
