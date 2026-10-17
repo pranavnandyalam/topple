@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from phase2_common import RunSummary
 from topple.challenge import load_challenge
 from topple.compare import SCORELESS, Comparison, Entry
-from topple.evaluate import EvalProtocol
+from topple.evaluate import FALL_REASONS, EvalProtocol
 from topple.export import (
     MIN_SATURATED,
     MIN_UNSATURATED,
@@ -114,18 +114,25 @@ def entry(cmp: Comparison, entry_id: str) -> Entry:
 
 
 def rates(e: Entry) -> Rates:
+    """``e``'s rates. Falls come from the validated ``termination`` array (contract §11); the
+    extras must agree with it (``fell`` per seed, and every success docked), so a forged or
+    inconsistent extras column is refused, never counted. An error is any scoreless episode
+    (``error``, ``sim_unstable``, ``missing``)."""
     n = len(e.scores)
     if n == 0:
         raise Phase2bError(f"{e.id}: no episodes")
     docked = e.extras["docked"]
-    fell = e.extras["fell"]
-    causes = Counter(str(c) for c, f in zip(e.extras["fall_cause"], fell, strict=True) if f is True)
+    fell = [t in FALL_REASONS for t in e.termination]
+    for k, (f, x, d, ok) in enumerate(zip(fell, e.extras["fell"], docked, e.success, strict=True)):
+        if (x is not None and x is not f) or (ok and d is not True):
+            raise Phase2bError(f"{e.id}: seed index {k}: extras disagree with the termination")
+    causes = Counter(str(c) for c, f in zip(e.extras["fall_cause"], fell, strict=True) if f)
     return Rates(
         n=n,
-        errors=sum(t in SCORELESS - {"sim_unstable"} for t in e.termination),
+        errors=sum(t in SCORELESS for t in e.termination),
         score=math.fsum(e.scores) / n,
         docked=sum(d is True for d in docked) / n,
-        fell=sum(f is True for f in fell) / n,
+        fell=sum(fell) / n,
         falls_by_cause=dict(sorted(causes.items())),
         median_energy_j=median(e.energy_j),
         median_t_finish_s=median(  # an errored episode is a non-finisher (§8.6 ranking)

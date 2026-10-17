@@ -206,3 +206,27 @@ def test_exchange_rate_is_docked_survivors_minus_fallers() -> None:
 def test_mean_sd() -> None:
     assert wp.mean_sd([1.0, 2.0, 3.0]) == pytest.approx((2.0, 1.0))
     assert wp.mean_sd([5.0]) == (5.0, 0.0)
+
+
+def test_rates_refuse_extras_that_disagree_with_the_termination() -> None:
+    e = ent("p", flat(70.0), docked=40, fell=5)
+    forged = list(e.extras["fell"])
+    forged[0] = True  # a docked survivor claimed as a fall
+    with pytest.raises(wp.Phase2bError, match="extras disagree"):
+        wp.rates(e.model_copy(update={"extras": {**e.extras, "fell": tuple(forged)}}))
+    undocked = list(e.extras["docked"])
+    undocked[0] = False  # a success that never docked
+    with pytest.raises(wp.Phase2bError, match="extras disagree"):
+        wp.rates(e.model_copy(update={"extras": {**e.extras, "docked": tuple(undocked)}}))
+
+
+def test_sim_unstable_counts_as_an_error() -> None:
+    e = ent("p", flat(70.0), docked=40, fell=0)
+    term = ("sim_unstable", *e.termination[1:])
+    scores = (0.0, *e.scores[1:])
+    success = (False, *e.success[1:])
+    extras = {k: (None, *v[1:]) for k, v in e.extras.items()}
+    bad = e.model_copy(
+        update={"termination": term, "scores": scores, "success": success, "extras": extras}
+    )
+    assert wp.rates(bad).errors == 1

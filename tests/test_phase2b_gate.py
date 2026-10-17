@@ -88,15 +88,42 @@ def test_item8_checks_presence_caps_and_gif_sides(tmp_path: Path) -> None:
     assert gate.item8(tmp_path) == ["waypoint.gif is not a 480x480 GIF"]
 
 
-def test_item6_judges_the_shipped_policy_and_needs_it_everywhere() -> None:
+def test_item6_judges_the_shipped_policy_and_binds_every_comparison() -> None:
+    """The synthetic comparisons are standard 0..49, so each is flagged as not its protocol;
+    the policy binding and the entry checks are judged on top of that."""
+    sha = "ab" * 32
     base = [driver(), ent(wp.CREEPER_ID, flat(60.0), docked=0, fell=0)]
-    good = comparison([*base, ent(gate.SHIPPED_ID, flat(79.0), docked=40, fell=5)])
-    assert gate.item6(good, good, good) == []
+    shipped = ent(gate.SHIPPED_ID, flat(79.0), docked=40, fell=5)
+    good = comparison([*base, shipped.model_copy(update={"policy_sha256": sha})])
+    not_protocol = [f"{n} is not its protocol at the current hash" for n in gate.EXPECTED_HASHES]
+    assert gate.item6(good, good, good, sha) == not_protocol
+    other = gate.item6(good, good, good, "cd" * 32)
+    assert "wp_eval: ppo_waypoint is not the submission's policy" in other
     weak = comparison([*base, ent(gate.SHIPPED_ID, flat(79.0), docked=20, fell=5)])
-    assert gate.item6(weak, good, good) == ["a_docked"]
+    assert gate.item6(weak, good, good, sha)[0] == "a_docked"
     without = comparison(base)
-    problems = gate.item6(good, without, good)
-    assert problems == ["wp_clean: waypoint-v1/standard: no single entry 'ppo_waypoint'"]
+    problems = gate.item6(good, without, good, sha)
+    assert "wp_clean: waypoint-v1/standard: no single entry 'ppo_waypoint'" in problems
+
+
+RUNS = REPORT.with_name("phase2b")
+
+
+def test_item5_rows_accept_the_committed_report_and_comparisons() -> None:
+    assert gate.item5_rows(report(doc()), RUNS) == []
+
+
+def test_item5_rows_catch_an_edited_row_and_a_reordered_shipping_list() -> None:
+    data = doc()
+    data["fresh"][0]["standard"]["score"] += 1.0
+    assert any("its standard row differs" in p for p in gate.item5_rows(report(data), RUNS))
+    data = doc()
+    data["fresh"][1]["item6"]["pass"] = not data["fresh"][1]["item6"]["pass"]
+    assert any("its item 6 differs" in p for p in gate.item5_rows(report(data), RUNS))
+    data = doc()
+    data["shipped"]["attempts"][0]["run"] = "ppo_wp_s1"
+    problems = gate.item5_rows(report(data), RUNS)
+    assert "the shipping attempts are not the candidates in rank order" in problems
 
 
 def test_main_exits_2_on_an_unreadable_input(

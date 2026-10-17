@@ -69,8 +69,20 @@ class GateInputError(Exception):
     """An input the gate cannot read (exit 2)."""
 
 
+def fresh_hash(preset: str) -> str:
+    return replace(EvalProtocol.from_id(f"waypoint-v1/{preset}"), seeds=FRESH_SEEDS).protocol_hash()
+
+
 def standard_hash() -> str:
-    return replace(EvalProtocol.from_id("waypoint-v1/standard"), seeds=FRESH_SEEDS).protocol_hash()
+    return fresh_hash("standard")
+
+
+EXPECTED_HASHES: Final = {
+    "wp_cal": lambda: fresh_hash("standard"),
+    "wp_clean": lambda: fresh_hash("clean"),
+    "wp_eval": lambda: EvalProtocol.from_id("wp_eval_v1").protocol_hash(),
+}
+RUNS_FILES: Final = {"standard": "wp_cal", "clean": "wp_clean", "wp_eval_v1": "wp_eval"}
 
 
 def gif_size(path: Path) -> tuple[int, int] | None:
@@ -108,15 +120,57 @@ def item5(rep: wp.Phase2bReport, md: str | None) -> list[str]:
     return out
 
 
-def item6(cal: Comparison, clean: Comparison, ev: Comparison) -> list[str]:
+def item6(cal: Comparison, clean: Comparison, ev: Comparison, policy_sha256: str) -> list[str]:
+    """Item 6 on ``wp_cal``; every comparison must be its own protocol (standard 0..399, clean
+    0..399, wp_eval_v1) and its ``ppo_waypoint`` entry the submission's policy bytes."""
     result = wp.item6(cal, SHIPPED_ID)
     out = [k for k, ok in result["checks"].items() if not ok]
-    for name, cmp in (("wp_clean", clean), ("wp_eval", ev)):
+    for name, cmp in (("wp_cal", cal), ("wp_clean", clean), ("wp_eval", ev)):
+        if cmp.protocol_hash != EXPECTED_HASHES[name]():
+            out.append(f"{name} is not its protocol at the current hash")
         try:
-            wp.entry(cmp, SHIPPED_ID)
+            if wp.entry(cmp, SHIPPED_ID).policy_sha256 != policy_sha256:
+                out.append(f"{name}: {SHIPPED_ID} is not the submission's policy")
             wp.entry(cmp, wp.DRIVER_ID)
         except wp.Phase2bError as exc:
             out.append(f"{name}: {exc}")
+    return out
+
+
+def item5_rows(rep: wp.Phase2bReport, runs_dir: Path) -> list[str]:
+    """The report's per-run rows equal their recomputation from the committed comparisons
+    (``phase2b/runs_*.json``), and its shipping attempts replay §8.8: the candidates in waypoint
+    ``rank_key`` order, each failing item 6 exactly as recomputed, the shipped run first to pass."""
+    from phase2_common import candidates
+    from phase2_results import core
+
+    cmps = {p: read_comparison(runs_dir / f"runs_{p}.json") for p in RUNS_FILES}
+    out = []
+    for p, cmp in cmps.items():
+        if cmp.protocol_hash != EXPECTED_HASHES[RUNS_FILES[p]]():
+            out.append(f"runs_{p}.json is not its protocol at the current hash")
+    for row in rep.fresh:
+        for p, cmp in cmps.items():
+            got = wp.rates(wp.entry(cmp, row.run)).to_json()
+            if got != getattr(row, p).model_dump(mode="json"):
+                out.append(f"{row.run}: its {p} row differs from runs_{p}.json")
+        if wp.item6(cmps["standard"], row.run) != row.item6.model_dump(mode="json", by_alias=True):
+            out.append(f"{row.run}: its item 6 differs from runs_standard.json")
+    ranked = candidates(
+        [core(r.summary.model_dump(mode="json")) for r in rep.runs], kind="waypoint"
+    )
+    tried = [a.run for a in rep.shipped.attempts]
+    if tried != ranked[: len(tried)]:
+        out.append("the shipping attempts are not the candidates in rank order")
+    for a in rep.shipped.attempts:
+        failed6 = [k for k, ok in wp.item6(cmps["standard"], a.run)["checks"].items() if not ok]
+        if failed6 and list(a.failed) != failed6:
+            out.append(f"{a.run}: its recorded item 6 failures are not the recomputed ones")
+    passed = [a.run for a in rep.shipped.attempts if not a.failed]
+    if passed != ([rep.shipped.run] if rep.shipped.run else []) or (
+        passed and tried[-1] != passed[0]
+    ):
+        out.append("the shipped run is not the first attempt that passed")
     return out
 
 
@@ -202,8 +256,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     items: dict[str, Callable[[], list[str]]] = {
         "1 challenge frozen": lambda: item1(cal, rep),
         "4 contract": lambda: item4(contract),
-        "5 results": lambda: item5(rep, md),
-        "6 learnability": lambda: item6(cal, clean, ev),
+        "5 results": lambda: item5(rep, md) + item5_rows(rep, args.report.with_name("phase2b")),
+        "6 learnability": lambda: item6(cal, clean, ev, rep.shipped.onnx_sha256 or ""),
         "7 fine-tune sanity": lambda: item7(rep),
         "8 video": lambda: item8(args.results_dir),
         "9 export": lambda: item9(rep, args.submission, args.fixture),
