@@ -3,10 +3,16 @@ name: calibrate-waypoint
 # waypoint-v1 calibration on the calibration platform, linux-x86_64 (docs/design/phase-2.md §8.7,
 # decision log R1): the reference driver on standard seeds 0..399 at 9 push ceilings, plus clean;
 # and the five anchors beside the driver on standard 0..399 with the frozen scorer (§8.7 table).
-# Runs when this file is pushed on a phase-* branch, or by hand; its only outputs are the
-# artifacts (nothing is written back to the repository).
+# The calibration is frozen (impulse_hi 0.375, E_ref 21.4 J), so a push of this file on a phase-*
+# branch re-measures only the anchors; the calibration job runs by hand (only_anchors: false).
+# Its only outputs are the artifacts (nothing is written back to the repository).
 on:
   workflow_dispatch:
+    inputs:
+      only_anchors:
+        description: Re-measure only the anchors (the calibration is frozen)
+        type: boolean
+        default: true
   push:
     branches: ['phase-*']
     paths: ['.github/workflows/calibrate-waypoint.yml']
@@ -16,6 +22,7 @@ permissions:
 
 jobs:
   calibrate:
+    if: github.event_name == 'workflow_dispatch' && !inputs.only_anchors
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
