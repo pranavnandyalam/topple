@@ -26,11 +26,13 @@ is open. The training runs live only on the Mac, in `runs/` (gitignored; the shi
 
 ## Next steps, in order
 
-1. **Phase 2b next**: slice 3 needs its background reviewer (high effort). Then the pilot
-   `ppo_waypoint.yaml` seed 0 in a clean worktree at the committed HEAD (like `../p2-train`);
-   set waypoint `max_cpu_s` = 3x the pilot's cpu_s and apply the budget rule; the fine-tune arm
-   (`ppo_waypoint_ft.yaml`, `surgery.extend_obs`); 3+3 seed runs; 2b results and done-when
-   (§8.9); review gate; squash-merge.
+1. **Phase 2b next**: slices 1-3, fine-tune init (`fa2cc78`) and the pilot (`3654537`) are done
+   and reviewed. Pilot passed §8.9 item 6 (PPO 81.95 vs driver 80.24, docked 88.5%); budget rule
+   kept 6M; waypoint `max_cpu_s` 7,129. Running in `../p2-train` at `3654537`: `runs/ppo_wp_s{0,1,2}`
+   then `runs/ppo_wpft_s{0,1,2}` (one at a time, ~13 min each). Then: linux anchors from the
+   `calibrate-waypoint` CI artifact (`wp-anchors-linux`), shipping (§8.8: best eligible of 6,
+   `rank_key(..., "waypoint")` in `scripts/phase2_common.py:570` still says balance), the 2b results
+   and `phase2b_gate.py` done-when (§8.9), the phase review gate, squash-merge.
 2. Usage: Pranav asked to stop at 55% weekly (2026-10-17). Pause at 97% of the 5-hour window.
 3. Then PLAN.md section 0's build order (Studio, your own robot, test scenarios, Arena, ...), and
    revise the Phase 3 design as a short design note.
