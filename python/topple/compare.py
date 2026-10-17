@@ -58,6 +58,7 @@ from topple.results import (
 )
 from topple.rng import MAX_SEED
 from topple.stats import N_RESAMPLES, SEED, bootstrap_ci, paired_bootstrap
+from topple.waypoint import SCORE_PARTS
 
 if TYPE_CHECKING:
     from topple.evaluate import EvalProtocol
@@ -74,6 +75,20 @@ the controller per task stays cheap. Results never depend on it."""
 MISSING: Final = "missing"
 UNKNOWN_ID: Final = "unknown"
 MINUS: Final = "\u2212"  # a typographic minus: ids may hold "-", which is escaped
+WAYPOINT_EXTRAS: Final = (
+    "waypoints",
+    "progress",
+    "docked",
+    "fell",
+    "t_finish_s",
+    "max_hold_steps",
+    "fall_cause",
+    *SCORE_PARTS,
+)
+"""The waypoint-v1 metrics (§8.6) an entry records per seed beyond the common arrays, so the 2b
+gate recomputes docked and fell rates, fall causes and score parts from the file alone; ``None``
+for an episode without metrics. balance-v1 entries record none."""
+EXTRAS_OF_KIND: Final[dict[str, tuple[str, ...]]] = {"balance": (), "waypoint": WAYPOINT_EXTRAS}
 _ASCII_PUNCTUATION: Final = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 
 
@@ -245,7 +260,7 @@ def compare(subs: Sequence[Path], protocol: EvalProtocol, *, workers: int = 4) -
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
     entries = tuple(
-        _entry(name, sub, episodes)
+        _entry(name, sub, episodes, protocol.challenge.kind)
         for name, (sub, _), episodes in zip(ids, loaded, runs, strict=True)
     )
     return Comparison(
@@ -278,7 +293,7 @@ def _collect(futures: Sequence[Future[list[EpisodeResult]]], n: int) -> list[Epi
     return episodes
 
 
-def _entry(name: str, sub: Submission, episodes: Sequence[EpisodeResult]) -> Entry:
+def _entry(name: str, sub: Submission, episodes: Sequence[EpisodeResult], kind: str) -> Entry:
     return Entry(
         id=name,
         policy_sha256=sub.policy_sha256,
@@ -288,8 +303,16 @@ def _entry(name: str, sub: Submission, episodes: Sequence[EpisodeResult]) -> Ent
         energy_j=tuple(_metric(e, "energy_j") for e in episodes),
         saturation_fraction=tuple(_metric(e, "saturation_fraction") for e in episodes),
         termination=tuple(_termination(e) for e in episodes),
-        extras={},
+        extras=_extras(episodes, kind),
     )
+
+
+def _extras(episodes: Sequence[EpisodeResult], kind: str) -> dict[str, tuple[ExtraValue, ...]]:
+    """``kind``'s extra metrics per seed (``None`` where an episode has no metrics)."""
+    return {
+        name: tuple(None if e.metrics is None else e.metrics[name] for e in episodes)
+        for name in EXTRAS_OF_KIND[kind]
+    }
 
 
 def _metric(e: EpisodeResult, name: str) -> float:
