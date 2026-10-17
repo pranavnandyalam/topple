@@ -26,15 +26,45 @@ is open. The training runs live only on the Mac, in `runs/` (gitignored; the shi
 
 ## Next steps, in order
 
-1. **Phase 2b next**: run `scripts/phase2b_done.sh` once CI is green on HEAD (item 10), then the
-   phase review gate (code, security, done-when verifier; max effort on trust-boundary code:
-   `compare.py` extras, `course_video.py` replay inputs, `phase2b_gate.py`), fix confirmed
-   findings, squash-merge. Open spec-vs-code notes from the contract update: (a) `fall_cause` is
-   recorded for waypoint only (§8.5 says both kinds; adding it to balance-v1 is allowed but changes
-   2a results files, so it is left for an owner decision); (b) `to_course_frame` and the obs
-   rotation use libm cos/sin on the reset heading (positions are per-platform anyway). The spec
-   says results go in `phase2.json`/`phase2.md`; 2b writes `phase2b.json`/`phase2b.md` instead so
-   the merged 2a evidence stays untouched (update §8.9's text to match at the gate).
+1. **Phase 2b next: the gate fix pass, then merge.** Review gate v6 (run wf_a21d6525-01f,
+   2026-10-17) on PR #9: the done-when verifier passed `scripts/phase2b_done.sh` from a fresh
+   clone with CI green (4,266 tests, 98% coverage). One HIGH, now fixed in `7536b81`:
+   `run_versions()` recorded `balancer.obs.v1` for waypoint runs. Still to do, in order:
+   - **Regenerate evidence** with the F1 fix: rerun `scripts/phase2b_results.py` (all six runs;
+     about 15 min) and `phase2b_media.py`; re-measure `docs/results/phase2b/anchors/
+     wp_anchors_darwin.json` (`topple compare` of the driver and 5 anchors on standard 0..399) and
+     re-run the `calibrate-waypoint` CI `anchors` job for the linux file. Do this once, after the
+     fixes below that change `phase2b.json`.
+   - **Gate binding (MEDIUM, `scripts/phase2b_gate.py`):** bind each comparison to its protocol
+     (standard 0..399, clean 0..399, wp_eval_v1) and the `ppo_waypoint` entry to the submission's
+     `policy_sha256`; check `phase2b.json`'s per-run rows against the committed
+     `phase2b/runs_*.json` comparisons; replay the §8.8 shipping order (`candidates(kind=
+     "waypoint")` over the summaries) and the attempts list.
+   - **Fall rates from the validated termination array** (MEDIUM, `phase2b_common.rates`):
+     `fell` = termination in FALL_REASONS, cross-checked against the extras; count `sim_unstable`
+     in `no_errors` (LOW).
+   - **Item 8 (MEDIUM):** check that the MP4 is really an MP4 (ftyp box) and that the media show
+     the shipped policy; accept the ladder's smaller GIF rungs or force 480 (the spec says 480x480).
+   - **Video (MEDIUM):** the checkered dock is hard to see at GIF scale (make it larger or higher
+     contrast); add tests for a fall (epilogue, then the FELL hold), push arrows and the MP4 path; mark
+     rendering tests `render` so they skip when rendering is disabled. LOWs: keep the gate index in the
+     caption after a fall, don't let gate numbers hide the robot, anchor trails to a fixed grid,
+     remove the unused `_yaw_mat`, and decide whether the camera looks along or across the axis
+     (the spec says "along").
+   - **Tests (MEDIUM):** known-answer waypoint episode scores per platform (driver on 3 seeds, as
+     `test_golden.py` does for PID/LQR); env tests for next/final/after-dock observation semantics
+     (contract §6); tests for `phase2b_results.py` shipping, headline and arms. LOW: env ==
+     scorer events on 50 seeds (spec §8.5), not 10.
+   - **Contract LOWs:** the §12a metric order and the darwin E_ref figure.
+   - **Pranav's decision (2026-10-17, "you decide"): add `fall_cause` to balance-v1** as an
+     additive metric (spec §8.1 allows new keys; scores, success and hashes don't change). Check
+     that the 2a goldens and `phase2_done.sh` still pass; update contract §12, spec §8.5 and the
+     "known" note.
+   - Update spec §8.9's text: results go to `phase2b.json`/`phase2b.md`.
+   - Then: re-run `phase2b_done.sh` with CI green, a short re-review of the fixes (one agent per
+     area, high effort), and squash-merge PR #9.
+   Notes: `phase2_ci_check.py` cannot resolve the repo in a clone of a local path (set GH_REPO);
+   the CI python job went from 7 to 16 min (watch it; the 30-min timeout is the limit).
 2. Usage: Pranav asked to stop at 55% weekly (2026-10-17). Pause at 97% of the 5-hour window.
 3. Then PLAN.md section 0's build order (Studio, your own robot, test scenarios, Arena, ...), and
    revise the Phase 3 design as a short design note.
