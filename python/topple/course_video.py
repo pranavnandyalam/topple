@@ -77,9 +77,9 @@ ROBOT_RGBA: Final = (
 )
 GATE_RGBA: Final = np.array([0.2, 0.75, 0.3, 0.55], dtype=np.float32)
 GATE_DONE_RGBA: Final = np.array([0.5, 0.5, 0.5, 0.35], dtype=np.float32)
-DOCK_RGBA: Final = (
-    np.array([0.1, 0.1, 0.1, 0.8], dtype=np.float32),
-    np.array([0.95, 0.95, 0.95, 0.8], dtype=np.float32),
+DOCK_RGBA: Final = (  # opaque black and white: the dock must read at GIF scale
+    np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+    np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
 )
 CHECKER: Final = 4
 """Quadrants of the checkered dock disc (alternating colours)."""
@@ -223,11 +223,6 @@ def _disc(
     z: float = DISC_Z,
 ) -> None:
     _add(scene, mujoco.mjtGeom.mjGEOM_CYLINDER, (r, 0.001, 0.0), (xy[0], xy[1], z), rgba)
-
-
-def _yaw_mat(yaw: float) -> npt.NDArray[np.float64]:
-    c, s = math.cos(yaw), math.sin(yaw)
-    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
 
 def _course(scene: mujoco.MjvScene, replay: WaypointReplay, done: int, r: float) -> None:

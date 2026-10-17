@@ -61,6 +61,7 @@ def test_the_camera_frames_the_course_within_the_clamp(
     assert cam.elevation == cv.ELEVATION_DEG
 
 
+@pytest.mark.render
 def test_frames_are_square_and_follow_the_clock(pair: tuple[Trajectory, Trajectory]) -> None:
     frames = list(cv.course_frames([pair[0]], ["driver"], fps=10, size=160))
     t = cv.make_track(pair[0], "driver")
@@ -69,6 +70,7 @@ def test_frames_are_square_and_follow_the_clock(pair: tuple[Trajectory, Trajecto
     assert frames[0].std() > 0  # something is drawn
 
 
+@pytest.mark.render
 def test_two_robots_render_in_one_scene(pair: tuple[Trajectory, Trajectory]) -> None:
     one = next(iter(cv.course_frames([pair[0]], ["a"], fps=10, size=160)))
     two = next(iter(cv.course_frames(list(pair), ["a", "b"], fps=10, size=160)))
@@ -91,6 +93,7 @@ def test_bad_arguments_fail_before_rendering(pair: tuple[Trajectory, Trajectory]
         cv.course_frames([pair[0]], ["a"], fps=7, size=160)
 
 
+@pytest.mark.render
 def test_the_gif_ladder_takes_the_first_rung_within_the_cap(
     pair: tuple[Trajectory, Trajectory], tmp_path: Path
 ) -> None:
@@ -103,3 +106,49 @@ def test_the_gif_ladder_takes_the_first_rung_within_the_cap(
                              max_bytes=100)  # fmt: skip
     assert not (tmp_path / "small.gif").exists()
     assert WAYPOINT_LADDER[0] == GifRung(480, 10)
+
+
+@pytest.fixture(scope="module")
+def fall() -> Trajectory:
+    """The driver falls on standard seed 63 (wp_anchors_darwin.json)."""
+    return episode(DRIVER, "standard", 63)
+
+
+def test_a_fallen_track_ends_at_its_fall_and_holds_with_a_stamp(fall: Trajectory) -> None:
+    t = cv.make_track(fall, "driver")
+    assert t.t_fall is not None
+    assert t.t_finish is None
+    assert t.end_s == t.t_fall
+    assert len(t.rows) == len(fall.qpos) + len(fall.epilogue_qpos)  # the epilogue plays
+    last = round(cv.end_time([t]) / t.control_dt)
+    assert last > len(fall.qpos)  # the video runs past the fall: epilogue, then the hold
+    assert cv._hud(t, last) == f"driver: FELL at {t.t_fall:.2f} s"
+
+
+@pytest.mark.render
+def test_a_fall_renders_through_the_epilogue_and_holds(fall: Trajectory) -> None:
+    frames = list(cv.course_frames([fall], ["driver"], fps=10, size=160))
+    t = cv.make_track(fall, "driver")
+    assert len(frames) == round(cv.end_time([t]) / 0.01) // 10 + 1
+    assert np.array_equal(frames[-1][40:], frames[-2][40:])  # held pose (below the HUD)
+
+
+@pytest.mark.render
+def test_push_arrows_are_drawn(fall: Trajectory) -> None:
+    from dataclasses import replace as dc_replace
+
+    start = int(fall.meta["scenario"]["pushes"][0]["start_step"])
+    quiet = dc_replace(fall, push_force=np.zeros_like(fall.push_force))
+    k = start // 10  # the frame (fps 10, stride 10) whose window holds the push onset
+    with_push = list(cv.course_frames([fall], ["a"], fps=10, size=160))[k]
+    without = list(cv.course_frames([quiet], ["a"], fps=10, size=160))[k]
+    assert not np.array_equal(with_push, without)
+
+
+@pytest.mark.render
+def test_render_course_writes_an_mp4(pair: tuple[Trajectory, Trajectory], tmp_path: Path) -> None:
+    out = tmp_path / "wp.mp4"
+    n = cv.render_course([pair[0]], ["a"], out, fps=10, size=160)
+    t = cv.make_track(pair[0], "a")
+    assert n == round(cv.end_time([t]) / 0.01) // 10 + 1
+    assert out.read_bytes()[4:8] == b"ftyp"
