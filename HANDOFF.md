@@ -20,15 +20,18 @@ is open. The training runs live only on the Mac, in `runs/` (gitignored; the shi
 | Linux recalibration | E_ref **13.1 J** on linux-x86_64 (the calibration platform); darwin goldens re-pinned (`07681c8`) |
 | Direction update | `PLAN.md` section 0 (2026-10-11): workbench for people's own robot projects, Studio, Arena with FRC drive practice, revised build order |
 | Deferred risks | `docs/design/deferred-risks.md` |
+| **Phase 2a** | **Merged to `main` as 386df1e (PR #4)** |
+| **Phase 2b (waypoint-v1)** | Branch `phase-2b-waypoint` (pushed). Slice 1 kinds/traj2/course/scorer (`28c806e`, review fixes `6293af1`); slice 2 env, bundle, kinds dispatch, Driver, 5 anchors (`a6399e1`); calibration frozen impulse_hi 0.375, E_ref 21.4 J linux (`5e80388`); slice 3 training support, waypoint selection gate, `ppo_waypoint.yaml`, anchors (`03096ca`). Anchors on standard 0..399: driver 80.24, balance_in_place 19.89, spin 17.45, creeper 60.65, gates_only 68.86, reckless 71.26: all §8.7 checks pass |
 | Phase 3 design inputs | Branch `phase-3-design` (draft + critiques, not yet revised). Never merge it wholesale |
 
 ## Next steps, in order
 
-1. Finish the Phase 2a review-gate fixes (B54: canonical metadata text, G9 push runs only, retry
-   chain, test gaps), push, CI green, re-run `phase2_done.sh`, **squash-merge PR #4**.
-2. **Phase 2b** (waypoint-v1, `topple.traj/2`, spec §8): build in slices in the main session
-   (working mode below), pass the challenge kind to `choose_best` (B52 note), its own done-when
-   (§8.9) and review gate.
+1. **Phase 2b next**: slice 3 needs its background reviewer (high effort). Then the pilot
+   `ppo_waypoint.yaml` seed 0 in a clean worktree at the committed HEAD (like `../p2-train`);
+   set waypoint `max_cpu_s` = 3x the pilot's cpu_s and apply the budget rule; the fine-tune arm
+   (`ppo_waypoint_ft.yaml`, `surgery.extend_obs`); 3+3 seed runs; 2b results and done-when
+   (§8.9); review gate; squash-merge.
+2. Usage: Pranav asked to stop at 55% weekly (2026-10-17). Pause at 97% of the 5-hour window.
 3. Then PLAN.md section 0's build order (Studio, your own robot, test scenarios, Arena, ...), and
    revise the Phase 3 design as a short design note.
 
