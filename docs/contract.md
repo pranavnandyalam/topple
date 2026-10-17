@@ -10,22 +10,27 @@ J this way on 2026-10-15, when it was re-measured on the ranked platform, §12).
 covers. The push impulse band (§10) lives in the `standard` preset's push config
 (`topple.disturbances.PRESETS`, shared env code), which `protocol_hash` covers as part of the full
 preset definition. So an edit to `E_ref` moves every balance-v1 protocol hash, and an edit to the
-band moves `balance-v1/standard`'s (§13).
+band moves `balance-v1/standard`'s (§13). waypoint-v1 freezes earlier, at the end of Phase 2b
+(§13); its **[calibrated]** `E_ref` (§12a) and push impulse band (§10) both live in
+`challenges/waypoint-v1/challenge.yaml` (the band in its own `standard` preset, §10), so
+`bundle_hash` covers both and `protocol_hash` the band a second time through the resolved preset.
 
 ## 1. Identifiers
 
 | Kind | Grammar | Example |
 |---|---|---|
 | Challenge | `[a-z][a-z0-9]*(-[a-z][a-z0-9]*)*-v[1-9][0-9]*` | `balance-v1`, `waypoint-v1`, `sumo-v1` |
-| Protocol | `<challenge>/<preset>` | `balance-v1/standard`, `balance-v1/clean` |
-| Gymnasium id | `topple/<Pascal>-v<N>` (1:1 with challenge) | `topple/Balance-v1` |
-| Schema | `<family>.<obs\|robot\|effort>.v<N>` | `balancer.obs.v1`, `diffdrive.effort.v1`, `balancer.robot.v1` |
-| Artifact format | `topple.<kind>/<N>` | `topple.traj/1`, `topple.results/1` |
+| Protocol | `<challenge>/<preset>` | `balance-v1/standard`, `balance-v1/clean`, `waypoint-v1/standard` |
+| Gymnasium id | `topple/<Pascal>-v<N>` (1:1 with challenge) | `topple/Balance-v1`, `topple/Waypoint-v1` |
+| Schema | `<family>.<obs\|robot\|effort>.v<N>` | `balancer.obs.v1`, `balancer-target.obs.v1`, `diffdrive.effort.v1`, `balancer.robot.v1` |
+| Artifact format | `topple.<kind>/<N>` | `topple.traj/1`, `topple.traj/2`, `topple.results/1` |
 
-Permanent protocol aliases: `eval_v1` → `balance-v1/standard` and `eval_v1_clean` →
-`balance-v1/clean`, accepted wherever a protocol is named (`--protocol`, `EvalProtocol.from_id`);
-files always store the canonical id (§15). Schema ids have no aliases: `obs_v1` is only an
-informal name for `balancer.obs.v1` (its Python class `BalancerObs` is also exported as
+Permanent protocol aliases: `eval_v1` → `balance-v1/standard`, `eval_v1_clean` →
+`balance-v1/clean` and `wp_eval_v1` → `waypoint-v1/standard` (`topple.ids.PROTOCOL_ALIASES`),
+accepted wherever a protocol is named (`--protocol`, `EvalProtocol.from_id`); files always store
+the canonical id (§15). The Gymnasium ids `topple/Balance-v1` and `topple/Waypoint-v1` are
+registered by importing `topple.envs`. Schema ids have no aliases: `obs_v1` is only an informal
+name for `balancer.obs.v1` (its Python class `BalancerObs` is also exported as
 `topple.contract.Observation`), and `validate_schema_id` and a challenge's `obs_schema` refuse
 it.
 
@@ -178,7 +183,10 @@ a camera named `track` (above), and names every taken name.
 - `act()` is called at exactly 100 Hz on every platform, firmware included (hardware timer,
   zero-order hold). Sensing and estimation run at the physics rate (500 Hz).
 - Time is an integer step counter `k`; `obs.t = k * control_dt`. Never derived from `data.time`.
-- Episode length: `episode_seconds = 10.0` → `max_steps = 1000`.
+- Episode length is per challenge: `max_steps = round(episode_seconds / control_dt)`
+  (`TaskSpec.max_steps`, `verify.protocol_max_steps`). balance-v1: `episode_seconds = 10.0` →
+  `max_steps = 1000`. waypoint-v1: `episode_seconds = 20.0` → `max_steps = 2000`. Both use
+  `control_dt = 0.01` s and the same physics step.
 
 ## 5. Sensing and estimation (how the Observation is produced)
 
@@ -258,7 +266,47 @@ class BalancerObs:            # alias: topple.contract.Observation
   controller and one behind a pipe receive bit-identical observations, and `obs` row k of a
   trajectory reproduces observation k bit for bit.
 - A published schema id never changes meaning or order; changes get a new id. Later tasks extend by
-  appending fields under a new id (e.g. `balancer-target.obs.v1` appends `target_x, target_y`).
+  appending fields under a new id (e.g. `balancer-target.obs.v1`, below, appends `gate_x, gate_y,
+  next_x, next_y, final`).
+
+**`balancer-target.obs.v1`** (waypoint-v1; frozen with it at the end of Phase 2b, §13):
+
+```python
+@dataclass(frozen=True, slots=True)
+class BalancerTargetObs:      # topple.contract
+    t: float                  # s since reset (metadata, not a feature)
+    pitch: float              # ... the balancer.obs.v1 fields, unchanged ...
+    pitch_rate: float
+    yaw: float
+    yaw_rate: float
+    wheel_pos: tuple[float, float]
+    wheel_vel: tuple[float, float]
+    last_action: tuple[float, float]
+    gate: tuple[float, float]  # m, current waypoint (x, y) in the yaw-only robot frame
+    next: tuple[float, float]  # m, the waypoint after it (equal to gate at the dock)
+    final: float               # 1.0 iff the current waypoint is the dock, else 0.0
+```
+
+- Feature vector (`to_array`, float32, fixed order, 15 values, `topple.contract.TARGET_FEATURES`):
+  the 10 `balancer.obs.v1` features in their order, then `gate_x, gate_y, next_x, next_y, final`.
+  `t` is excluded. Wire format: 16 little-endian float64 (128 bytes), `t` + the feature order,
+  bitwise lossless. `final` must be exactly 0.0 or 1.0 (`ValueError` otherwise).
+- Quantization is as above: `controller_obs(obs_arr, t, *, schema="balancer-target.obs.v1")`
+  rounds the 15 features to float32 and widens them exactly; the 2-argument call still builds a
+  `BalancerObs`. The harness passes its challenge's schema.
+- The course (§9) has 5 waypoints: 0–3 are gates, 4 is the dock. `gate` is the current waypoint
+  and `next` the one after it (equal to `gate` while the dock is current); after docking `gate =
+  next = dock` and `final = 1`. The observation returned by the step that reaches gate k already
+  shows gate k+1 (the reach rules are §12a's).
+- Both points are in the yaw-only robot frame (x forward, y left, origin at the axle midpoint),
+  computed from the **true** pose (the root's `qpos` position and the yaw of its quaternion) at
+  the same instant as the other features: an idealized beacon, without noise or delay. The `yaw`
+  feature stays the odometry yaw of §5.
+- `wheel_pos` (about 100 rad over a course) and `yaw` (wraps at ±π) are non-stationary on courses.
+- The course constants reach the controller through `TaskSpec.extras` (§8, `str → float`):
+  `n_waypoints, leg_m, turn_deg_min, turn_deg_max, max_radius_m, max_attempts, gate_radius_m,
+  dock_hold_steps`. A seed's course itself is not in `TaskSpec`: the controller sees it only
+  through `gate` and `next`.
 
 ## 7. Action `diffdrive.effort.v1`
 
@@ -384,15 +432,39 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
 - Streams: `np.random.default_rng(np.random.SeedSequence(episode_seed, spawn_key=(agent, stream)))`
   with append-only stream ids `INIT=0, PUSHES=1, SENSOR=2, MODEL=3, DELAY=4, CONTROLLER=5,
   TARGETS=6`. `agent` is 0 for single-robot tasks.
-- TARGETS (waypoint tasks, `topple.course`) draws courses by rejection: each attempt takes, in
-  order, the first heading `h0` = U(−π, π) (one double), `n_waypoints − 1` turn magnitudes
-  U(rad(turn_deg_min), rad(turn_deg_max)) (one double each) and as many signs
-  (`integers(0, 2)`), and is accepted iff every waypoint lies within `max_radius_m` of the
-  start; `max_attempts` failures raise `RuntimeError`. Acceptance decides how much of the stream
-  is consumed, so the waypoints are computed with the portable `pcos`/`psin` (Python float
-  `+ − ×` only, never libm or numpy), and draws follow the portable U rule below. Only the
-  accepted `{h0, turns}` (signed radians) are stored; the points are derived from them with the
-  same functions wherever they are used.
+- Stream `TARGETS = 6` (waypoint tasks, `topple.course.make_course(seed, cfg)`, frozen with
+  waypoint-v1, §13) draws courses by rejection: each attempt takes, in order, the first heading
+  `h0` = U(−π, π) (one double), `n_waypoints − 1` turn magnitudes U(rad(turn_deg_min),
+  rad(turn_deg_max)) (one double each) and as many signs (`integers(0, 2, size=n_waypoints − 1)`,
+  raw bits; sign 1 is `+`), and is accepted iff every waypoint lies within `max_radius_m` of the
+  start (`x² + y² ≤ max_radius_m²`); `max_attempts` failures raise `RuntimeError`. Headings
+  accumulate (`θ_0 = h0`, `θ_k = θ_{k−1} + turn_{k−1}`) and `p_k = p_{k−1} + leg_m·(pcos θ_k,
+  psin θ_k)` from `p_{−1} = (0, 0)`, in the start frame (origin = axle midpoint at reset, x = the
+  initial heading). waypoint-v1 (`course` in its `challenge.yaml`): 5 waypoints, `leg_m` 0.70,
+  turns of 30°–150°, `max_radius_m` 1.5, `max_attempts` 1000 (about 44% of attempts are
+  accepted; path length 3.5 m, mean turn about 98°).
+- **Portable acceptance.** Acceptance decides how much of the stream is consumed, so it must come
+  out the same on every platform: draws follow the portable U rule below (never
+  `Generator.uniform`), and the waypoints are computed with the portable `pcos`/`psin`, never libm
+  or numpy, whose cos and sin may differ in the last bit between platforms (numpy's even within
+  one, cf. §12's arccos rule) and could accept a course near the radius on one platform and refuse
+  it on another. They use Python float `+`, `−` and `×` only (IEEE-754, correctly rounded; CPython
+  never fuses them): `k = round(θ / 2π)`, `r = (θ − k·6.28125) − k·(2π − 6.28125)` with `2π =
+  2.0 * math.pi`, then the Taylor polynomials of cos and sin through r^30 and r^31 (16 terms each,
+  coefficients `(−1)^n / (2n)!` and `(−1)^n / (2n + 1)!` from exact integer division) by Horner in
+  a fixed order. `tests/test_course.py` pins `pcos`/`psin` at fixed inputs and the courses of seeds
+  0, 3000 and 2**53−1, on every platform.
+- **`Scenario.course`.** Only the accepted draws `{h0, turns}` (signed radians) are stored, so the
+  scenario stays portable bit for bit; `course_points` derives the 5 points from them with the
+  same `pcos`/`psin` wherever they are used (env, scorer, video), so the points too are the same
+  doubles on every platform. `course` is written only when the challenge has a course
+  (balance-v1's scenarios keep their key set). `make_scenario(..., course=<the challenge's
+  CourseConfig>)` adds it; `Scenario.from_dict(data, *, clock=None, challenge=None)` with a
+  challenge requires its preset to be one of the challenge's (§10) and the key exactly when the
+  challenge has a course (without `challenge`, Phase 1's rule: no course, preset names from
+  `PRESETS`), and checks it: exactly the keys `h0` and `turns`, JSON floats (an integer literal is
+  refused) that are finite, `|h0| ≤ π`, exactly `n_waypoints − 1` = 4 turns, each `|turn|` in
+  [rad(turn_deg_min), rad(turn_deg_max)].
 - Controller seed: `SeedSequence(entropy=(episode_seed, salt), spawn_key=(0, CONTROLLER))
   .generate_state(1, uint64)[0] >> 11`; `salt = 0` for public protocols, a 128-bit secret for
   private ones.
@@ -444,6 +516,16 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
 
 ## 10. Disturbance presets
 
+Presets are per challenge. `Challenge.preset(name) -> Preset` returns the bundle's own definition
+when its `challenge.yaml` has one under `preset_defs`, else the shared `PRESETS[name]`
+(`topple.disturbances`), and accepts only the names the bundle lists in `presets`. Every lookup
+goes through it: the challenge's preset-name validation, the env (init, `set_preset`, reset),
+`make_scenario`'s callers, trusted verification (§16), `protocol_hash` (which hashes the resolved
+definition, §13) and `Scenario.from_dict(..., challenge=...)` (§9). A bundle preset is checked
+when its challenge loads against the bounds `Scenario.from_dict` enforces (§9), so the env never
+draws a scenario its own parser refuses. balance-v1 defines none: its presets are the shared ones
+below. waypoint-v1 defines its own (end of this section).
+
 | Preset | Sensors/estimator | Model randomization | Pushes |
 |---|---|---|---|
 | `ideal` | ground truth | none | none |
@@ -474,6 +556,25 @@ and the shipped PID 40–90% of `standard` episodes; measured on seeds 0..199 on
 the calibration platform (the one ranked scores come from, §13): LQR 87.5%, PID 65.0%; on
 darwin-arm64: LQR 86.5%, PID 64.5%; both 100% on `clean` on both platforms). Force is capped at
 50 N.
+
+**waypoint-v1** (`preset_defs` in its `challenge.yaml`) has only `clean` and `standard` (no
+`ideal`). Both use full sensors (§5) and the randomization above, unchanged, and draw the initial
+pitch as above; `clean` has no pushes. `standard` pushes with `PushConfig(count=(1, 2),
+impulse_ns=(0.15, 0.375), duration_s=0.1, earliest_s=2.0, latest_s=18.0, min_spacing_s=3.0,
+lateral_fraction_max=0.3, max_force_n=50.0)`, existing fields only, so `Preset`'s dump keeps its
+keys: count ∈ {1, 2}; the first push at t ≥ 2.0 s, spacing ≥ 3.0 s and the last at t ≤ 18.0 s,
+rounded to the control grid as above, so pushes start on steps 200 to 1800 inclusive, at least 300
+steps apart; the same 0.1 s pulse, application point and direction rule as balance-v1. The PUSHES
+stream still draws `MAX_PUSHES = 3` candidates whatever the count, so stream consumption never
+depends on it. Every push satisfies §9's clock checks (at most 0.375 N·s, far below 5 N·s).
+Impulse magnitude **[calibrated]** U(0.15, 0.375) N·s: the upper bound is the value among
+0.300, 0.325, …, 0.500 N·s at which the reference driver (`submissions/waypoint_pid_example.py`)
+falls in [3%, 10%] and docks in ≥ 88% of `waypoint-v1/standard` seeds 0..399, closest to 6% falls
+(ties to the lower value). Measured on `linux-x86_64`, the calibration platform: 6.5% falls and
+93.5% docked at 0.375 N·s (0.350: 5.2% / 94.8%; 0.400: 9.5% / 90.5%), and the driver scores 3.29
+points more on `clean` than on `standard`. darwin-arm64 measures 6.8% / 93.2% at 0.375 and
+5.2% / 94.8% at 0.350, a tie the rule would break toward 0.350 there; the calibration platform
+decides. The curve is recorded in the `challenge.yaml` header comment.
 
 ## 11. Termination, stability
 
@@ -547,28 +648,146 @@ where N is the number of episodes the protocol expects: a missing or errored epi
 Mean time upright is averaged over the episodes present (those with metrics). Ranking: round(score,
 2), ties broken by success rate, then mean time upright.
 
+**Metrics vocabulary.** A metric name means the same in every challenge that records it; each
+challenge lists the names it records (balance-v1 above, waypoint-v1 in §12a), and values are
+`float | int | bool | str`, never null. Adding a metric key to a published challenge is allowed
+when it changes no existing metric value, score, success or hash; removing or redefining one is
+not. Defined for both kinds:
+
+- `fall_cause` (str): for a fall (`termination` in `evaluate.FALL_REASONS` = {`fell`,
+  `floor_contact`}) at step T, `"push"` if some push of the scenario started on a step s with
+  `0 < T − s ≤ W`, W = round(1.5 s / control_dt) = 150 steps (so a push exactly 1.5 s before
+  counts, and one scheduled at step T, which never ran, does not), else `"self"`; `"none"` for
+  every other recorded reason (`timeout`, `error`, `sim_unstable`). Compared in whole steps, so the
+  1.5 s boundary is exact (`topple.waypoint.fall_cause`). 1.5 s, not 1.0: measured push-to-fall
+  latency reaches 0.92 s (reference driver) and 1.26 s (PPO), while every no-push PPO fall on
+  waypoint-v1 happened before 2.0 s, the earliest push time. waypoint-v1 records it in every
+  episode (§12a); balance-v1's recorded set is still the keys above, and adding `fall_cause` to it
+  is such an allowed addition.
+- `fell` (bool, waypoint-v1): `termination` in `FALL_REASONS`. Every "fall rate" means these
+  reasons.
+
+## 12a. Metrics and score (`waypoint-v1`)
+
+Drive through 4 gates and hold the dock for 1 s within `T_ep = episode_seconds = 20.0` s
+(`max_steps` 2000, §4). Course: §9 (`leg_m` L = 0.70 m; `gate_radius_m` r = 0.10 m;
+`dock_hold_steps` 100). Termination is §11's alone (`fell`, `floor_contact`, `sim_unstable`, else
+`timeout` at `max_steps`): docking does not end an episode and there is no drift termination.
+Public seeds 3000..3049 (`wp_eval_v1`); per-episode spread on `standard` is large, so 50-seed public
+scores are provisional, and Phase 3 ranks waypoint-v1 on at least 200 private seeds disjoint from
+the calibration seeds 0..399.
+
+Metrics, score and success are a pure function of the trajectory and its scenario's course
+(`topple.kinds.score_trajectory`; on the trusted path the verifier's own replay and the trusted
+scenario, §16). The rules are one function shared by the env and the scorer
+(`topple.waypoint.WaypointTracker`, via `waypoint_events`), so their events agree by construction:
+
+- **Positions.** Row k's position is the true axle midpoint (the root's `qpos` x, y) in the
+  course frame: relative to row 0's position, rotated by the yaw of row 0's root quaternion (the
+  env's reset heading). Waypoints are `course_points(scenario.course)` (§9). Distances are
+  `math.hypot` of Python floats.
+- **Rows.** Rows k = 1..T−1 are checked when the env ended the episode (recorded reason `fell`,
+  `floor_contact` or `sim_unstable`: the env skips the check on its terminating step), else
+  1..T (`timeout`, or `error` for an episode the harness stopped, §11).
+- **Gates.** At row k only the current waypoint is checked, so at most one waypoint advances per
+  step and the next one is first checked at row k+1. Gate i < 4 is reached at the first checked
+  row with distance ≤ r (inclusive).
+- **Dock.** From the row after it becomes current, `hold_k = hold_{k−1} + 1` if `d_k ≤ r`, else
+  0; docked at the first row with `hold_k = 100`, `t_finish = k · control_dt`, and nothing is
+  checked after that. `max_hold_steps` is the longest streak (< 100 unless docked).
+- **`d_min`** is the closest distance to the current waypoint since it became current: its
+  distance on that row (row 0 for gate 0), then the minimum over the rows checked since.
+
+Episode score (0–100), the exact sum (`math.fsum`) of four parts, clipped to [0, 100]:
+
+```
+course_pts  = 55 · (g + p) / 5
+speed_pts   = 25 · docked · clip((T_ep − t_finish) / (T_ep − t_par), 0, 1)
+alive_pts   = 15 · t_alive / T_ep
+battery_pts =  5 · (t_alive / T_ep) · (1 − min(E / E_ref, 1))
+```
+
+- **g**: waypoints completed, 0..5 (the dock counts once held). **p**: partial credit toward the
+  current waypoint, 0 when g = 5. Current waypoint a gate: `1 − min(d_min / L, 1)`. Current
+  waypoint the dock: `0.8 · clip((L − d_min) / (L − r), 0, 1) + 0.2 · max_hold_steps / 100`,
+  monotone in closeness and hold, so g + p < 5 until docked.
+- `t_par` = 5.0 s: a finish at or before 5 s earns all 25 speed points, and each second faster on a
+  docked run earns 25 / (T_ep − t_par) = 1.67 points. `t_alive` = `time_upright_s` = T ·
+  `control_dt` and E = `energy_j`, both exactly as in §12. There is no drift term. In words: "55
+  for the course, 25 for speed (full marks at a 5 s finish), 15 for staying up, 5 for battery".
+- An episode with an error scores 0: all four parts are 0.
+- **Success:** `docked ∧ survived ∧ E ≤ 5 · E_ref` (`survived` as in §12: reason `timeout` and T =
+  `max_steps`), never with an error.
+- `E_ref` **[calibrated]** = 2 × the reference driver's median battery energy on
+  `waypoint-v1/standard` seeds 0..399 at the frozen push band (§10), rounded to 0.1 J: 2 × 10.72 J
+  → `E_ref = 21.4` J, measured on `linux-x86_64`, the calibration platform (darwin-arm64 would give
+  21.5 J). As for balance-v1 (§12), a re-measurement alone never changes it.
+- **Score config.** Every scorer constant is in the bundle's `score` (`WaypointScore`: `weights`
+  (55, 25, 15, 5), summing to 100; `t_par_s` 5.0; `dock_progress_weights` (0.8, 0.2), summing to
+  1; `success_energy_factor` 5; `e_ref_j` 21.4) or its `course` (`leg_m`, `gate_radius_m`,
+  `dock_hold_steps`); none lives in code, so all of them are in `protocol_hash` (§13).
+
+Protocol score, success rate and mean time upright are §12's aggregate. **Ranking:** round(score,
+2), ties broken by success rate, then the median `t_finish_s` (lower is better; a non-finisher, or
+an episode without metrics, counts as `T_ep`).
+
+**Metrics** (18, in this order; §15 allows 32): `steps, termination, survived, time_upright_s,
+energy_j, saturation_fraction, rms_tilt_rad` exactly as in §12, then
+
+- `waypoints` (int): g; `progress` (float): p; `docked` (bool);
+- `fell` (bool) and `fall_cause` (str), as defined in §12's vocabulary;
+- `t_finish_s` (float): `t_finish`, or `episode_seconds` for a non-finisher;
+- `max_hold_steps` (int);
+- the four score parts `course_pts, speed_pts, alive_pts, battery_pts` (floats), which sum to the
+  score (before the clip, which an honest episode never reaches).
+
+balance-v1's `upright_frac`, `max_tilt_rad`, `drift_m` and `max_drift_m` are not recorded for
+waypoint-v1.
+
 ## 13. Bump rule and hashes
 
 Once a challenge is published, anything that can change a fixed controller's score on a fixed
 seed requires a new challenge major version (`balance-v2`): MJCF, robot params, physics options,
 presets, scorer, E_ref, seeds, episode length, control rate, observation semantics. Before
 publication such a change is a reviewed re-pin of the hashes and golden scores instead (balance-v1's
-E_ref recalibration, §12). Reward shaping and training configs never bump.
+E_ref recalibration, §12). Reward shaping and training configs never bump. waypoint-v1 freezes
+earlier than publication, at the end of Phase 2b: from then on it is treated as published, so any
+change to a fixed controller's score on a fixed seed is `waypoint-v2`, never a re-pin. Stream
+`TARGETS = 6` (§9) and `balancer-target.obs.v1` (§6) freeze at the same point; the schema id, its
+feature order, the Gymnasium id `topple/Waypoint-v1` and the alias `wp_eval_v1` (§1) are frozen.
 
 Env code is shared by all challenges. A code change that can change a fixed controller's results
-on a fixed seed (sensing, estimation, termination, pushes, model overrides) must bump
-`topple.challenge.ENV_ALGO_VERSION` (currently 1). It is part of every `protocol_hash`, so results
+on a fixed seed (sensing, estimation, termination, pushes, model overrides) must bump the env
+algorithm version of every challenge kind whose results it can change. The version is per kind,
+read at call time by `topple.challenge.env_algo_version(kind)`, never an int copied at import:
+balance's returns the module attribute `topple.challenge.ENV_ALGO_VERSION` (currently 1;
+monkeypatching it must change `protocol_hash`, which a stored copy would not), waypoint's its own
+constant `WAYPOINT_ENV_ALGO_VERSION` (currently 1). It is part of every `protocol_hash`, so results
 from different env algorithms are never compared; once a challenge is published such a change also
-needs its new major version. Known-answer tests (`tests/test_golden.py`) pin controller seeds,
-scenarios (seeds 0, 1000 and 2**53−1 on every preset), the bundle and protocol hashes and the
-PID/LQR baseline scores on public seeds 1000–1002 of `standard` (per platform, to 1e-9), so such
-a change cannot land unnoticed. CI (`linux-x86_64`, the platform ranked scores come from)
-enforces that platform's scores on every push; the `darwin-arm64` scores are enforced only by
+needs its new major version. waypoint-v1's version follows the freeze: **before** it, every change
+to the course generator, the course events or the observation bumps it (nothing is published, and
+runs made under an older algorithm become detectable); **at** it, its value is recorded in
+`docs/results/phase2.json`; **after** it, any change to a fixed controller's score on a fixed seed
+is `waypoint-v2` (above) and the version only guards against accidental drift.
+
+Known-answer tests (`tests/test_golden.py`) pin controller seeds, scenarios (seeds 0, 1000 and
+2**53−1 on every preset), the bundle and protocol hashes and the PID/LQR baseline scores on public
+seeds 1000–1002 of `standard` (per platform, to 1e-9), so an env change cannot land unnoticed.
+CI (`linux-x86_64`, the platform ranked scores come from) enforces that platform's scores on
+every push; the `darwin-arm64` scores are enforced only by
 test runs on Apple Silicon, and any other platform skips them and prints what it measured. In CI
 (`GITHUB_ACTIONS=true`) they are never skipped: a platform without pins fails, and so does any
 platform but `linux-x86_64`, so a job moved to another runner can never pass while enforcing
 none of the ranked platform's pins. A deliberate re-pin updates every platform's scores in one
 change.
+
+**Dependency upgrades are a re-score, not a challenge bump.** An upgrade of MuJoCo (pinned
+`>=3.15,<3.16`) or of the policy runtime (`onnxruntime>=1.31,<1.32`, §17) can change results bit
+for bit, but it changes nothing a challenge defines (bundle, presets, scorer, seeds, env
+algorithm): physics and ONNX outputs are only reproducible per platform and version anyway (§14,
+§17), and results record the versions (§15). Such an upgrade is a deliberate re-score: the golden
+scores are re-pinned in the upgrade's own change and whatever is ranked is re-evaluated on the new
+build; neither the challenge version nor the env algorithm version moves.
 
 - `bundle_hash()` = sha256 of the tag `topple.bundle/1\n`, then, for each bundle file in POSIX-path
   order, `len(path)‖path‖len(bytes)‖bytes` (8-byte big-endian lengths, path relative to the bundle
@@ -581,14 +800,19 @@ change.
   form, so `5.0` is written `5.0`, never `5`: Python's
   `json.dumps(…, sort_keys=True, separators=(",", ":"), allow_nan=False)`; the standard
   protocol's text is pinned in `tests/test_challenge.py`) of
-  `{format: "topple.protocol/1", env_algo_version, bundle: bundle_hash,
-  preset: <the full preset definition: name, sensor model, randomize flag, randomization ranges,
-  push config>, score: <ScoreConfig>, seeds: <seed list in order>, salt}`. Seeds default to the
-  public list, salt to 0. A private protocol's hash includes its 128-bit secret salt, which keeps
-  the published hash from revealing the private seeds.
+  `{format: "topple.protocol/1", env_algo_version: <env_algo_version(the challenge's kind)>,
+  bundle: bundle_hash, preset: <the full definition of the preset `Challenge.preset` resolves
+  (§10): name, sensor model, randomize flag, randomization ranges, push config>, score: <the
+  kind's score config: `ScoreConfig` for balance, `WaypointScore` for waypoint (§12a)>, seeds:
+  <seed list in order>, salt}`. For balance-v1 every field is exactly what it was before kinds
+  existed, so its hashes did not move. Seeds default to the public list, salt to 0. A private
+  protocol's hash includes its 128-bit secret salt, which keeps the published hash from revealing
+  the private seeds.
 
 ## 14. Trajectory `topple.traj/1`
 
+`topple.traj/1` is the format of every challenge whose `obs_schema` is `balancer.obs.v1`
+(balance-v1); every other challenge writes `topple.traj/2`, which differs only in `obs` (§14a).
 One `.npz` per episode, written with only `<f8`, `<f4`, `<i4`, `|u1` C-contiguous arrays (no
 pickles, no strings). Row `k` of state arrays is the state at `t = k·control_dt`, before action `k`.
 
@@ -640,8 +864,9 @@ checkout. Limits: the check and the writes are separate steps, so a directory sw
 symlink in between, by a process running alongside, is out of its reach; and the library writers
 (`Trajectory.save_npz`, `write_results`, `evaluate(traj_dir=…)`) take their paths as given.
 
-**Loading** (`load_npz(path, *, max_steps)`; `max_steps` is required, so every caller bounds T)
-reads the archive and each member by hand and raises `ValueError`, naming the file, for anything
+**Loading** (`load_npz(path, *, max_steps, layout=TRAJ_V1)`; `max_steps` is required, so every
+caller bounds T, and `layout` is the format and `obs` width the caller expects, §14a) reads the
+archive and each member by hand and raises `ValueError`, naming the file, for anything
 else, including unreadable, truncated or missing files and corrupted members:
 
 - a regular file (symlinks are followed) of at most `MAX_FILE_BYTES = 33554432` bytes (32 MiB;
@@ -690,7 +915,46 @@ else, including unreadable, truncated or missing files and corrupted members:
 - `meta_json` a UTF-8 JSON object with `"format": "topple.traj/1"` and only finite numbers: no
   `NaN`/`Infinity` tokens and no literal that overflows to infinity, such as `1e400`.
 
-`read_meta(path)` applies the same member checks and returns only the metadata.
+`read_meta(path)` applies the same member checks and returns only the metadata; it accepts
+`meta.format` `topple.traj/1` or `topple.traj/2` (§14a).
+
+## 14a. Trajectory `topple.traj/2`
+
+`topple.traj/1` fixes `obs` at 10 columns, so a 15-feature waypoint record cannot be written in
+it. `/1` stays exactly as §14 defines it (bytes, reader, tests) for challenges whose `obs_schema`
+is `balancer.obs.v1`; every other challenge (waypoint-v1) writes `topple.traj/2`, which is `/1`
+in everything (the 11 members, dtypes, the other trailing widths, the canonical zip layout, every
+§14 cap, `T, E ≤ max_steps`, finite-only `meta_json`, atomic writing) except:
+
+- `meta.format = "topple.traj/2"`;
+- `obs` is T × D float32 with D = `len(TaskSpec.obs_features)` of its challenge, 1 ≤ D ≤
+  `MAX_OBS_WIDTH = 64` (waypoint-v1: D = 15, §6);
+- `meta.obs_features` names exactly D features (a list of D strings).
+
+Reading, writing and verifying:
+
+- **Layout.** `topple.traj.TrajLayout(format, obs_width)` (frozen; 1 ≤ `obs_width` ≤
+  `MAX_OBS_WIDTH`; a `/1` layout has width 10), `TRAJ_V1 = TrajLayout("topple.traj/1", 10)`. A
+  trusted caller passes `verify.protocol_traj_layout(protocol)`, derived from the protocol's
+  challenge kind and never from the file, as it passes `protocol_max_steps`; the default
+  `TRAJ_V1` fails closed on a waypoint file.
+- **Reader.** `load_npz(path, *, max_steps, layout)` requires the `obs` header's width to equal
+  `layout.obs_width` before any of its data is read (like the T limit), and `meta.format` to
+  equal `layout.format`. Under `TRAJ_V1` that is all (a `/1` meta may hold neither `obs_schema`
+  nor `obs_features`); a `/2` layout also requires `meta.obs_features` to be a list of exactly
+  `obs_width` strings, checked inside the reader's guard, so a bad value is a `ValueError` naming
+  the file. So a 10-wide `obs` under the waypoint layout, a 15-wide one under `TRAJ_V1` and a
+  65-wide header are all refused before any data is read.
+- **Format rule.** A trajectory is `/2` iff its `meta` has an `obs_schema` that is not exactly the
+  string `balancer.obs.v1`; a meta without one is `/1`, and `save_npz` writes the rule's format
+  (`topple.traj.traj_format`). Constructing a `Trajectory` requires `obs` of shape (T, 10) for
+  `/1` and (T, D) with 1 ≤ D ≤ `MAX_OBS_WIDTH` for `/2`. The rule touches `meta` only with `in`,
+  `isinstance` and `==`, never `len()` or another call on an untrusted value, so a forged-meta
+  copy still constructs and then fails verification as `not_reproducible` (§16). A 15-wide `obs`
+  whose meta claims `balancer.obs.v1` cannot be constructed, so such a file fails to load.
+- **Verification** is §16's, unchanged: the replay records its challenge's layout, and step 5
+  compares `obs` (shape, then bytes) and `obs_schema` / `obs_features` with it, so a forged width
+  or feature list fails even past the reader.
 
 ## 15. Results `topple.results/1`
 
@@ -772,8 +1036,14 @@ aggregate {score, success_rate, mean_time_upright_s, episodes, errors} (§12).
   index `i` (so the seed is `protocol.seeds[i]`) and the verifier's own Topple and MuJoCo build.
   The controller identity and isolation that `rescore` records come from the trusted caller.
 - **Untrusted input:** the uploaded `traj_*.npz`, loaded with
-  `load_npz(path, max_steps=<the protocol's max_steps>)` (§14). It only supplies the commands to
-  replay and the records the replay must reproduce bit for bit.
+  `load_npz(path, max_steps=<the protocol's max_steps>, layout=<the protocol's layout>)`
+  (`protocol_max_steps`, `protocol_traj_layout`: §14, §14a). It only supplies the commands to
+  replay and the records the replay must reproduce bit for bit. The layout comes from the
+  protocol's challenge, never from the file, so a waypoint upload with a 10-wide `obs` and a
+  balance upload with a 15-wide one are refused by the loader. `topple verify`, `topple score`
+  and the replay videos of `topple run`/`eval` load with the protocol's layout (Phase 3
+  publishing must too); `topple video` uses the layout of the challenge the file names (a bundle
+  Topple ships), never a width read from the file.
 - **Republishing.** Whoever stores or serves a verified episode (Phase 3's publish step, the
   replay viewer) writes the verifier's own record, `verdict.replay.save_npz(...)`, never the
   uploaded bytes. The canonical layout (§14) makes every zip reader decode an accepted upload
@@ -827,10 +1097,13 @@ and `index` only labels the verdict.
    forgery; a well-formed one is sanitized (§15).
 2. **Scenario.** The trusted env (the protocol's own challenge object and preset, recording) is
    reset on the trusted seed, which materializes the trusted scenario exactly as evaluation does
-   (`make_scenario(seed, preset, timestep, control_dt, episode_seconds)`, §9). `meta.scenario`
-   must equal the trusted scenario's `to_dict()` as canonical JSON (sorted keys, so `1`, `1.0`
-   and `true` all differ): "scenario differs from the scenario of the protocol seed". The replay
-   always runs the trusted scenario, never the uploaded one.
+   (`make_scenario(seed, preset, timestep, control_dt, episode_seconds, course)`, §9, with the
+   preset `Challenge.preset` resolves, §10, and, for a waypoint challenge, its course config, so
+   the trusted scenario includes the seed's `course`). `meta.scenario` must equal the trusted
+   scenario's `to_dict()` as canonical JSON (sorted keys, so `1`, `1.0` and `true` all differ):
+   "scenario differs from the scenario of the protocol seed". An edited
+   `meta.scenario.course` therefore fails here. The replay always runs the trusted scenario, never
+   the uploaded one, and a waypoint episode is scored against the trusted course (step 6).
 3. **Commands.** `T ≤ max_steps`; every `ctrl` value finite and in [−1, 1]; every `action` value
    finite; `clip(action, −1, 1) == ctrl` row by row.
 4. **Replay.** The uploaded `ctrl` rows are stepped in order. If the env terminates or truncates
@@ -855,8 +1128,10 @@ and `index` only labels the verdict.
    `termination, max_steps, control_dt, timestep, frame_skip, joint_qpos, wheel_sign, obs_schema,
    obs_features` must equal the replay's as canonical JSON. `meta.versions` is informational.
 6. **Score.** Metrics, score and success come only from the replay and its env-produced metadata
-   (`episode_metrics(replay, motor)`, §12), exactly as `evaluate` scores a live episode. An
-   episode with a trusted error (step 4) scores 0 and is not a success: an honest error report
+   (the challenge kind's scorer, `kinds.score_trajectory`: `episode_metrics(replay, motor)`, §12,
+   for balance-v1; §12a for waypoint-v1, with the course of the replay's scenario, which is the
+   trusted one), exactly as `evaluate` scores a live episode. An episode with a trusted error
+   (step 4) scores 0 and is not a success: an honest error report
    can only lower a score. A failed verdict (`ok == False`) scores 0, is not a success and
    carries the error `{code: <verify code>, step: T, detail: reason}`; its metrics are the
    replay's if the replay ran, else null.
@@ -983,7 +1258,9 @@ submitter and a runtime rely on.
   (ONNX Runtime 1.31 on arm64 maps an all-NaN observation to finite actions; ONNX Runtime Web
   returns NaN). The env never emits one (`sim_unstable` rolls the bad substep back and ends the
   episode; a non-finite reset raises, §9, §11), and the harness checks every observation, as the
-  controller would receive it, before every `act` call: a non-finite one raises `RuntimeError`,
+  controller would receive it (quantized to float32, §6, whatever its schema:
+  `balancer-target.obs.v1`'s 15 features included), before every `act` call, for every controller
+  kind, Python or policy: a non-finite one raises `RuntimeError`,
   a harness bug like an episode that outlasts `max_steps` (§8), checked even under `python -O`.
   Mapping a non-finite action to `invalid_action` therefore matters only for runtimes that
   propagate NaN.
