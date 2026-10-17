@@ -173,3 +173,39 @@ def test_report_names_must_render_safely() -> None:
     data["baselines"]["standard"]["a|b"] = data["baselines"]["standard"]["creeper"]
     with pytest.raises(ValueError, match="pattern"):
         report(data)
+
+
+def test_derived_fields_are_rebuilt_from_the_comparisons() -> None:
+    """Re-review finding: every derivable field of phase2b.json is recomputed."""
+    for edit, field in (
+        (lambda d: d.update(item6_passes=6), "item6_passes"),
+        (lambda d: d["arms"].update(better_arm="finetune"), "arms"),
+        (lambda d: d["baselines"]["standard"]["creeper"].update(score=1.0), "baselines"),
+        (lambda d: d.update(exchange_rate=1.0), "exchange_rate"),
+    ):
+        data = doc()
+        edit(data)
+        problems = gate.item5_rows(report(data), RUNS)
+        assert f"phase2b.json: {field} is not what the comparisons give" in problems, field
+    data = doc()
+    data["headline"]["scratch"]["first_eligible_steps"][0] = 1
+    assert "phase2b.json: the scratch headline steps are not the runs'" in gate.item5_rows(
+        report(data), RUNS
+    )
+
+
+def test_runs_files_must_hold_each_runs_best_checkpoint(tmp_path: Path) -> None:
+    for name in ("standard", "clean", "wp_eval_v1"):
+        (tmp_path / f"runs_{name}.json").write_bytes((RUNS / f"runs_{name}.json").read_bytes())
+    clean = json.loads((tmp_path / "runs_clean.json").read_text())
+    next(e for e in clean["entries"] if e["id"] == "ppo_wpft_s1")["policy_sha256"] = "0" * 64
+    (tmp_path / "runs_clean.json").write_text(json.dumps(clean))
+    problems = gate.item5_rows(report(doc()), tmp_path)
+    assert "runs_clean.json: ppo_wpft_s1 is not its run's best checkpoint" in problems
+
+
+def test_attempt_failures_are_known_check_names() -> None:
+    data = doc()
+    data["shipped"]["attempts"][0]["failed"] = ["<b>"]
+    with pytest.raises(ValueError, match=r"Input should be"):
+        report(data)

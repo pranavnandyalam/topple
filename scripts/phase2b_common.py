@@ -282,9 +282,23 @@ class FreshRun(_Strict):
     item6: Item6
 
 
+Check = Literal[
+    "a_docked",
+    "b_paired_lo",
+    "c_above_creeper",
+    "d_falls",
+    "no_errors",
+    "obs_dim",
+    "fixture_sha256",
+    "parity",
+    "coverage",
+]
+"""The item-6 sub-gates and the item-9 parity checks a shipping attempt can fail."""
+
+
 class Attempt(_Strict):
     run: Name
-    failed: tuple[str, ...]
+    failed: tuple[Check, ...]
 
 
 class Shipped(_Strict):

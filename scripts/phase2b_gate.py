@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -138,6 +139,59 @@ def item6(cal: Comparison, clean: Comparison, ev: Comparison, policy_sha256: str
     return out
 
 
+def derived_fields(rep: wp.Phase2bReport, cmps: dict[str, Comparison]) -> list[str]:
+    """Every field ``phase2b_results`` derives from the runs and the comparisons, rebuilt and
+    compared exactly (``pilot`` and the pretraining steps come from elsewhere), and each run's
+    entries are its own best checkpoint's bytes."""
+    import phase2b_results as results
+
+    out = []
+    best = {r.summary.run: r.summary.best.onnx_sha256 for r in rep.runs}
+    for p, cmp in cmps.items():
+        for e in cmp.entries:
+            if e.id in best and e.policy_sha256 != best[e.id]:
+                out.append(f"runs_{p}.json: {e.id} is not its run's best checkpoint")
+    for row, r in zip(rep.fresh, rep.runs, strict=True):
+        s = r.summary.model_dump(mode="json")
+        if row.arm != r.arm or row.first_eligible_step != results.first_eligible(s):
+            out.append(f"{row.run}: its arm or first eligible step is not its run's")
+    runs = [{"arm": r.arm, "summary": r.summary.model_dump(mode="json")} for r in rep.runs]
+    std = cmps["standard"]
+    want: dict[str, object] = {
+        "item6_passes": sum(wp.item6(std, r.run)["pass"] for r in rep.fresh),
+        "arms": results.arms(runs, {"standard": std}),
+        "baselines": {
+            p: {e.id: wp.rates(e).to_json() for e in c.entries if e.id not in best}
+            for p, c in cmps.items()
+        },
+        "exchange_rate": None,
+    }
+    if rep.shipped.run is not None:
+        x = wp.exchange_rate(wp.entry(std, rep.shipped.run))
+        want["exchange_rate"] = None if math.isnan(x) else x
+    got = rep.model_dump(mode="json", by_alias=True)
+    out += [
+        f"phase2b.json: {k} is not what the comparisons give" for k in want if got[k] != want[k]
+    ]
+    for arm in ("scratch", "finetune"):
+        steps = [row.first_eligible_step for row in rep.fresh if row.arm == arm]
+        if rep.headline[arm]["first_eligible_steps"] != steps:
+            out.append(f"phase2b.json: the {arm} headline steps are not the runs'")
+    return out
+
+
+def fresh_binding(cal: Comparison, rep: wp.Phase2bReport, runs_dir: Path) -> list[str]:
+    """On the platform the committed comparisons came from, the shipped run's committed
+    standard episodes must equal the fresh ``ppo_waypoint`` ones (same bytes, same seeds)."""
+    std = read_comparison(runs_dir / "runs_standard.json")
+    if rep.shipped.run is None or std.platform != cal.platform:
+        return []
+    a, b = wp.entry(std, rep.shipped.run), wp.entry(cal, SHIPPED_ID)
+    if (a.scores, a.termination, a.extras) != (b.scores, b.termination, b.extras):
+        return ["runs_standard.json's shipped run is not what the fresh wp_cal.json measured"]
+    return []
+
+
 def item5_rows(rep: wp.Phase2bReport, runs_dir: Path) -> list[str]:
     """The report's per-run rows equal their recomputation from the committed comparisons
     (``phase2b/runs_*.json``), and its shipping attempts replay §8.8: the candidates in waypoint
@@ -157,6 +211,7 @@ def item5_rows(rep: wp.Phase2bReport, runs_dir: Path) -> list[str]:
                 out.append(f"{row.run}: its {p} row differs from runs_{p}.json")
         if wp.item6(cmps["standard"], row.run) != row.item6.model_dump(mode="json", by_alias=True):
             out.append(f"{row.run}: its item 6 differs from runs_standard.json")
+    out += derived_fields(rep, cmps)
     ranked = candidates(
         [core(r.summary.model_dump(mode="json")) for r in rep.runs], kind="waypoint"
     )
@@ -281,7 +336,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "1 challenge frozen": lambda: item1(cal, rep),
         "4 contract": lambda: item4(contract),
         "5 results": lambda: item5(rep, md) + item5_rows(rep, args.report.with_name("phase2b")),
-        "6 learnability": lambda: item6(cal, clean, ev, rep.shipped.onnx_sha256 or ""),
+        "6 learnability": lambda: (
+            item6(cal, clean, ev, rep.shipped.onnx_sha256 or "")
+            + fresh_binding(cal, rep, args.report.with_name("phase2b"))
+        ),
         "7 fine-tune sanity": lambda: item7(rep),
         "8 video": lambda: item8(args.results_dir, rep, args.report.with_name("phase2b")),
         "9 export": lambda: item9(rep, args.submission, args.fixture),
