@@ -410,7 +410,7 @@
     "topple": "0.1.0",
     "mujoco": "3.15.0",
     "numpy": "2.5.3",
-    "obs_schema": "balancer.obs.v1",
+    "obs_schema": "balancer-target.obs.v1",
     "action_spec": "diffdrive.effort.v1",
     "onnxruntime": "1.31.0",
     "onnx": "1.23.2",
