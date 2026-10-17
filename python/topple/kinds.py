@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from topple.challenge import Challenge
 from topple.contract import TARGET_OBS_SCHEMA_ID
@@ -21,6 +22,7 @@ from topple.scoring import episode_metrics, episode_score, episode_success
 from topple.traj import FORMAT_V2, TRAJ_V1, Trajectory, TrajLayout
 from topple.waypoint import (
     FALL_REASONS,
+    WaypointEvents,
     WaypointScore,
     env_terminated,
     fall_cause,
@@ -77,17 +79,26 @@ def score_trajectory(traj: Trajectory, challenge: Challenge, *, error: bool) -> 
     )
 
 
-def _score_waypoint(traj: Trajectory, challenge: Challenge, *, error: bool) -> Scored:
-    """§8.5/§8.6: the 18 waypoint metrics, from the trajectory and its trusted scenario."""
+@dataclass(frozen=True)
+class WaypointReplay:
+    """A waypoint trajectory on its course: the course points in the start frame, that frame
+    (``origin``, ``heading``: the axle midpoint and yaw at reset), the axle positions per row in
+    it, and the course events (§8.5)."""
+
+    points: tuple[tuple[float, float], ...]
+    origin: tuple[float, float]
+    heading: float
+    rows: npt.NDArray[np.float64]
+    events: WaypointEvents
+
+
+def waypoint_replay(traj: Trajectory, challenge: Challenge, termination: str) -> WaypointReplay:
+    """The scorer's view of ``traj`` (its trusted scenario's course; ``termination`` is the
+    recorded reason), shared with the course video so both see the same events."""
     cfg = challenge.config.course
-    score_cfg: WaypointScore = challenge.config.score
     meta = traj.meta
-    base = episode_metrics(traj, challenge.params.motor)
     root = int(meta["joint_qpos"]["root"])
-    control_dt = float(meta["control_dt"])
-    episode_s = float(meta["max_steps"]) * control_dt
-    scenario = meta["scenario"]
-    course = Course.from_dict(scenario["course"], cfg)
+    course = Course.from_dict(meta["scenario"]["course"], cfg)
     points = course_points(course, cfg)
     qpos = traj.qpos
     origin = (float(qpos[0, root]), float(qpos[0, root + 1]))
@@ -96,15 +107,28 @@ def _score_waypoint(traj: Trajectory, challenge: Challenge, *, error: bool) -> S
         [to_course_frame((float(r[root]), float(r[root + 1])), origin, heading) for r in qpos],
         dtype=np.float64,
     )
-    termination = base.termination
     events = waypoint_events(
         rows,
         points,
         gate_radius_m=cfg.gate_radius_m,
         dock_hold_steps=cfg.dock_hold_steps,
-        control_dt=control_dt,
+        control_dt=float(meta["control_dt"]),
         terminated=env_terminated(termination),
     )
+    return WaypointReplay(points, origin, heading, rows, events)
+
+
+def _score_waypoint(traj: Trajectory, challenge: Challenge, *, error: bool) -> Scored:
+    """§8.5/§8.6: the 18 waypoint metrics, from the trajectory and its trusted scenario."""
+    cfg = challenge.config.course
+    score_cfg: WaypointScore = challenge.config.score
+    meta = traj.meta
+    base = episode_metrics(traj, challenge.params.motor)
+    control_dt = float(meta["control_dt"])
+    episode_s = float(meta["max_steps"]) * control_dt
+    scenario = meta["scenario"]
+    termination = base.termination
+    events = waypoint_replay(traj, challenge, termination).events
     progress = waypoint_progress(
         events,
         leg_m=cfg.leg_m,
