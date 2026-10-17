@@ -1,9 +1,10 @@
 name: calibrate-waypoint
 
 # waypoint-v1 calibration on the calibration platform, linux-x86_64 (docs/design/phase-2.md §8.7,
-# decision log R1): the reference driver on standard seeds 0..399 at 9 push ceilings, plus clean.
-# Runs when this file is pushed on a phase-* branch, or by hand; its only output is the
-# calibration JSON artifact (nothing is written back to the repository).
+# decision log R1): the reference driver on standard seeds 0..399 at 9 push ceilings, plus clean;
+# and the five anchors beside the driver on standard 0..399 with the frozen scorer (§8.7 table).
+# Runs when this file is pushed on a phase-* branch, or by hand; its only outputs are the
+# artifacts (nothing is written back to the repository).
 on:
   workflow_dispatch:
   push:
@@ -35,4 +36,33 @@ jobs:
         with:
           name: wp-calibration-linux
           path: out/wp_calibration_linux.json
+          if-no-files-found: error
+
+  anchors:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          enable-cache: true
+      - name: Install headless OpenGL (OSMesa)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libosmesa6
+      - run: uv sync --locked
+      - name: Anchors (driver + 5 anchors, standard 0..399)
+        run: |
+          mkdir -p out
+          uv run topple compare submissions/waypoint_pid_example.py \
+            submissions/anchors/balance_in_place.py submissions/anchors/spin.py \
+            submissions/anchors/creeper.py submissions/anchors/gates_only.py \
+            submissions/anchors/reckless.py \
+            -p waypoint-v1/standard --seeds 0..399 --workers 2 \
+            --json out/wp_anchors_linux.json > out/wp_anchors_linux.md
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wp-anchors-linux
+          path: out/wp_anchors_linux.*
           if-no-files-found: error
