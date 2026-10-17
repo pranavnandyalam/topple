@@ -35,16 +35,12 @@ is open. The training runs live only on the Mac, in `runs/` (gitignored; the shi
      wp_anchors_darwin.json` (`topple compare` of the driver and 5 anchors on standard 0..399) and
      re-run the `calibrate-waypoint` CI `anchors` job for the linux file. Do this once, after the
      fixes below that change `phase2b.json`.
-   - **Gate binding (MEDIUM, `scripts/phase2b_gate.py`):** bind each comparison to its protocol
-     (standard 0..399, clean 0..399, wp_eval_v1) and the `ppo_waypoint` entry to the submission's
-     `policy_sha256`; check `phase2b.json`'s per-run rows against the committed
-     `phase2b/runs_*.json` comparisons; replay the §8.8 shipping order (`candidates(kind=
-     "waypoint")` over the summaries) and the attempts list.
-   - **Fall rates from the validated termination array** (MEDIUM, `phase2b_common.rates`):
-     `fell` = termination in FALL_REASONS, cross-checked against the extras; count `sim_unstable`
-     in `no_errors` (LOW).
-   - **Item 8 (MEDIUM):** check that the MP4 is really an MP4 (ftyp box) and that the media show
-     the shipped policy; accept the ladder's smaller GIF rungs or force 480 (the spec says 480x480).
+   - **Done 2026-10-17:** gate binding (each comparison bound to its protocol and the
+     shipped bytes; per-run rows recomputed from `phase2b/runs_*.json`; §8.8 shipping replayed),
+     falls from the validated termination array with the extras cross-checked, `sim_unstable`
+     counted as an error, and the MP4 ftyp check (`7ab9e4d` and the commit after it). Still open
+     on item 8: check that the media show the shipped policy (e.g. the media script writes the
+     hero seed and policy sha to `phase2b.json`, and the gate checks them).
    - **Video (MEDIUM):** the checkered dock is hard to see at GIF scale (make it larger or higher
      contrast); add tests for a fall (epilogue, then the FELL hold), push arrows and the MP4 path; mark
      rendering tests `render` so they skip when rendering is disabled. LOWs: keep the gate index in the

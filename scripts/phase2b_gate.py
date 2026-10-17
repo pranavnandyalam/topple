@@ -202,6 +202,8 @@ def item8(results_dir: Path) -> list[str]:
             out.append(f"{name} is over {cap // MB} MB")
         if side is not None and gif_size(path) != (side, side):
             out.append(f"{name} is not a {side}x{side} GIF")
+        if side is None and path.read_bytes()[4:8] != b"ftyp":
+            out.append(f"{name} is not an MP4 (no ftyp box)")
     return out
 
 

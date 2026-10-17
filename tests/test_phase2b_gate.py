@@ -80,12 +80,14 @@ def test_item8_checks_presence_caps_and_gif_sides(tmp_path: Path) -> None:
     assert len(gate.item8(tmp_path)) == len(gate.MEDIA)
     for name, (_, side) in gate.MEDIA.items():
         if side is None:
-            (tmp_path / name).write_bytes(b"\x00" * 64)
+            (tmp_path / name).write_bytes(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 52)
         else:
             Image.new("RGB", (side, side)).save(tmp_path / name)
     assert gate.item8(tmp_path) == []
     Image.new("RGB", (320, 320)).save(tmp_path / "waypoint.gif")
     assert gate.item8(tmp_path) == ["waypoint.gif is not a 480x480 GIF"]
+    (tmp_path / "waypoint.mp4").write_bytes(b"\x00" * 64)
+    assert "waypoint.mp4 is not an MP4 (no ftyp box)" in gate.item8(tmp_path)
 
 
 def test_item6_judges_the_shipped_policy_and_binds_every_comparison() -> None:
