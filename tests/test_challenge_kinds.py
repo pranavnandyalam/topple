@@ -127,3 +127,19 @@ def test_balance_env_refuses_another_kind() -> None:
 def test_the_protocol_challenge_is_a_copy_safe_value() -> None:
     proto = EvalProtocol.from_id("wp_eval_v1")
     assert replace(proto, seeds=(3000,)).challenge is proto.challenge
+
+
+def test_the_frozen_waypoint_scorer_and_push_ceiling() -> None:
+    """§8.7 calibration on linux-x86_64: impulse_hi 0.375 N.s, E_ref 21.4 J. Every scorer
+    constant is in the score config and so in protocol_hash (§8.1)."""
+    wp = load_challenge("waypoint-v1")
+    assert wp.config.score.model_dump(mode="json") == {
+        "weights": [55.0, 25.0, 15.0, 5.0],
+        "t_par_s": 5.0,
+        "dock_progress_weights": [0.8, 0.2],
+        "success_energy_factor": 5.0,
+        "e_ref_j": 21.4,
+    }
+    pushes = wp.preset("standard").pushes
+    assert pushes is not None
+    assert pushes.impulse_ns == (0.15, 0.375)
