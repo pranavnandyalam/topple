@@ -16,7 +16,7 @@ import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, overload, runtime_checkable
 
 if TYPE_CHECKING:
     import numpy as np
@@ -43,6 +43,12 @@ FEATURES: tuple[str, ...] = (
     "last_action_r",
 )
 _WIRE = struct.Struct("<11d")  # t + FEATURES, little-endian float64
+TARGET_OBS_SCHEMA_ID = "balancer-target.obs.v1"
+TARGET_FEATURES: tuple[str, ...] = (*FEATURES, "gate_x", "gate_y", "next_x", "next_y", "final")
+"""``balancer-target.obs.v1`` (waypoint-v1, docs/design/phase-2.md §8.4): the balance features,
+then the current waypoint and the one after it in the yaw-only robot frame (x forward, y left)
+and ``final`` (1.0 iff the current waypoint is the dock)."""
+_TARGET_WIRE = struct.Struct("<16d")  # t + TARGET_FEATURES, little-endian float64
 SATURATION_THRESHOLD = 0.99
 
 
@@ -132,12 +138,98 @@ class BalancerObs:
         return cls(t, p, pr, y, yr, (wpl, wpr), (wvl, wvr), (lal, lar))
 
 
+@dataclass(frozen=True, slots=True)
+class BalancerTargetObs:
+    """What a waypoint controller sees each control step (``balancer-target.obs.v1``): the
+    ``balancer.obs.v1`` features, then ``gate``, ``next`` and ``final``."""
+
+    t: float
+    pitch: float
+    pitch_rate: float
+    yaw: float
+    yaw_rate: float
+    wheel_pos: tuple[float, float]
+    wheel_vel: tuple[float, float]
+    last_action: tuple[float, float]
+    gate: tuple[float, float]
+    next: tuple[float, float]
+    final: float
+
+    def __post_init__(self) -> None:
+        for name in ("t", "pitch", "pitch_rate", "yaw", "yaw_rate", "final"):
+            object.__setattr__(self, name, _as_float(name, getattr(self, name)))
+        for name in ("wheel_pos", "wheel_vel", "last_action", "gate", "next"):
+            object.__setattr__(self, name, _as_pair(name, getattr(self, name)))
+        if self.final not in (0.0, 1.0):
+            raise ValueError(f"final must be 0.0 or 1.0, got {self.final!r}")
+
+    def features(self) -> tuple[float, ...]:
+        return (
+            self.pitch,
+            self.pitch_rate,
+            self.yaw,
+            self.yaw_rate,
+            *self.wheel_pos,
+            *self.wheel_vel,
+            *self.last_action,
+            *self.gate,
+            *self.next,
+            self.final,
+        )
+
+    def to_array(self) -> npt.NDArray[np.float32]:
+        """Feature vector in ``TARGET_FEATURES`` order, float32 (the neural-network input)."""
+        import numpy as np
+
+        return np.asarray(self.features(), dtype=np.float32)
+
+    @classmethod
+    def _from_values(cls, t: float, values: Sequence[float]) -> BalancerTargetObs:
+        p, pr, y, yr, wpl, wpr, wvl, wvr, lal, lar, gx, gy, nx, ny, final = values
+        return cls(t, p, pr, y, yr, (wpl, wpr), (wvl, wvr), (lal, lar), (gx, gy), (nx, ny), final)
+
+    @classmethod
+    def from_array(cls, arr: Sequence[float] | npt.NDArray[Any], t: float) -> BalancerTargetObs:
+        values = [float(v) for v in arr]
+        if len(values) != len(TARGET_FEATURES):
+            raise ValueError(f"expected {len(TARGET_FEATURES)} features, got {len(values)}")
+        return cls._from_values(t, values)
+
+    def to_wire(self) -> bytes:
+        """Lossless 128-byte encoding: ``t`` then the features as little-endian float64."""
+        return _TARGET_WIRE.pack(self.t, *self.features())
+
+    @classmethod
+    def from_wire(cls, data: bytes) -> BalancerTargetObs:
+        if len(data) != _TARGET_WIRE.size:
+            raise ValueError(f"expected {_TARGET_WIRE.size} bytes, got {len(data)}")
+        t, *features = _TARGET_WIRE.unpack(data)
+        return cls._from_values(t, features)
+
+
+def obs_features(schema: str) -> tuple[str, ...]:
+    """The feature names of a known observation schema (contract §6)."""
+    if schema == OBS_SCHEMA_ID:
+        return FEATURES
+    if schema == TARGET_OBS_SCHEMA_ID:
+        return TARGET_FEATURES
+    raise ValueError(f"unknown observation schema {schema!r}")
+
+
 # A permanent Python name for balancer.obs.v1 (lesson-1 submissions use it). Schema ids have no
 # aliases: "obs_v1" is only an informal name, never an accepted id (contract §1).
 Observation = BalancerObs
 
 
-def controller_obs(obs_arr: Sequence[float] | npt.NDArray[Any], t: float) -> BalancerObs:
+@overload
+def controller_obs(obs_arr: Sequence[float] | npt.NDArray[Any], t: float) -> BalancerObs: ...
+@overload
+def controller_obs(
+    obs_arr: Sequence[float] | npt.NDArray[Any], t: float, *, schema: str
+) -> BalancerObs | BalancerTargetObs: ...
+def controller_obs(
+    obs_arr: Sequence[float] | npt.NDArray[Any], t: float, *, schema: str = OBS_SCHEMA_ID
+) -> BalancerObs | BalancerTargetObs:
     """The observation a controller receives: the only way a harness builds it (contract §6).
 
     The 10 features are quantized to float32 (what the env emits and the trajectory stores), then
@@ -148,8 +240,11 @@ def controller_obs(obs_arr: Sequence[float] | npt.NDArray[Any], t: float) -> Bal
 
     with np.errstate(over="ignore"):  # a float64 beyond float32 range becomes inf, as in the env
         arr = np.asarray(obs_arr, dtype=np.float32)
-    if arr.shape != (len(FEATURES),):
-        raise ValueError(f"expected {len(FEATURES)} features of shape (10,), got shape {arr.shape}")
+    width = len(obs_features(schema))
+    if arr.shape != (width,):
+        raise ValueError(f"expected {width} features of shape ({width},), got shape {arr.shape}")
+    if schema == TARGET_OBS_SCHEMA_ID:
+        return BalancerTargetObs.from_array(arr, t)
     return BalancerObs.from_array(arr, t)
 
 

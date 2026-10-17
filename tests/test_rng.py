@@ -11,8 +11,36 @@ from topple.rng import (
 
 
 def test_streams_are_append_only_ids() -> None:
-    assert [s.value for s in Stream] == [0, 1, 2, 3, 4, 5]
-    assert [s.name for s in Stream] == ["INIT", "PUSHES", "SENSOR", "MODEL", "DELAY", "CONTROLLER"]
+    assert [s.value for s in Stream] == [0, 1, 2, 3, 4, 5, 6]
+    assert [s.name for s in Stream] == [
+        "INIT",
+        "PUSHES",
+        "SENSOR",
+        "MODEL",
+        "DELAY",
+        "CONTROLLER",
+        "TARGETS",
+    ]
+
+
+# First draw of seed 0 on each stream, captured before TARGETS existed: appending a stream id
+# must never shift an existing one (contract §9).
+_FIRST_DRAW_SEED0 = {
+    Stream.INIT: "0x1.2158f36608d1ap-1",
+    Stream.PUSHES: "0x1.758ef1b663000p-2",
+    Stream.SENSOR: "0x1.00c3aadf06e30p-3",
+    Stream.MODEL: "0x1.6b87b8c452a00p-8",
+    Stream.DELAY: "0x1.11cfa0c4746eep-1",
+    Stream.CONTROLLER: "0x1.267f779146b70p-2",
+}
+
+
+def test_targets_stream_is_new_and_leaves_existing_streams_unchanged() -> None:
+    assert Stream.TARGETS.value == 6
+    for stream, first in _FIRST_DRAW_SEED0.items():
+        assert stream_rng(0, stream).random().hex() == first
+    targets = stream_rng(0, Stream.TARGETS).random().hex()
+    assert targets not in _FIRST_DRAW_SEED0.values()
 
 
 def test_stream_rng_deterministic() -> None:

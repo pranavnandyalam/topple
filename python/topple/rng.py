@@ -23,6 +23,7 @@ class Stream(IntEnum):
     MODEL = 3
     DELAY = 4
     CONTROLLER = 5
+    TARGETS = 6  # waypoint courses (topple.course)
 
 
 def validate_seed(seed: int) -> int:

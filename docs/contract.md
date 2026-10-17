@@ -382,8 +382,17 @@ def make_controller(spec: TaskSpec) -> Controller: ...   # in the submission fil
 
 - Seeds are integers in `[0, 2**53)`.
 - Streams: `np.random.default_rng(np.random.SeedSequence(episode_seed, spawn_key=(agent, stream)))`
-  with append-only stream ids `INIT=0, PUSHES=1, SENSOR=2, MODEL=3, DELAY=4, CONTROLLER=5`.
-  `agent` is 0 for single-robot tasks.
+  with append-only stream ids `INIT=0, PUSHES=1, SENSOR=2, MODEL=3, DELAY=4, CONTROLLER=5,
+  TARGETS=6`. `agent` is 0 for single-robot tasks.
+- TARGETS (waypoint tasks, `topple.course`) draws courses by rejection: each attempt takes, in
+  order, the first heading `h0` = U(−π, π) (one double), `n_waypoints − 1` turn magnitudes
+  U(rad(turn_deg_min), rad(turn_deg_max)) (one double each) and as many signs
+  (`integers(0, 2)`), and is accepted iff every waypoint lies within `max_radius_m` of the
+  start; `max_attempts` failures raise `RuntimeError`. Acceptance decides how much of the stream
+  is consumed, so the waypoints are computed with the portable `pcos`/`psin` (Python float
+  `+ − ×` only, never libm or numpy), and draws follow the portable U rule below. Only the
+  accepted `{h0, turns}` (signed radians) are stored; the points are derived from them with the
+  same functions wherever they are used.
 - Controller seed: `SeedSequence(entropy=(episode_seed, salt), spawn_key=(0, CONTROLLER))
   .generate_state(1, uint64)[0] >> 11`; `salt = 0` for public protocols, a 128-bit secret for
   private ones.

@@ -17,7 +17,6 @@ from topple import __version__
 from topple.challenge import Challenge, load_challenge
 from topple.contract import FEATURES, BalancerObs, clip_action, validate_action
 from topple.disturbances import (
-    PRESETS,
     EpisodeClock,
     Preset,
     Push,
@@ -164,7 +163,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         self.clock = EpisodeClock(
             timestep=timestep, frame_skip=self.frame_skip, max_steps=self.max_steps
         )
-        self._preset: Preset = PRESETS[preset]
+        self._preset: Preset = self.challenge.preset(preset)
         self._pending_preset: Preset | None = None
         self.reward_config = reward or RewardConfig()
         self.max_drift_m = max_drift_m
@@ -237,7 +236,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         """Curriculum hook: switch disturbance preset at the next reset (works via env_method)."""
         if preset not in self.challenge.config.presets:
             raise ValueError(f"preset {preset!r} is not part of {self.challenge.id}")
-        self._pending_preset = PRESETS[preset]
+        self._pending_preset = self.challenge.preset(preset)
 
     # ------------------------------------------------------------------ gym API
 
@@ -257,7 +256,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             scenario = (
                 given
                 if isinstance(given, Scenario)
-                else Scenario.from_dict(given, clock=self.clock)
+                else Scenario.from_dict(given, clock=self.clock, challenge=self.challenge)
             )
         else:
             episode_seed = seed if seed is not None else int(self.np_random.integers(MAX_SEED))
@@ -267,6 +266,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
                 timestep=float(self.model.opt.timestep),
                 control_dt=self.control_dt,
                 episode_seconds=self.task_spec.episode_seconds,
+                course=self.challenge.config.course,
             )
         if "init_pitch_rad" in opts:
             scenario = replace(scenario, init_pitch_rad=float(opts["init_pitch_rad"]))
@@ -282,7 +282,7 @@ class BalanceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         check_push_schedule(scenario.pushes, frame_skip=self.frame_skip)
 
         self._scenario = scenario
-        self._sensors_ideal = PRESETS[scenario.preset].sensors == "ideal"
+        self._sensors_ideal = self.challenge.preset(scenario.preset).sensors == "ideal"
         self._apply_model_overrides(scenario)
         self._set_initial_state(scenario.init_pitch_rad, scenario.init_pitch_rate_rads)
         if not self._finite_state():
