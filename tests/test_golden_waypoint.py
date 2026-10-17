@@ -7,6 +7,8 @@ protocol hashes and the waypoint env algorithm version are pinned. A change to a
 from __future__ import annotations
 
 import json
+import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +16,8 @@ import pytest
 
 from topple.challenge import Challenge, env_algo_version, load_challenge
 from topple.disturbances import make_scenario
-from topple.evaluate import EvalProtocol
+from topple.evaluate import EvalProtocol, iter_episodes, platform_tag
+from topple.loader import load_submission
 from topple.rng import MAX_SEED
 
 GOLDEN = Path(__file__).parent / "golden" / "scenarios_waypoint_v1.json"
@@ -87,3 +90,44 @@ def test_wp_eval_v1_is_the_public_standard_protocol() -> None:
 
 def test_the_waypoint_env_algo_version_is_pinned() -> None:
     assert env_algo_version("waypoint") == WAYPOINT_ENV_ALGO_VERSION
+
+
+# --- reference driver episodes, per platform (gate finding: drift after the freeze) ---------------
+
+DRIVER_SEEDS = (0, 1, 2, 63)
+"""Three ordinary standard seeds and one fall (63), from the anchors comparisons."""
+DRIVER_EPISODES: dict[str, dict[int, tuple[float, bool, str]]] = {
+    # docs/results/phase2b/anchors/wp_anchors_darwin.json (Apple Silicon)
+    "darwin-arm64": {
+        0: (79.5, True, "timeout"),
+        1: (83.28871800773045, True, "timeout"),
+        2: (83.13900621442112, True, "timeout"),
+        63: (31.656947311015543, False, "fell"),
+    },
+    # docs/results/phase2b/anchors/wp_anchors_linux.json (GitHub Actions ubuntu-24.04)
+    "linux-x86_64": {
+        0: (79.5, True, "timeout"),
+        1: (83.33408901363678, True, "timeout"),
+        2: (83.14087568514255, True, "timeout"),
+        63: (31.642570489726804, False, "fell"),
+    },
+}
+
+
+def test_the_reference_driver_scores_its_known_answers() -> None:
+    """The waypoint scorer, env and driver are frozen with the challenge: these exact scores
+    must hold on each platform (contract §13). In CI (linux) a missing pin fails, as in
+    ``test_golden.py``."""
+    tag = platform_tag()
+    if tag not in DRIVER_EPISODES:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail(f"no waypoint driver pins for {tag}")
+        pytest.skip(f"no waypoint driver pins for {tag}")
+    proto = replace(EvalProtocol.from_id("waypoint-v1/standard"), seeds=DRIVER_SEEDS)
+    driver = Path(__file__).resolve().parents[1] / "submissions" / "waypoint_pid_example.py"
+    factory = load_submission(driver, challenge=proto.challenge).factory
+    for k, run in enumerate(iter_episodes(proto, factory)):
+        m = run.result.metrics
+        assert m is not None
+        got = (run.result.score, run.result.success, m["termination"])
+        assert got == DRIVER_EPISODES[tag][DRIVER_SEEDS[k]], (tag, DRIVER_SEEDS[k], got)
