@@ -25,6 +25,9 @@ jobs:
         with:
           version: "0.13.0"
           enable-cache: true
+      # importing the env loads MuJoCo's renderer, which needs OSMesa on a headless runner
+      - name: Install headless OpenGL (OSMesa)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends libosmesa6
       - run: uv sync --locked
       - name: Calibrate (driver, standard 0..399 x 9 ceilings, clean 0..399)
         run: uv run python scripts/phase2b_calibrate.py --out out/wp_calibration_linux.json --workers 2
