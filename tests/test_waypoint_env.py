@@ -124,6 +124,9 @@ def test_scoring_dispatches_by_kind(driver: object) -> None:
     assert scored.score == 0.0
     assert not scored.success
     assert len(scored.metrics) == 18
+    from topple.waypoint import WAYPOINT_METRICS
+
+    assert tuple(scored.metrics) == WAYPOINT_METRICS  # names and order (contract §12a)
 
 
 def test_target_features_follow_the_course(driver: object) -> None:

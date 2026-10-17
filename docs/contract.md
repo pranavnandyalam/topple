@@ -721,8 +721,8 @@ battery_pts =  5 · (t_alive / T_ep) · (1 − min(E / E_ref, 1))
   `max_steps`), never with an error.
 - `E_ref` **[calibrated]** = 2 × the reference driver's median battery energy on
   `waypoint-v1/standard` seeds 0..399 at the frozen push band (§10), rounded to 0.1 J: 2 × 10.72 J
-  → `E_ref = 21.4` J, measured on `linux-x86_64`, the calibration platform (darwin-arm64 would give
-  21.5 J). As for balance-v1 (§12), a re-measurement alone never changes it.
+  → `E_ref = 21.4` J, measured on `linux-x86_64`, the calibration platform (darwin-arm64 gives 2 × 10.62 =
+  21.2 J at the same band). As for balance-v1 (§12), a re-measurement alone never changes it.
 - **Score config.** Every scorer constant is in the bundle's `score` (`WaypointScore`: `weights`
   (55, 25, 15, 5), summing to 100; `t_par_s` 5.0; `dock_progress_weights` (0.8, 0.2), summing to
   1; `success_energy_factor` 5; `e_ref_j` 21.4) or its `course` (`leg_m`, `gate_radius_m`,
@@ -736,9 +736,10 @@ an episode without metrics, counts as `T_ep`).
 energy_j, saturation_fraction, rms_tilt_rad` exactly as in §12, then
 
 - `waypoints` (int): g; `progress` (float): p; `docked` (bool);
-- `fell` (bool) and `fall_cause` (str), as defined in §12's vocabulary;
+- `fell` (bool), as defined in §12's vocabulary;
 - `t_finish_s` (float): `t_finish`, or `episode_seconds` for a non-finisher;
 - `max_hold_steps` (int);
+- `fall_cause` (str), as defined in §12's vocabulary;
 - the four score parts `course_pts, speed_pts, alive_pts, battery_pts` (floats), which sum to the
   score (before the clip, which an honest episode never reaches).
 

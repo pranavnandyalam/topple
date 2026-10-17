@@ -162,3 +162,14 @@ def test_item8_checks_the_media_manifest(tmp_path: Path) -> None:
     assert gate.item8(tmp_path, rep, RUNS) == []
     (tmp_path / MANIFEST).write_text(json.dumps({**manifest, "hero_seed": 3000}))
     assert gate.item8(tmp_path, rep, RUNS) == [f"{MANIFEST}: hero_seed is not the prescribed one"]
+
+
+def test_report_names_must_render_safely() -> None:
+    data = doc()
+    data["shipped"]["attempts"][0]["run"] = "x`|<b>"
+    with pytest.raises(ValueError, match="pattern"):
+        report(data)
+    data = doc()
+    data["baselines"]["standard"]["a|b"] = data["baselines"]["standard"]["creeper"]
+    with pytest.raises(ValueError, match="pattern"):
+        report(data)

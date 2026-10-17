@@ -481,6 +481,9 @@ class PpoTrainConfig(_Common):
             raise ValueError("ppo.batch_size must not exceed ppo.n_steps * n_envs (one rollout)")
         if self.init is not None and self.env.waypoint_reward is None:
             raise ValueError("init extends a balance policy to a waypoint challenge only")
+        if self.init is not None and self.normalize.reward:
+            # apply_init freezes VecNormalize (training=False), which also freezes ret_rms
+            raise ValueError("init freezes VecNormalize, so normalize.reward must be false")
         return self
 
 

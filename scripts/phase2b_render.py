@@ -5,7 +5,7 @@ templated from the report, nothing is typed in by hand. Run ids are the report's
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from phase2b_common import DRIVER_ID, Phase2bReport, RatesModel
 from topple.waypoint import SCORE_PARTS
@@ -109,7 +109,9 @@ def _fresh(rep: Phase2bReport) -> list[str]:
     return lines
 
 
-def _other(rep: Phase2bReport, proto: str, title: str, note: str) -> list[str]:
+def _other(
+    rep: Phase2bReport, proto: Literal["clean", "wp_eval_v1"], title: str, note: str
+) -> list[str]:
     rows = [[f"`{r.run}`", f"{getattr(r, proto).score:.2f}", _pct(getattr(r, proto).docked),
              _falls(getattr(r, proto))] for r in rep.fresh]  # fmt: skip
     rows += [[f"`{k}`", f"{b.score:.2f}", _pct(b.docked), _falls(b)]

@@ -863,3 +863,12 @@ def test_the_gate_must_fit_the_challenge_kind(name: str, gate: str) -> None:
         d["selection"]["max_saturation"] = 0.08 if gate == "pid" else None
 
     refused(edited(name, swap), "selection.gate", "does not fit")
+
+
+def test_init_refuses_reward_normalization() -> None:
+    """apply_init freezes VecNormalize, which would also freeze the reward statistics."""
+    data = raw("ppo_waypoint")
+    data["init"] = INIT
+    data["normalize"] = {**data["normalize"], "reward": True}
+    with pytest.raises(ConfigError, match=r"normalize\.reward must be false"):
+        parse_train_config(as_yaml(data))

@@ -237,6 +237,9 @@ class _Strict(BaseModel):
 
 
 Rate = Annotated[float, Field(ge=0.0, le=1.0)]
+Name = Annotated[str, Field(pattern=r"^[A-Za-z0-9_.-]{1,64}$")]
+"""A run or entry id as phase2b.md renders it: no character Markdown would interpret."""
+SourceRun = Annotated[str, Field(pattern=r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,199}$")]
 Arm = Literal["scratch", "finetune"]
 
 
@@ -270,7 +273,7 @@ class RunRow(_Strict):
 
 
 class FreshRun(_Strict):
-    run: str
+    run: Name
     arm: Arm
     first_eligible_step: int | None
     standard: RatesModel
@@ -280,12 +283,12 @@ class FreshRun(_Strict):
 
 
 class Attempt(_Strict):
-    run: str
+    run: Name
     failed: tuple[str, ...]
 
 
 class Shipped(_Strict):
-    run: str | None
+    run: Name | None
     arm: Arm | None
     step: int | None
     onnx_sha256: str | None
@@ -293,8 +296,8 @@ class Shipped(_Strict):
 
 
 class Sanity(_Strict):
-    run: str
-    source: dict[str, str | int]
+    run: Name
+    source: dict[Literal["run", "step", "onnx_sha256"], SourceRun | int]
     survival: Rate
 
 
@@ -305,7 +308,7 @@ class Phase2bReport(_Strict):
     e_ref_j: Annotated[float, Field(gt=0.0)]
     runs: Annotated[tuple[RunRow, ...], Field(min_length=6, max_length=6)]
     fresh: Annotated[tuple[FreshRun, ...], Field(min_length=6, max_length=6)]
-    baselines: dict[str, dict[str, RatesModel]]
+    baselines: dict[Literal["standard", "clean", "wp_eval_v1"], dict[Name, RatesModel]]
     """Per protocol, the rates of each non-run entry (the driver and the anchors)."""
     item6_passes: Annotated[int, Field(ge=0, le=6)]
     headline: dict[Arm, dict[str, Any]]
