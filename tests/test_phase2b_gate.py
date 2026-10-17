@@ -137,3 +137,28 @@ def test_main_exits_2_on_an_unreadable_input(
     code = gate.main([*inputs, *flags, "--results-dir", str(tmp_path)])
     assert code == 2
     assert capsys.readouterr().err.startswith("phase2b_gate: ")
+
+
+def test_item8_checks_the_media_manifest(tmp_path: Path) -> None:
+    from phase2b_media import MANIFEST, gallery_seeds, hero_seed
+    from topple.compare import read_comparison
+
+    for name, (_, side) in gate.MEDIA.items():
+        if side is None:
+            (tmp_path / name).write_bytes(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 52)
+        else:
+            Image.new("RGB", (side, side)).save(tmp_path / name)
+    rep = report(doc())
+    assert gate.item8(tmp_path, rep, RUNS) == [f"{MANIFEST} is missing or not JSON"]
+    assert rep.shipped.run is not None
+    ev = read_comparison(RUNS / "runs_wp_eval_v1.json")
+    std = read_comparison(RUNS / "runs_standard.json")
+    manifest = {
+        "policy_sha256": rep.shipped.onnx_sha256,
+        "hero_seed": hero_seed(wp.entry(ev, rep.shipped.run), ev.seeds),
+        "gallery_seeds": gallery_seeds(wp.entry(std, rep.shipped.run), std.seeds),
+    }
+    (tmp_path / MANIFEST).write_text(json.dumps(manifest))
+    assert gate.item8(tmp_path, rep, RUNS) == []
+    (tmp_path / MANIFEST).write_text(json.dumps({**manifest, "hero_seed": 3000}))
+    assert gate.item8(tmp_path, rep, RUNS) == [f"{MANIFEST}: hero_seed is not the prescribed one"]

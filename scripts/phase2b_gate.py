@@ -27,6 +27,7 @@ Exit 0 iff every item passes; 1 if one fails; 2 if an input cannot be read.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import replace
@@ -191,7 +192,11 @@ def item7(rep: wp.Phase2bReport) -> list[str]:
     return out
 
 
-def item8(results_dir: Path) -> list[str]:
+def item8(
+    results_dir: Path, rep: wp.Phase2bReport | None = None, runs_dir: Path | None = None
+) -> list[str]:
+    """The media files within their caps and sizes; with ``rep`` and ``runs_dir``, also that
+    ``waypoint_media.json`` names the shipped policy and the seeds §8.9 prescribes."""
     out = []
     for name, (cap, side) in MEDIA.items():
         path = results_dir / name
@@ -204,6 +209,23 @@ def item8(results_dir: Path) -> list[str]:
             out.append(f"{name} is not a {side}x{side} GIF")
         if side is None and path.read_bytes()[4:8] != b"ftyp":
             out.append(f"{name} is not an MP4 (no ftyp box)")
+    if rep is not None and runs_dir is not None and rep.shipped.run is not None:
+        from phase2b_media import MANIFEST, gallery_seeds, hero_seed
+
+        try:
+            media = json.loads((results_dir / MANIFEST).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return [*out, f"{MANIFEST} is missing or not JSON"]
+        ev = read_comparison(runs_dir / "runs_wp_eval_v1.json")
+        std = read_comparison(runs_dir / "runs_standard.json")
+        want = {
+            "policy_sha256": rep.shipped.onnx_sha256,
+            "hero_seed": hero_seed(wp.entry(ev, rep.shipped.run), ev.seeds),
+            "gallery_seeds": gallery_seeds(wp.entry(std, rep.shipped.run), std.seeds),
+        }
+        out += [
+            f"{MANIFEST}: {k} is not the prescribed one" for k in want if media.get(k) != want[k]
+        ]
     return out
 
 
@@ -261,7 +283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "5 results": lambda: item5(rep, md) + item5_rows(rep, args.report.with_name("phase2b")),
         "6 learnability": lambda: item6(cal, clean, ev, rep.shipped.onnx_sha256 or ""),
         "7 fine-tune sanity": lambda: item7(rep),
-        "8 video": lambda: item8(args.results_dir),
+        "8 video": lambda: item8(args.results_dir, rep, args.report.with_name("phase2b")),
         "9 export": lambda: item9(rep, args.submission, args.fixture),
         "11 binding": lambda: item11(rep),
     }

@@ -16,6 +16,7 @@ what the committed comparison recorded, so the media show the reported episodes.
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -34,6 +35,8 @@ RESULTS: Final = REPO / "docs/results"
 OUT: Final = RESULTS / "phase2"
 SHIPPED: Final = REPO / "submissions/ppo_waypoint"
 DRIVER: Final = REPO / "submissions/waypoint_pid_example.py"
+MANIFEST: Final = "waypoint_media.json"
+"""What the media show (gate item 8 recomputes the seeds and checks the policy)."""
 HERO_INDEX: Final = 24
 GALLERY: Final = 3
 MB: Final = 1 << 20
@@ -61,6 +64,18 @@ def checked(sub: Path, protocol_id: str, seed: int, score: float) -> Trajectory:
     return traj
 
 
+def hero_seed(ppo: Entry, seeds: tuple[int, ...]) -> int:
+    """§8.9 item 8: the seed at index 24 of the 50 sorted by (PPO score, seed)."""
+    order = sorted(range(len(seeds)), key=lambda k: (ppo.scores[k], seeds[k]))
+    return seeds[order[HERO_INDEX]]
+
+
+def gallery_seeds(ppo: Entry, seeds: tuple[int, ...]) -> list[int]:
+    """The 3 lowest-scoring seeds, ties to the lower seed."""
+    worst = sorted(range(len(seeds)), key=lambda i: (ppo.scores[i], seeds[i]))
+    return [seeds[i] for i in worst[:GALLERY]]
+
+
 def main() -> int:
     report = parse_report((RESULTS / "phase2b.json").read_bytes())
     run = report.shipped.run
@@ -70,8 +85,7 @@ def main() -> int:
     try:
         ppo, seeds = entry(RESULTS / "phase2b/runs_wp_eval_v1.json", run)
         drv, _ = entry(RESULTS / "phase2b/runs_wp_eval_v1.json", DRIVER_ID)
-        order = sorted(range(len(seeds)), key=lambda k: (ppo.scores[k], seeds[k]))
-        k = order[HERO_INDEX]
+        k = seeds.index(hero_seed(ppo, seeds))
         hero = [checked(SHIPPED, "wp_eval_v1", seeds[k], ppo.scores[k]),
                 checked(DRIVER, "wp_eval_v1", seeds[k], drv.scores[k])]  # fmt: skip
         labels = ["ppo_waypoint", "driver"]
@@ -80,15 +94,18 @@ def main() -> int:
             raise Phase2bError("waypoint.mp4 is over 8 MB")
         render_course_gif(hero, labels, OUT / "waypoint.gif", WAYPOINT_LADDER, max_bytes=5 * MB)
         std, std_seeds = entry(RESULTS / "phase2b/runs_standard.json", run)
-        worst = sorted(range(len(std_seeds)), key=lambda i: (std.scores[i], std_seeds[i]))
-        for n, i in enumerate(worst[:GALLERY], 1):
-            seed = std_seeds[i]
+        gallery = gallery_seeds(std, std_seeds)
+        for n, seed in enumerate(gallery, 1):
+            i = std_seeds.index(seed)
             traj = checked(SHIPPED, "waypoint-v1/standard", seed, std.scores[i])
             cause = std.extras["fall_cause"][i]
             gif = OUT / f"wp_gallery_{n}.gif"
             label = f"seed {seed}, fall cause {cause}"
             render_course_gif([traj], [label], gif, WAYPOINT_LADDER, max_bytes=3 * MB)
             print(f"gallery {n}: seed {seed} score {std.scores[i]:.2f} cause {cause}")
+        manifest = {"policy_sha256": ppo.policy_sha256, "hero_seed": seeds[k],
+                    "gallery_seeds": gallery}  # fmt: skip
+        (OUT / MANIFEST).write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
     except Phase2bError as exc:
         print(f"phase2b_media: {exc}", file=sys.stderr)
         return 2
