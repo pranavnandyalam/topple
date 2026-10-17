@@ -122,7 +122,7 @@ def test_a_fallen_track_ends_at_its_fall_and_holds_with_a_stamp(fall: Trajectory
     assert len(t.rows) == len(fall.qpos) + len(fall.epilogue_qpos)  # the epilogue plays
     last = round(cv.end_time([t]) / t.control_dt)
     assert last > len(fall.qpos)  # the video runs past the fall: epilogue, then the hold
-    assert cv._hud(t, last) == f"driver: FELL at {t.t_fall:.2f} s"
+    assert cv._hud(t, last).startswith(f"driver: FELL at {t.t_fall:.2f} s, gate ")
 
 
 @pytest.mark.render

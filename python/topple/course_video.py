@@ -169,7 +169,7 @@ def camera(tracks: Sequence[Track], fovy_deg: float) -> mujoco.MjvCamera:
     cam = mujoco.MjvCamera()
     cam.type = mujoco.mjtCamera.mjCAMERA_FREE
     cam.lookat[:] = [*((lo + hi) / 2), 0.0]
-    cam.azimuth = axis + 90.0  # look across the principal axis, so it runs left to right
+    cam.azimuth = axis  # §8.9: the camera looks along the course's principal axis
     cam.elevation = ELEVATION_DEG
     cam.distance = side / 2 / math.tan(math.radians(fovy_deg) / 2)
     return cam
@@ -275,11 +275,12 @@ def _hud(t: Track, step: int) -> str:
     reached = [s for s in t.replay.events.reached_step if s is not None and s <= step]
     n = len(t.replay.points)
     now = step * t.control_dt
+    gates = f"gate {min(len(reached), n - 1)}/{n - 1}"
     if t.t_finish is not None and now >= t.t_finish:
         return f"{t.label}: docked {t.t_finish:.2f} s"
     if t.t_fall is not None and now >= t.t_fall:
-        return f"{t.label}: FELL at {t.t_fall:.2f} s"
-    return f"{t.label}: gate {min(len(reached), n - 1)}/{n - 1}"
+        return f"{t.label}: FELL at {t.t_fall:.2f} s, {gates}"
+    return f"{t.label}: {gates}"
 
 
 def _overlay(
@@ -293,7 +294,7 @@ def _overlay(
     font = _font(px)  # the bundled font, the same on every platform
     for i, (u, v) in enumerate(numbers, 1):
         draw.text(
-            (u, v),
+            (u + 0.7 * px, v - 0.7 * px),  # beside the disc, so the robot on it stays visible
             str(i),
             font=font,
             fill=(255, 255, 255),
@@ -378,6 +379,7 @@ def _frames(
                 q = t.rows[k]
                 _, yaw = _quat_pitch_yaw(q[root + 3 : root + 7])
                 lo = max(0, k - round(TRAIL_S / t.control_dt))
+                lo = -(-lo // TRAIL_EVERY) * TRAIL_EVERY  # dots on a fixed grid, so they stay put
                 trail = t.rows[lo:k:TRAIL_EVERY, root : root + 2]
                 rgba = ROBOT_RGBA[i].copy()
                 if i:
