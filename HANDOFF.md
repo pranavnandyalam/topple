@@ -4,7 +4,7 @@ This file moves work between Claude Code sessions (local Mac ⇄ cloud at claude
 **Whoever stops working must update it, commit it and push before stopping.** Nothing else
 carries over: local memory, scratch files and workflow scripts stay on the machine that made them.
 
-Last updated: 2026-10-16 by the local Mac session. Branch `phase-2-learn` is pushed; PR #4 (Phase 2a)
+Last updated: 2026-10-17 by the local Mac session (Phase 2b built; review gate next). Branch `phase-2-learn` is pushed; PR #4 (Phase 2a)
 is open. The training runs live only on the Mac, in `runs/` (gitignored; the shipped run is
 `runs/ppo_s2`, needed by `phase2_done.sh`'s re-export check).
 
@@ -21,18 +21,20 @@ is open. The training runs live only on the Mac, in `runs/` (gitignored; the shi
 | Direction update | `PLAN.md` section 0 (2026-10-11): workbench for people's own robot projects, Studio, Arena with FRC drive practice, revised build order |
 | Deferred risks | `docs/design/deferred-risks.md` |
 | **Phase 2a** | **Merged to `main` as 386df1e (PR #4)** |
-| **Phase 2b (waypoint-v1)** | Branch `phase-2b-waypoint` (pushed). Slice 1 kinds/traj2/course/scorer (`28c806e`, review fixes `6293af1`); slice 2 env, bundle, kinds dispatch, Driver, 5 anchors (`a6399e1`); calibration frozen impulse_hi 0.375, E_ref 21.4 J linux (`5e80388`); slice 3 training support, waypoint selection gate, `ppo_waypoint.yaml`, anchors (`03096ca`). Anchors on standard 0..399: driver 80.24, balance_in_place 19.89, spin 17.45, creeper 60.65, gates_only 68.86, reckless 71.26: all §8.7 checks pass |
+| **Phase 2b (waypoint-v1)** | **Built; done-when run and review gate next.** Branch `phase-2b-waypoint` (pushed). Slices 1-3, fine-tune init, pilot (`3654537`); 6 seed runs in `../p2-train` at `3654537` (copied into `runs/`); shipped `submissions/ppo_waypoint` = `ppo_wpft_s1` (fine-tune, step 5,505,024; `1e2bd5d`); compare files carry waypoint extras (`5a65204`); results, gate, done script, course video (`4159c5f`); contract + media (`09367b3`); waypoint goldens (`0b6bc5d`). Fresh standard 0..399: shipped 79.23 vs driver 80.24 (paired −1.02 [−3.35, +1.21]), docked 81%, fell 19%; item 6: 5 of 6 runs pass (`ppo_wp_s1` fails, lo −5.11). Headline: first eligible at a median 3.01M in both arms; fine-tune +5.01M pretraining. Energy: fine-tune 1.03× driver, scratch 2.72×. Item 7 survival 1.0 ×3. Linux anchors match darwin within 0.25 |
 | Phase 3 design inputs | Branch `phase-3-design` (draft + critiques, not yet revised). Never merge it wholesale |
 
 ## Next steps, in order
 
-1. **Phase 2b next**: slices 1-3, fine-tune init (`fa2cc78`) and the pilot (`3654537`) are done
-   and reviewed. Pilot passed §8.9 item 6 (PPO 81.95 vs driver 80.24, docked 88.5%); budget rule
-   kept 6M; waypoint `max_cpu_s` 7,129. Running in `../p2-train` at `3654537`: `runs/ppo_wp_s{0,1,2}`
-   then `runs/ppo_wpft_s{0,1,2}` (one at a time, ~13 min each). Then: linux anchors from the
-   `calibrate-waypoint` CI artifact (`wp-anchors-linux`), shipping (§8.8: best eligible of 6,
-   `rank_key(..., "waypoint")` in `scripts/phase2_common.py:570` still says balance), the 2b results
-   and `phase2b_gate.py` done-when (§8.9), the phase review gate, squash-merge.
+1. **Phase 2b next**: run `scripts/phase2b_done.sh` once CI is green on HEAD (item 10), then the
+   phase review gate (code, security, done-when verifier; max effort on trust-boundary code:
+   `compare.py` extras, `course_video.py` replay inputs, `phase2b_gate.py`), fix confirmed
+   findings, squash-merge. Open spec-vs-code notes from the contract update: (a) `fall_cause` is
+   recorded for waypoint only (§8.5 says both kinds; adding it to balance-v1 is allowed but changes
+   2a results files, so it is left for an owner decision); (b) `to_course_frame` and the obs
+   rotation use libm cos/sin on the reset heading (positions are per-platform anyway). The spec
+   says results go in `phase2.json`/`phase2.md`; 2b writes `phase2b.json`/`phase2b.md` instead so
+   the merged 2a evidence stays untouched (update §8.9's text to match at the gate).
 2. Usage: Pranav asked to stop at 55% weekly (2026-10-17). Pause at 97% of the 5-hour window.
 3. Then PLAN.md section 0's build order (Studio, your own robot, test scenarios, Arena, ...), and
    revise the Phase 3 design as a short design note.
