@@ -661,9 +661,10 @@ not. Defined for both kinds:
   every other recorded reason (`timeout`, `error`, `sim_unstable`). Compared in whole steps, so the
   1.5 s boundary is exact (`topple.waypoint.fall_cause`). 1.5 s, not 1.0: measured push-to-fall
   latency reaches 0.92 s (reference driver) and 1.26 s (PPO), while every no-push PPO fall on
-  waypoint-v1 happened before 2.0 s, the earliest push time. waypoint-v1 records it in every
-  episode (§12a); balance-v1's recorded set is still the keys above, and adding `fall_cause` to it
-  is such an allowed addition.
+  waypoint-v1 happened before 2.0 s, the earliest push time. Both challenges record it in every
+  episode: waypoint-v1 in §12a's list, balance-v1 after the keys above (added in Phase 2b as an
+  allowed addition: no other metric, score, success or hash changed, so results written before
+  it simply lack the key).
 - `fell` (bool, waypoint-v1): `termination` in `FALL_REASONS`. Every "fall rate" means these
   reasons.
 

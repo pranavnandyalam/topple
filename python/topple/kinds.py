@@ -72,8 +72,16 @@ def score_trajectory(traj: Trajectory, challenge: Challenge, *, error: bool) -> 
     metrics = episode_metrics(traj, challenge.params.motor)
     cfg = challenge.config.score
     score = 0.0 if error else episode_score(metrics, cfg)
+    pushes = [int(p["start_step"]) for p in traj.meta["scenario"]["pushes"]]
+    fell = metrics.termination in FALL_REASONS
+    cause = fall_cause(  # §8.1/§8.5: added to balance-v1, every existing key unchanged
+        metrics.termination,
+        metrics.steps if fell else None,
+        pushes,
+        float(traj.meta["control_dt"]),
+    )
     return Scored(
-        metrics=metrics.as_dict(),
+        metrics={**metrics.as_dict(), "fall_cause": cause},
         score=min(max(score, 0.0), 100.0),
         success=not error and episode_success(metrics, cfg),
     )
