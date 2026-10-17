@@ -1,0 +1,35 @@
+name: calibrate-waypoint
+
+# waypoint-v1 calibration on the calibration platform, linux-x86_64 (docs/design/phase-2.md §8.7,
+# decision log R1): the reference driver on standard seeds 0..399 at 9 push ceilings, plus clean.
+# Runs when this file is pushed on a phase-* branch, or by hand; its only output is the
+# calibration JSON artifact (nothing is written back to the repository).
+on:
+  workflow_dispatch:
+  push:
+    branches: ['phase-*']
+    paths: ['.github/workflows/calibrate-waypoint.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.0"
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Calibrate (driver, standard 0..399 x 9 ceilings, clean 0..399)
+        run: uv run python scripts/phase2b_calibrate.py --out out/wp_calibration_linux.json --workers 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wp-calibration-linux
+          path: out/wp_calibration_linux.json
+          if-no-files-found: error
