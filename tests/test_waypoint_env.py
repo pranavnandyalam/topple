@@ -61,15 +61,17 @@ def test_env_events_equal_scorer_events_and_the_record_is_v2(
     driver: object, tmp_path: Path
 ) -> None:
     env = make_env(WP, "standard", record=True)
-    for i, seed in enumerate(range(10)):
+    for i, seed in enumerate(range(50)):  # spec §8.5: env events == scorer events on 50 seeds
         run = run_episode(env, driver, seed, i)  # type: ignore[arg-type]
         m = run.result.metrics
         assert m is not None
         ev = env.tracker.events(env.control_dt)  # type: ignore[attr-defined]
-        assert (ev.waypoints, ev.docked, ev.max_hold_steps) == (
+        t_finish = ev.t_finish_s if ev.t_finish_s is not None else WP.config.episode_seconds
+        assert (ev.waypoints, ev.docked, ev.max_hold_steps, t_finish) == (
             m["waypoints"],
             m["docked"],
             m["max_hold_steps"],
+            m["t_finish_s"],
         )
         parts = sum(float(m[k]) for k in ("course_pts", "speed_pts", "alive_pts", "battery_pts"))
         assert math.isclose(parts, run.result.score, abs_tol=1e-9)

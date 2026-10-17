@@ -56,7 +56,7 @@ CONTRACT_TERMS: Final = (
     "ENV_ALGO_VERSION",
     "max_steps",
 )
-MB: Final = 1 << 20
+MB: Final = 1_000_000  # decimal megabytes, as the 2a caps (section 5.2)
 MEDIA: Final = {  # name: (cap in bytes, GIF side in pixels or None)
     "waypoint.mp4": (8 * MB, None),
     "waypoint.gif": (5 * MB, 480),

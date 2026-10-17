@@ -39,7 +39,7 @@ MANIFEST: Final = "waypoint_media.json"
 """What the media show (gate item 8 recomputes the seeds and checks the policy)."""
 HERO_INDEX: Final = 24
 GALLERY: Final = 3
-MB: Final = 1 << 20
+MB: Final = 1_000_000  # decimal megabytes, as the 2a caps (section 5.2)
 
 
 def episode(sub: Path, protocol_id: str, seed: int) -> tuple[Trajectory, float]:
